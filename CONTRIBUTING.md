@@ -13,8 +13,9 @@ cd wordforge
 cargo test
 
 # 桌面 App：Linux 需要先裝 WebView 相關套件
-sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
-    patchelf build-essential curl wget file libxdo-dev libssl-dev
+# 注意：不要裝 libappindicator3-dev（Tauri v1 的依賴，會跟 libayatana-appindicator3-1 衝突）
+sudo apt install libwebkit2gtk-4.1-dev librsvg2-dev patchelf libxdo-dev \
+    build-essential curl wget file libssl-dev
 cd apps/desktop && npm install && npm run tauri dev
 ```
 

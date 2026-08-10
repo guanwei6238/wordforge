@@ -94,9 +94,13 @@ Cambridge、Oxford、朗文等商業字典的釋義、例句與錄音**受著作
 Linux 另需 Tauri 的系統依賴：
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
-    patchelf build-essential curl wget file libxdo-dev libssl-dev
+sudo apt install libwebkit2gtk-4.1-dev librsvg2-dev patchelf libxdo-dev \
+    build-essential curl wget file libssl-dev
 ```
+
+> **不要裝 `libappindicator3-dev`**。那是 Tauri v1 的依賴，會跟現在系統上的
+> `libayatana-appindicator3-1` 衝突。Tauri v2 只有在需要系統列圖示時才需要
+> `libayatana-appindicator3-dev`，本專案沒有用到。
 
 啟動：
 
