@@ -93,8 +93,15 @@ pub fn parse<R: Read>(reader: R) -> impl Iterator<Item = Result<DictEntry>> {
 }
 
 /// 拆開 ECDICT 用字面 `\n` 串起來的多條釋義。
-fn split_lines(field: &str) -> impl Iterator<Item = &str> {
-    field.split("\\n").map(str::trim).filter(|s| !s.is_empty())
+///
+/// 欄位裡的換行是**字面上的兩個字元** `\` + `n`，不是真的換行；
+/// 有些資料列尾巴還帶著同樣字面的 `\r`，一併清掉，
+/// 否則翻譯會顯示成「第一的\r」。
+fn split_lines(field: &str) -> impl Iterator<Item = String> {
+    field
+        .split("\\n")
+        .map(|s| s.replace("\\r", "").trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn convert(row: Row) -> DictEntry {
@@ -103,15 +110,15 @@ fn convert(row: Row) -> DictEntry {
     // 中文翻譯排前面：這是中文母語者第一眼要看的東西
     for line in split_lines(&row.translation) {
         senses.push(SenseEntry {
-            gloss: line.to_string(),
+            gloss: line.clone(),
             gloss_lang: "zh-CN".into(),
-            translation: Some(line.to_string()),
+            translation: Some(line),
             ..Default::default()
         });
     }
     for line in split_lines(&row.definition) {
         senses.push(SenseEntry {
-            gloss: line.to_string(),
+            gloss: line,
             gloss_lang: "en".into(),
             ..Default::default()
         });
@@ -258,6 +265,13 @@ mod tests {
 
         let e = parse_one(r#"obscure,,,a. 晦涩的,,,,,5000,0,,,"#);
         assert_eq!(e.freq_rank, Some(5000), "frq 沒有就退回 BNC");
+    }
+
+    /// 真實資料裡有些列的尾巴帶著字面的 `\r`，不清掉會直接顯示出來。
+    #[test]
+    fn strips_literal_carriage_returns() {
+        let e = parse_one(r#"a,,,"第一个字母 A; 一个; 第一的\r",,,,,0,0,,,"#);
+        assert_eq!(e.senses[0].gloss, "第一个字母 A; 一个; 第一的");
     }
 
     #[test]

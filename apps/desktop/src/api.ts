@@ -180,6 +180,27 @@ export function addLemmaToDeck(
   return invoke("add_lemma_to_deck", { profileId, lemmaId, kinds });
 }
 
+/* -------------------------------------------------------------------- 牌組 */
+
+export interface TagSummary {
+  tag: string;
+  total: number;
+  in_deck: number;
+}
+
+export function deckTags(lang = "en", profileId = DEFAULT_PROFILE_ID): Promise<TagSummary[]> {
+  return invoke("deck_tags", { profileId, lang });
+}
+
+export function addWordsByTag(
+  tag: string,
+  limit: number,
+  lang = "en",
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<number> {
+  return invoke("add_words_by_tag", { profileId, lang, tag, limit });
+}
+
 /* -------------------------------------------------------------------- 匯入 */
 
 export interface SourceInfo {

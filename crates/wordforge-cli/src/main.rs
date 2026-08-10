@@ -10,11 +10,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use wordforge_db::Db;
+use time::OffsetDateTime;
+use wordforge_core::model::{CardKind, ProfileId};
+use wordforge_db::{Db, repo};
 use wordforge_import::{FreqFormat, ImportOptions, ImportProgress, NoProgress, ProgressSink};
 
 /// 必須跟 `tauri.conf.json` 的 identifier 一致，否則 CLI 和 App 會各寫各的資料庫。
 const APP_IDENTIFIER: &str = "org.wordforge.app";
+
+/// App 首次啟動時建立的預設 profile。CLI 目前只操作這一個。
+const DEFAULT_PROFILE: i64 = 1;
+
+/// 標籤的中文說明，只用於 CLI 輸出。
+const TAG_NAMES: [(&str, &str); 9] = [
+    ("zk", "國中會考"),
+    ("gk", "學測"),
+    ("cet4", "大學英語四級"),
+    ("cet6", "大學英語六級"),
+    ("ky", "考研"),
+    ("toefl", "托福"),
+    ("ielts", "雅思"),
+    ("gre", "GRE"),
+    ("oxford3000", "牛津核心三千"),
+];
 
 #[derive(Parser)]
 #[command(name = "wordforge", version, about = "Wordforge 命令列工具")]
@@ -44,6 +62,32 @@ enum Command {
     /// 匯入字典或詞頻表
     #[command(subcommand)]
     Import(ImportCmd),
+    /// 管理牌組
+    #[command(subcommand)]
+    Deck(DeckCmd),
+}
+
+#[derive(Subcommand)]
+enum DeckCmd {
+    /// 列出可用的標籤與各自的字數
+    Tags {
+        #[arg(long, default_value = "en")]
+        lang: String,
+    },
+    /// 依標籤批次加入單字，由常用到罕見
+    Add {
+        /// 標籤，如 zk（國中會考）、gk（學測）、cet4、ielts
+        #[arg(long)]
+        tag: String,
+        #[arg(long, default_value = "en")]
+        lang: String,
+        /// 最多加入幾個字
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+        /// 卡片類型，可重複指定：recognition / recall / listening / spelling
+        #[arg(long = "kind", default_values_t = [String::from("recognition")])]
+        kinds: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -215,8 +259,8 @@ async fn main() -> Result<()> {
         }
 
         Command::Search { query, lang, limit } => {
-            // profile 1 是 App 首次啟動時建立的預設 profile
-            let hits = wordforge_db::dict::search(&db, &lang, &query, 1, limit).await?;
+            let hits =
+                wordforge_db::dict::search(&db, &lang, &query, DEFAULT_PROFILE, limit).await?;
             if hits.is_empty() {
                 println!("查不到「{query}」");
             }
@@ -234,6 +278,56 @@ async fn main() -> Result<()> {
                     tags
                 );
             }
+        }
+
+        Command::Deck(DeckCmd::Tags { lang }) => {
+            let summary = repo::cards::tag_summary(&db, ProfileId(DEFAULT_PROFILE), &lang).await?;
+            if summary.is_empty() {
+                println!("字典裡沒有任何標籤。ECDICT 才有考試範圍標籤。");
+            }
+            for (tag, total, in_deck) in summary {
+                println!(
+                    "  {:<12} {:>6} 字　已加入 {:>6}　{}",
+                    tag,
+                    total,
+                    in_deck,
+                    TAG_NAMES
+                        .iter()
+                        .find(|(k, _)| *k == tag)
+                        .map(|(_, v)| *v)
+                        .unwrap_or("")
+                );
+            }
+        }
+
+        Command::Deck(DeckCmd::Add {
+            tag,
+            lang,
+            limit,
+            kinds,
+        }) => {
+            let kinds: Vec<CardKind> = kinds
+                .iter()
+                .map(|k| match k.as_str() {
+                    "recognition" => Ok(CardKind::Recognition),
+                    "recall" => Ok(CardKind::Recall),
+                    "listening" => Ok(CardKind::Listening),
+                    "spelling" => Ok(CardKind::Spelling),
+                    other => Err(anyhow::anyhow!("未知的卡片類型：{other}")),
+                })
+                .collect::<Result<_>>()?;
+
+            let added = repo::cards::add_by_tag(
+                &db,
+                ProfileId(DEFAULT_PROFILE),
+                &lang,
+                &tag,
+                &kinds,
+                limit,
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+            println!("加入 {added} 張卡片（標籤 {tag}，上限 {limit} 字）");
         }
 
         Command::Import(cmd) => {

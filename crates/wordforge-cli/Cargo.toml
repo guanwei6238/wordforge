@@ -20,6 +20,7 @@ wordforge-import = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

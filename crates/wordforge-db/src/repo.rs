@@ -337,6 +337,98 @@ pub mod cards {
         Ok(ids.into_iter().map(LemmaId).collect())
     }
 
+    /// 依標籤批次建卡，例如「把國中範圍的字全部加進牌組」。
+    ///
+    /// 依詞頻由常用到罕見加入——一次加一千個字，先學到的當然該是常用的那些。
+    /// 已經在牌組裡的字不會被重置，回傳實際新增的張數。
+    pub async fn add_by_tag(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+        tag: &str,
+        kinds: &[CardKind],
+        limit: i64,
+        now: OffsetDateTime,
+    ) -> Result<u64> {
+        // 標籤在資料庫裡存成 " zk gk "，前後補空白比對才不會讓 zk 誤中 zkk
+        let pattern = format!("% {} %", tag.trim());
+        let due = ts::to_sql(now);
+        let mut added = 0u64;
+
+        let mut tx = db.pool().begin().await?;
+        for kind in kinds {
+            // 包一層子查詢有兩個理由：ORDER BY + LIMIT 要作用在挑選而不是插入，
+            // 以及 SQLite 的 INSERT...SELECT 接 ON CONFLICT 需要語法上不含糊。
+            let res = sqlx::query(
+                "INSERT INTO card (profile_id, lemma_id, kind, state, due)
+                 SELECT ?, pick.id, ?, 'new', ?
+                 FROM (
+                     SELECT id FROM lemma
+                     WHERE lang = ? AND ' ' || tags || ' ' LIKE ?
+                     ORDER BY freq_rank IS NULL, freq_rank, id
+                     LIMIT ?
+                 ) AS pick
+                 WHERE true
+                 ON CONFLICT (profile_id, lemma_id, kind) DO NOTHING",
+            )
+            .bind(profile_id.0)
+            .bind(kind.as_str())
+            .bind(&due)
+            .bind(lang)
+            .bind(&pattern)
+            .bind(limit)
+            .execute(&mut *tx)
+            .await?;
+            added += res.rows_affected();
+        }
+        tx.commit().await?;
+
+        Ok(added)
+    }
+
+    /// 每個標籤有幾個字、其中幾個已經在牌組裡。
+    pub async fn tag_summary(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        // 標籤是空白分隔的字串，SQLite 沒有 split，所以在 Rust 端展開。
+        // 標籤種類只有十幾種，詞條數才是大的那一邊，撈回來的資料量不大。
+        let rows = sqlx::query(
+            "SELECT l.tags,
+                    COUNT(*) AS total,
+                    SUM(EXISTS (SELECT 1 FROM card c
+                                WHERE c.lemma_id = l.id AND c.profile_id = ?)) AS in_deck
+             FROM lemma l
+             WHERE l.lang = ? AND l.tags <> ''
+             GROUP BY l.tags",
+        )
+        .bind(profile_id.0)
+        .bind(lang)
+        .fetch_all(db.pool())
+        .await?;
+
+        let mut totals: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
+        for row in rows {
+            let tags: String = row.get("tags");
+            let total: i64 = row.get("total");
+            let in_deck: i64 = row.get::<Option<i64>, _>("in_deck").unwrap_or(0);
+            for tag in tags.split_whitespace() {
+                let e = totals.entry(tag.to_string()).or_insert((0, 0));
+                e.0 += total;
+                e.1 += in_deck;
+            }
+        }
+
+        let mut out: Vec<(String, i64, i64)> = totals
+            .into_iter()
+            .map(|(tag, (total, in_deck))| (tag, total, in_deck))
+            .collect();
+        // 字多的標籤排前面，那通常是使用者真的會用的範圍
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
     /// 複習歷程，供 FSRS optimizer 重新訓練個人化權重使用。
     pub async fn review_history(
         db: &Db,
@@ -552,6 +644,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filtered.len(), 1);
+    }
+
+    /// 「把國中範圍的字加進牌組」是這個 App 最直接的用法之一。
+    #[tokio::test]
+    async fn add_by_tag_picks_frequent_words_first() {
+        let (db, profile) = setup().await;
+
+        // 三個國中字（詞頻不同）與一個高中字
+        for (word, freq, tags) in [
+            ("rare", 9000, " zk "),
+            ("common", 100, " zk "),
+            ("middle", 3000, " zk gk "),
+            ("advanced", 50, " gk "),
+        ] {
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', ?, ?)",
+            )
+            .bind(word)
+            .bind(word)
+            .bind(freq)
+            .bind(tags)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let added = cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 2, t0())
+            .await
+            .unwrap();
+        assert_eq!(added, 2);
+
+        let words: Vec<String> = sqlx::query_scalar(
+            "SELECT l.text FROM card c JOIN lemma l ON l.id = c.lemma_id
+             ORDER BY l.freq_rank",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            words,
+            vec!["common", "middle"],
+            "應該先加常用的字，而且高中字不該混進來"
+        );
+    }
+
+    /// 重複執行不該把已經在複習的卡片打回新卡。
+    #[tokio::test]
+    async fn add_by_tag_never_resets_existing_cards() {
+        let (db, profile) = setup().await;
+        sqlx::query(
+            "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+             VALUES ('en', 'apple', 'apple', '', 100, ' zk ')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 10, t0())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE card SET state = 'review', stability = 30.0, reps = 5")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let added = cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 10, t0())
+            .await
+            .unwrap();
+
+        assert_eq!(added, 0, "已經在牌組裡的字不該重複加入");
+        let (state, reps): (String, i64) = sqlx::query_as("SELECT state, reps FROM card")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(state, "review", "複習進度被重置了");
+        assert_eq!(reps, 5);
+    }
+
+    /// 標籤比對必須精確：zk 不能命中 zkk。
+    #[tokio::test]
+    async fn tag_matching_is_exact() {
+        let (db, profile) = setup().await;
+        sqlx::query(
+            "INSERT INTO lemma (lang, text, normalized, pos, tags)
+             VALUES ('en', 'trap', 'trap', '', ' zkk ')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let added = cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 10, t0())
+            .await
+            .unwrap();
+        assert_eq!(added, 0);
+    }
+
+    #[tokio::test]
+    async fn tag_summary_counts_words_and_deck_progress() {
+        let (db, profile) = setup().await;
+        for (word, tags) in [("a1", " zk gk "), ("a2", " zk "), ("a3", " gk ")] {
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', 1, ?)",
+            )
+            .bind(word)
+            .bind(word)
+            .bind(tags)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 1, t0())
+            .await
+            .unwrap();
+
+        let summary = cards::tag_summary(&db, profile, "en").await.unwrap();
+        let zk = summary.iter().find(|(t, ..)| t == "zk").unwrap();
+        let gk = summary.iter().find(|(t, ..)| t == "gk").unwrap();
+
+        assert_eq!(zk.1, 2, "zk 有兩個字");
+        assert_eq!(zk.2, 1, "其中一個已加入牌組");
+        assert_eq!(gk.1, 2);
+        assert_eq!(gk.2, 1, "同一個字同時屬於 zk 與 gk，兩邊都要算到");
     }
 
     #[tokio::test]

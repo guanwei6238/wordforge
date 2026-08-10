@@ -300,6 +300,52 @@ async fn add_lemma_to_deck(
     Ok(())
 }
 
+/// 一個標籤的字數與牌組進度。
+#[derive(Debug, Serialize)]
+pub struct TagSummary {
+    pub tag: String,
+    pub total: i64,
+    pub in_deck: i64,
+}
+
+#[tauri::command]
+async fn deck_tags(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    lang: String,
+) -> CmdResult<Vec<TagSummary>> {
+    let rows = cards::tag_summary(&state.db, ProfileId(profile_id), &lang).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(tag, total, in_deck)| TagSummary {
+            tag,
+            total,
+            in_deck,
+        })
+        .collect())
+}
+
+/// 依考試範圍批次加入單字，例如把國中會考範圍的字全部排進複習。
+#[tauri::command]
+async fn add_words_by_tag(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    lang: String,
+    tag: String,
+    limit: i64,
+) -> CmdResult<u64> {
+    Ok(cards::add_by_tag(
+        &state.db,
+        ProfileId(profile_id),
+        &lang,
+        &tag,
+        &[CardKind::Recognition],
+        limit,
+        OffsetDateTime::now_utc(),
+    )
+    .await?)
+}
+
 // ---------------------------------------------------------------- 匯入
 
 /// 匯入的檔案格式。
@@ -484,6 +530,8 @@ pub fn run() {
             word_detail,
             dictionary_stats,
             add_lemma_to_deck,
+            deck_tags,
+            add_words_by_tag,
             start_import,
             cancel_import,
             import_running,

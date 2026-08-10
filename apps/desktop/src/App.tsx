@@ -1,4 +1,5 @@
 import { useState } from "react";
+import Deck from "./pages/Deck";
 import Dictionary from "./pages/Dictionary";
 import Import from "./pages/Import";
 import Review from "./pages/Review";
@@ -6,6 +7,7 @@ import Review from "./pages/Review";
 const TABS = [
   { id: "review", label: "複習" },
   { id: "dictionary", label: "字典" },
+  { id: "deck", label: "牌組" },
   { id: "import", label: "匯入" },
 ] as const;
 
@@ -34,6 +36,7 @@ export default function App() {
       <main className="page">
         {tab === "review" && <Review />}
         {tab === "dictionary" && <Dictionary />}
+        {tab === "deck" && <Deck />}
         {tab === "import" && <Import />}
       </main>
     </div>
