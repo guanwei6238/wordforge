@@ -537,6 +537,141 @@ mod tests {
         assert_eq!(ImportProgress::default().fraction(), None);
     }
 
+    /// 建立一個測試用的暫存檔。回傳 (路徑, 用完要刪的目錄)。
+    fn temp_file(name: &str, content: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("wordforge-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        (path, dir)
+    }
+
+    /// 走完整條實際路徑：開檔 → 串流解析 → 寫入 → 查得到。
+    #[tokio::test]
+    async fn imports_a_jsonl_file_end_to_end() {
+        let jsonl = concat!(
+            r#"{"word":"cat","pos":"noun","lang_code":"en","senses":[{"glosses":["A small feline"]}],"#,
+            r#""sounds":[{"ipa":"/kæt/","tags":["UK"]}],"forms":[{"form":"cats","tags":["plural"]}]}"#,
+            "\n",
+            r#"{"word":"dog","pos":"noun","lang_code":"en","senses":[{"glosses":["A domestic canine"]}]}"#,
+            "\n",
+            "{broken json}\n",
+            r#"{"word":"ghost","senses":[]}"#,
+            "\n",
+        );
+        let (path, dir) = temp_file("sample.jsonl", jsonl);
+        let db = Db::open_in_memory().await.unwrap();
+
+        let p = import_wiktionary_jsonl(&db, &path, "en", &ImportOptions::default(), &NoProgress)
+            .await
+            .unwrap();
+
+        assert_eq!(p.imported, 2);
+        assert_eq!(p.failed, 1, "壞掉的行要計數而不是中斷匯入");
+        assert_eq!(p.skipped, 1, "沒有釋義的詞條要跳過");
+        assert!(p.bytes_total > 0, "檔案大小應該讀得到，進度條才有意義");
+        assert_eq!(p.bytes_read, p.bytes_total, "讀完整個檔案");
+
+        // 來源與授權要正確登記，UI 才有東西可以標示
+        let stats = dict::stats(&db).await.unwrap();
+        assert_eq!(stats.sources[0].slug, "wiktionary-en");
+        assert_eq!(stats.sources[0].license.as_deref(), Some("CC BY-SA 4.0"));
+
+        // 查得到，而且詞形變化也對得回原形
+        let hits = wordforge_db::dict::search(&db, "en", "cats", 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "cat");
+        assert_eq!(hits[0].gloss.as_deref(), Some("A small feline"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn imports_a_csv_file_end_to_end() {
+        let (path, dir) = temp_file(
+            "words.csv",
+            "word,translation,ipa\napple,蘋果,/ˈæp.əl/\nbook,書,\n",
+        );
+        let db = Db::open_in_memory().await.unwrap();
+
+        let p = import_csv(
+            &db,
+            &path,
+            "en",
+            b',',
+            "我的單字表",
+            &ImportOptions::default(),
+            &NoProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(p.imported, 2);
+
+        let hits = wordforge_db::dict::search(&db, "en", "apple", 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits[0].translation.as_deref(), Some("蘋果"));
+
+        // 自製單字表沒有授權資訊，不該亂填一個
+        let stats = dict::stats(&db).await.unwrap();
+        assert_eq!(stats.sources[0].name, "我的單字表");
+        assert_eq!(stats.sources[0].license, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 詞頻表套用到已匯入的詞條上。
+    #[tokio::test]
+    async fn freq_list_updates_imported_words() {
+        let (csv, csv_dir) = temp_file("w.csv", "word,translation\napple,蘋果\nzebra,斑馬\n");
+        let (freq, freq_dir) = temp_file("freq.txt", "the\napple\nof\n");
+        let db = Db::open_in_memory().await.unwrap();
+
+        import_csv(
+            &db,
+            &csv,
+            "en",
+            b',',
+            "表",
+            &ImportOptions::default(),
+            &NoProgress,
+        )
+        .await
+        .unwrap();
+
+        let updated = import_freq_list(&db, &freq, "en", FreqFormat::RankedList)
+            .await
+            .unwrap();
+
+        assert_eq!(updated, 1, "只有 apple 兩邊都有");
+        let hits = wordforge_db::dict::search(&db, "en", "apple", 1, 5)
+            .await
+            .unwrap();
+        assert_eq!(hits[0].freq_rank, Some(2), "apple 在詞頻表的第 2 行");
+
+        std::fs::remove_dir_all(&csv_dir).ok();
+        std::fs::remove_dir_all(&freq_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_file_is_a_clear_error() {
+        let db = Db::open_in_memory().await.unwrap();
+        let err = import_wiktionary_jsonl(
+            &db,
+            std::path::Path::new("/nonexistent/nope.jsonl"),
+            "en",
+            &ImportOptions::default(),
+            &NoProgress,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ImportError::Io(_)));
+    }
+
     #[tokio::test]
     async fn reimporting_the_same_file_does_not_duplicate() {
         let (db, source) = setup().await;
