@@ -27,7 +27,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": [],
+    "icon": ["icons/icon.png"],
     "shortDescription": "離線優先的語言學習應用程式",
     "longDescription": "用自己的字典、教材與 LLM 打造個人化的語言學習迴圈：間隔重複背單字、90% 法則閱讀理解、AI 對話與寫作批改。",
     "category": "Education",

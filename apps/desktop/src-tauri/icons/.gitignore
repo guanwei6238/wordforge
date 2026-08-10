@@ -1,3 +1,6 @@
-icons/*.png
-icons/*.ico
-icons/*.icns
+# `npx tauri icon` 產生的多尺寸檔案不進版控，
+# 但 icon.png 是編譯期就要讀到的來源檔，必須保留。
+*.png
+!icon.png
+*.ico
+*.icns
