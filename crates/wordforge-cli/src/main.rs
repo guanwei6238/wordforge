@@ -87,6 +87,9 @@ enum DeckCmd {
         /// 卡片類型，可重複指定：recognition / recall / listening / spelling
         #[arg(long = "kind", default_values_t = [String::from("recognition")])]
         kinds: Vec<String>,
+        /// 連 the / of / and 這類功能詞也一起加入（預設排除，它們該從閱讀中學）
+        #[arg(long)]
+        include_function_words: bool,
     },
 }
 
@@ -305,6 +308,7 @@ async fn main() -> Result<()> {
             lang,
             limit,
             kinds,
+            include_function_words,
         }) => {
             let kinds: Vec<CardKind> = kinds
                 .iter()
@@ -320,10 +324,13 @@ async fn main() -> Result<()> {
             let added = repo::cards::add_by_tag(
                 &db,
                 ProfileId(DEFAULT_PROFILE),
-                &lang,
-                &tag,
-                &kinds,
-                limit,
+                repo::cards::AddByTag {
+                    lang: &lang,
+                    tag: &tag,
+                    kinds: &kinds,
+                    limit,
+                    skip_function_words: !include_function_words,
+                },
                 OffsetDateTime::now_utc(),
             )
             .await?;

@@ -101,6 +101,10 @@ export default function Review() {
             <dd>{stats.due_now}</dd>
           </div>
           <div>
+            <dt>今日新字</dt>
+            <dd>{stats.new_today}</dd>
+          </div>
+          <div>
             <dt>已掌握</dt>
             <dd>{stats.known_words}</dd>
           </div>
@@ -142,8 +146,11 @@ export default function Review() {
         </section>
       ) : (
         <section className="done">
-          <p>今天的複習做完了 🎉</p>
-          <p className="muted">明天再回來，或到「字典」頁加入一些新單字。</p>
+          <p>今天的份做完了 🎉</p>
+          <p className="muted">
+            每天固定引入少量新字才記得住。明天再回來，
+            或到「牌組」頁把更多範圍排進來。
+          </p>
         </section>
       )}
 

@@ -20,6 +20,21 @@ use wordforge_import::{FreqFormat, ImportOptions, ImportProgress, ProgressSink};
 /// 「算是會了」的 stability 門檻（天）。撐得過三週不複習才計入詞彙量。
 const KNOWN_STABILITY_DAYS: f64 = 21.0;
 
+/// 每天引入的新卡上限。
+///
+/// 一次把整個國中範圍 1600 個字設成到期，開啟 App 看到「待複習 1600」
+/// 只會讓人直接關掉；FSRS 的排程也假設新卡是每天少量穩定引入的。
+/// 15 張大約是每天 10 分鐘的量。
+const NEW_CARDS_PER_DAY: i64 = 15;
+
+/// 每天的複習上限，避免長假回來被幾百張卡淹沒。
+const MAX_REVIEWS_PER_DAY: i64 = 200;
+
+/// 今天的起點（UTC）。跨日換算之後會改成使用者所在時區。
+fn day_start(now: OffsetDateTime) -> OffsetDateTime {
+    now.replace_time(time::Time::MIDNIGHT)
+}
+
 pub struct AppState {
     db: Db,
     scheduler: Arc<Scheduler>,
@@ -86,7 +101,10 @@ pub struct CardView {
 
 #[derive(Debug, Serialize)]
 pub struct StudyStats {
+    /// 今天要複習的張數（不含新卡）
     pub due_now: i64,
+    /// 今天還能引入幾張新卡
+    pub new_today: i64,
     pub known_words: i64,
     pub total_words: i64,
     pub reviews_today: i64,
@@ -106,7 +124,15 @@ async fn list_due_cards(
     limit: i64,
 ) -> CmdResult<Vec<CardView>> {
     let now = OffsetDateTime::now_utc();
-    let due = cards::due(&state.db, ProfileId(profile_id), now, limit).await?;
+    let due = cards::daily_queue(
+        &state.db,
+        ProfileId(profile_id),
+        now,
+        day_start(now),
+        NEW_CARDS_PER_DAY,
+        limit.min(MAX_REVIEWS_PER_DAY),
+    )
+    .await?;
 
     let mut views = Vec::with_capacity(due.len());
     for card in due {
@@ -154,7 +180,15 @@ async fn review_card(
 
     let now = OffsetDateTime::now_utc();
     // 重新讀出卡片，避免前端送來過期狀態
-    let due = cards::due(&state.db, ProfileId(profile_id), now, 1_000).await?;
+    let due = cards::daily_queue(
+        &state.db,
+        ProfileId(profile_id),
+        now,
+        day_start(now),
+        NEW_CARDS_PER_DAY,
+        MAX_REVIEWS_PER_DAY,
+    )
+    .await?;
     let card = due
         .into_iter()
         .find(|c| c.id.map(|id| id.0) == Some(input.card_id))
@@ -208,9 +242,14 @@ async fn add_word(
 #[tauri::command]
 async fn study_stats(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdResult<StudyStats> {
     let now = OffsetDateTime::now_utc();
-    let due_now = cards::due(&state.db, ProfileId(profile_id), now, i64::MAX)
-        .await?
-        .len() as i64;
+    let (due_now, new_today) = cards::daily_counts(
+        &state.db,
+        ProfileId(profile_id),
+        now,
+        day_start(now),
+        NEW_CARDS_PER_DAY,
+    )
+    .await?;
     let known: std::collections::HashSet<LemmaId> =
         cards::known_lemma_ids(&state.db, ProfileId(profile_id), KNOWN_STABILITY_DAYS).await?;
 
@@ -230,6 +269,7 @@ async fn study_stats(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdR
 
     Ok(StudyStats {
         due_now,
+        new_today,
         known_words: known.len() as i64,
         total_words,
         reviews_today,
@@ -337,10 +377,14 @@ async fn add_words_by_tag(
     Ok(cards::add_by_tag(
         &state.db,
         ProfileId(profile_id),
-        &lang,
-        &tag,
-        &[CardKind::Recognition],
-        limit,
+        cards::AddByTag {
+            lang: &lang,
+            tag: &tag,
+            kinds: &[CardKind::Recognition],
+            limit,
+            // 功能詞不做成卡片，理由見 wordforge_core::wordlist
+            skip_function_words: true,
+        },
         OffsetDateTime::now_utc(),
     )
     .await?)

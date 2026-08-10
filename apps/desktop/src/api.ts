@@ -32,7 +32,10 @@ export interface CardView {
 }
 
 export interface StudyStats {
+  /** 今天要複習的張數（不含新卡） */
   due_now: number;
+  /** 今天還能引入幾張新卡 */
+  new_today: number;
   known_words: number;
   total_words: number;
   reviews_today: number;

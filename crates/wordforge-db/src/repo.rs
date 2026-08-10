@@ -337,40 +337,75 @@ pub mod cards {
         Ok(ids.into_iter().map(LemmaId).collect())
     }
 
+    /// [`add_by_tag`] 的參數。
+    #[derive(Debug, Clone)]
+    pub struct AddByTag<'a> {
+        pub lang: &'a str,
+        /// 考試範圍標籤，如 `zk`（國中會考）
+        pub tag: &'a str,
+        pub kinds: &'a [CardKind],
+        /// 最多加入幾個字
+        pub limit: i64,
+        /// 排除 the / of / and 這類功能詞。除非有特別理由，都該是 `true`。
+        pub skip_function_words: bool,
+    }
+
     /// 依標籤批次建卡，例如「把國中範圍的字全部加進牌組」。
     ///
     /// 依詞頻由常用到罕見加入——一次加一千個字，先學到的當然該是常用的那些。
     /// 已經在牌組裡的字不會被重置，回傳實際新增的張數。
+    ///
+    /// `skip_function_words` 預設應該給 `true`：依詞頻排下來，最前面清一色是
+    /// `the`、`of`、`and`、`I`，做成單字卡學不到東西（理由見
+    /// [`wordforge_core::wordlist`]）。
     pub async fn add_by_tag(
         db: &Db,
         profile_id: ProfileId,
-        lang: &str,
-        tag: &str,
-        kinds: &[CardKind],
-        limit: i64,
+        opts: AddByTag<'_>,
         now: OffsetDateTime,
     ) -> Result<u64> {
+        let AddByTag {
+            lang,
+            tag,
+            kinds,
+            limit,
+            skip_function_words,
+        } = opts;
         // 標籤在資料庫裡存成 " zk gk "，前後補空白比對才不會讓 zk 誤中 zkk
         let pattern = format!("% {} %", tag.trim());
         let due = ts::to_sql(now);
-        let mut added = 0u64;
 
+        // 功能詞清單是編譯期常數，不是使用者輸入，直接內嵌成 SQL 字面值。
+        // 用 bind 的話得動態組出上百個 `?`，反而更難讀。
+        let exclusion = if skip_function_words {
+            let list = wordforge_core::wordlist::function_words(lang);
+            if list.is_empty() {
+                String::new()
+            } else {
+                let quoted: Vec<String> = list.iter().map(|w| format!("'{w}'")).collect();
+                format!("AND normalized NOT IN ({})", quoted.join(","))
+            }
+        } else {
+            String::new()
+        };
+
+        let mut added = 0u64;
         let mut tx = db.pool().begin().await?;
         for kind in kinds {
             // 包一層子查詢有兩個理由：ORDER BY + LIMIT 要作用在挑選而不是插入，
             // 以及 SQLite 的 INSERT...SELECT 接 ON CONFLICT 需要語法上不含糊。
-            let res = sqlx::query(
+            let res = sqlx::query(&format!(
                 "INSERT INTO card (profile_id, lemma_id, kind, state, due)
                  SELECT ?, pick.id, ?, 'new', ?
                  FROM (
                      SELECT id FROM lemma
-                     WHERE lang = ? AND ' ' || tags || ' ' LIKE ?
+                     WHERE lang = ? AND ' ' || tags || ' ' LIKE ? {exclusion}
                      ORDER BY freq_rank IS NULL, freq_rank, id
                      LIMIT ?
                  ) AS pick
                  WHERE true
-                 ON CONFLICT (profile_id, lemma_id, kind) DO NOTHING",
-            )
+                 ON CONFLICT (profile_id, lemma_id, kind) DO NOTHING"
+            ))
             .bind(profile_id.0)
             .bind(kind.as_str())
             .bind(&due)
@@ -384,6 +419,121 @@ pub mod cards {
         tx.commit().await?;
 
         Ok(added)
+    }
+
+    /// 今天還可以引入幾張新卡。
+    ///
+    /// 「今天引入的新卡」定義為 `review_log` 裡 `state = 'new'` 的紀錄——
+    /// 那是一張卡的第一次複習，之後再怎麼重複都不會再算一次。
+    pub async fn new_cards_introduced_today(
+        db: &Db,
+        profile_id: ProfileId,
+        day_start: OffsetDateTime,
+    ) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT r.card_id)
+             FROM review_log r JOIN card c ON c.id = r.card_id
+             WHERE c.profile_id = ? AND r.state = 'new' AND r.reviewed_at >= ?",
+        )
+        .bind(profile_id.0)
+        .bind(ts::to_sql(day_start))
+        .fetch_one(db.pool())
+        .await?;
+        Ok(n)
+    }
+
+    /// 今天該做的卡片佇列。
+    ///
+    /// 這跟單純的「due <= now」不一樣，差別就是這個 App 能不能天天用下去：
+    ///
+    /// 1. **學習中的卡最優先**：今天剛看過、幾分鐘後要再看一次的卡不能被排到後面，
+    ///    否則當天根本記不起來。
+    /// 2. **接著是到期的複習卡**：這些是已經投資過的記憶，錯過就要重學。
+    /// 3. **最後才引入新卡，而且有每日上限**：一次把 1600 個字全設成到期，
+    ///    開啟 App 看到「待複習 1600」只會讓人直接關掉。FSRS 的排程本來就
+    ///    假設新卡是每天少量穩定引入的。
+    pub async fn daily_queue(
+        db: &Db,
+        profile_id: ProfileId,
+        now: OffsetDateTime,
+        day_start: OffsetDateTime,
+        new_per_day: i64,
+        max_reviews: i64,
+    ) -> Result<Vec<Card>> {
+        let now_sql = ts::to_sql(now);
+
+        // 學習中 + 到期複習，先來後到
+        let mut queue: Vec<Card> = sqlx::query(&format!(
+            "{SELECT_CARD} WHERE profile_id = ? AND suspended = 0
+               AND state <> 'new' AND due <= ?
+             ORDER BY due ASC LIMIT ?"
+        ))
+        .bind(profile_id.0)
+        .bind(&now_sql)
+        .bind(max_reviews.max(0))
+        .fetch_all(db.pool())
+        .await?
+        .iter()
+        .map(row_to_card)
+        .collect::<Result<_>>()?;
+
+        let introduced = new_cards_introduced_today(db, profile_id, day_start).await?;
+        let remaining = (new_per_day - introduced).max(0);
+        if remaining == 0 {
+            return Ok(queue);
+        }
+
+        // 新卡依詞頻由常用到罕見引入，跟加入牌組時的順序一致
+        let new_cards: Vec<Card> = sqlx::query(&format!(
+            "{SELECT_CARD} AS c WHERE profile_id = ? AND suspended = 0
+               AND state = 'new' AND due <= ?
+             ORDER BY (SELECT freq_rank IS NULL FROM lemma WHERE id = c.lemma_id),
+                      (SELECT freq_rank FROM lemma WHERE id = c.lemma_id),
+                      c.id
+             LIMIT ?"
+        ))
+        .bind(profile_id.0)
+        .bind(&now_sql)
+        .bind(remaining)
+        .fetch_all(db.pool())
+        .await?
+        .iter()
+        .map(row_to_card)
+        .collect::<Result<_>>()?;
+
+        queue.extend(new_cards);
+        Ok(queue)
+    }
+
+    /// 今天的待辦數量：到期複習幾張、還能引入幾張新卡。
+    pub async fn daily_counts(
+        db: &Db,
+        profile_id: ProfileId,
+        now: OffsetDateTime,
+        day_start: OffsetDateTime,
+        new_per_day: i64,
+    ) -> Result<(i64, i64)> {
+        let reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM card
+             WHERE profile_id = ? AND suspended = 0 AND state <> 'new' AND due <= ?",
+        )
+        .bind(profile_id.0)
+        .bind(ts::to_sql(now))
+        .fetch_one(db.pool())
+        .await?;
+
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM card
+             WHERE profile_id = ? AND suspended = 0 AND state = 'new'",
+        )
+        .bind(profile_id.0)
+        .fetch_one(db.pool())
+        .await?;
+
+        let introduced = new_cards_introduced_today(db, profile_id, day_start).await?;
+        let new_today = (new_per_day - introduced).max(0).min(waiting);
+
+        Ok((reviews, new_today))
     }
 
     /// 每個標籤有幾個字、其中幾個已經在牌組裡。
@@ -671,9 +821,20 @@ mod tests {
             .unwrap();
         }
 
-        let added = cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 2, t0())
-            .await
-            .unwrap();
+        let added = cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 2,
+                skip_function_words: false,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
         assert_eq!(added, 2);
 
         let words: Vec<String> = sqlx::query_scalar(
@@ -702,17 +863,39 @@ mod tests {
         .await
         .unwrap();
 
-        cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 10, t0())
-            .await
-            .unwrap();
+        cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 10,
+                skip_function_words: false,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE card SET state = 'review', stability = 30.0, reps = 5")
             .execute(db.pool())
             .await
             .unwrap();
 
-        let added = cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 10, t0())
-            .await
-            .unwrap();
+        let added = cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 10,
+                skip_function_words: false,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(added, 0, "已經在牌組裡的字不該重複加入");
         let (state, reps): (String, i64) = sqlx::query_as("SELECT state, reps FROM card")
@@ -721,6 +904,48 @@ mod tests {
             .unwrap();
         assert_eq!(state, "review", "複習進度被重置了");
         assert_eq!(reps, 5);
+    }
+
+    /// 依詞頻加入時，最前面清一色是 the / of / and，
+    /// 把它們做成單字卡是浪費使用者的時間。
+    #[tokio::test]
+    async fn add_by_tag_skips_function_words() {
+        let (db, profile) = setup().await;
+        for (word, freq) in [("the", 1), ("of", 2), ("water", 3), ("i", 4), ("book", 5)] {
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', ?, ' zk ')",
+            )
+            .bind(word)
+            .bind(word)
+            .bind(freq)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 10,
+                skip_function_words: true,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let words: Vec<String> = sqlx::query_scalar(
+            "SELECT l.text FROM card c JOIN lemma l ON l.id = c.lemma_id ORDER BY l.freq_rank",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(words, vec!["water", "book"], "功能詞不該進牌組");
     }
 
     /// 標籤比對必須精確：zk 不能命中 zkk。
@@ -735,9 +960,20 @@ mod tests {
         .await
         .unwrap();
 
-        let added = cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 10, t0())
-            .await
-            .unwrap();
+        let added = cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 10,
+                skip_function_words: false,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
         assert_eq!(added, 0);
     }
 
@@ -756,9 +992,20 @@ mod tests {
             .await
             .unwrap();
         }
-        cards::add_by_tag(&db, profile, "en", "zk", &[CardKind::Recognition], 1, t0())
-            .await
-            .unwrap();
+        cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 1,
+                skip_function_words: false,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
 
         let summary = cards::tag_summary(&db, profile, "en").await.unwrap();
         let zk = summary.iter().find(|(t, ..)| t == "zk").unwrap();
@@ -768,6 +1015,136 @@ mod tests {
         assert_eq!(zk.2, 1, "其中一個已加入牌組");
         assert_eq!(gk.1, 2);
         assert_eq!(gk.2, 1, "同一個字同時屬於 zk 與 gk，兩邊都要算到");
+    }
+
+    /// 建立 n 張新卡，詞頻由 1 開始遞增。
+    async fn seed_new_cards(db: &Db, profile: ProfileId, n: i64) {
+        for i in 1..=n {
+            let word = format!("w{i:04}");
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', ?, ' zk ')",
+            )
+            .bind(&word)
+            .bind(&word)
+            .bind(i)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        cards::add_by_tag(
+            db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: n,
+                skip_function_words: false,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// 一次加一千個字，第一天不該全部湧出來。
+    #[tokio::test]
+    async fn daily_queue_caps_new_cards() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 50).await;
+
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 15, 200)
+            .await
+            .unwrap();
+
+        assert_eq!(queue.len(), 15, "每日新卡上限沒生效");
+        // 依詞頻由常用到罕見引入
+        let ids: Vec<i64> = queue.iter().map(|c| c.lemma_id.0).collect();
+        assert_eq!(ids, (1..=15).collect::<Vec<_>>());
+    }
+
+    /// 今天已經引入過的新卡要計入額度，否則關掉再開就能無限刷新。
+    #[tokio::test]
+    async fn introduced_new_cards_count_against_the_daily_limit() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 50).await;
+        let scheduler = Scheduler::default();
+
+        // 學掉 5 張
+        let first = cards::daily_queue(&db, profile, t0(), t0(), 15, 200)
+            .await
+            .unwrap();
+        for card in first.iter().take(5) {
+            let (next, log) = scheduler.review(card, Rating::Good, t0(), None);
+            cards::record_review(&db, &next, &log).await.unwrap();
+        }
+
+        assert_eq!(
+            cards::new_cards_introduced_today(&db, profile, t0())
+                .await
+                .unwrap(),
+            5
+        );
+
+        // 稍後再開，只剩 10 張新卡額度
+        let later = t0() + Duration::minutes(30);
+        let queue = cards::daily_queue(&db, profile, later, t0(), 15, 200)
+            .await
+            .unwrap();
+        let new_count = queue.iter().filter(|c| c.state == CardState::New).count();
+        assert_eq!(new_count, 10, "已引入的新卡沒有計入額度");
+
+        // 隔天額度重置
+        let tomorrow = t0() + Duration::days(1);
+        let queue = cards::daily_queue(&db, profile, tomorrow, tomorrow, 15, 200)
+            .await
+            .unwrap();
+        let new_count = queue.iter().filter(|c| c.state == CardState::New).count();
+        assert_eq!(new_count, 15, "隔天額度應該重置");
+    }
+
+    /// 幾分鐘後要再看一次的卡，必須排在新卡前面。
+    #[tokio::test]
+    async fn learning_cards_come_before_new_ones() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 10).await;
+        let scheduler = Scheduler::default();
+
+        // 第一張按 Again，10 分鐘內要再出現
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 5, 200)
+            .await
+            .unwrap();
+        let (next, log) = scheduler.review(&queue[0], Rating::Again, t0(), None);
+        cards::record_review(&db, &next, &log).await.unwrap();
+
+        let later = t0() + Duration::minutes(5);
+        let queue = cards::daily_queue(&db, profile, later, t0(), 5, 200)
+            .await
+            .unwrap();
+
+        assert_eq!(queue[0].state, CardState::Learning, "學習中的卡要排最前面");
+        assert_eq!(queue[0].lemma_id, next.lemma_id);
+    }
+
+    #[tokio::test]
+    async fn daily_counts_report_what_is_left_today() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 30).await;
+
+        let (reviews, new_today) = cards::daily_counts(&db, profile, t0(), t0(), 15)
+            .await
+            .unwrap();
+        assert_eq!(reviews, 0, "還沒有任何卡進入複習階段");
+        assert_eq!(new_today, 15);
+
+        // 牌組裡只剩 3 張新卡時，不該顯示 15
+        let (db2, profile2) = setup().await;
+        seed_new_cards(&db2, profile2, 3).await;
+        let (_, new_today) = cards::daily_counts(&db2, profile2, t0(), t0(), 15)
+            .await
+            .unwrap();
+        assert_eq!(new_today, 3);
     }
 
     #[tokio::test]

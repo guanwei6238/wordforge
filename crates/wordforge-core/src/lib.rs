@@ -9,11 +9,13 @@
 //! - [`coverage`]：可理解輸入（90% 法則）的覆蓋率計算與目標詞挑選
 //! - [`model`]：跨層共用的領域型別
 //! - [`text`]：字串正規化與斷詞的共用工具
+//! - [`wordlist`]：不適合做成單字卡的功能詞
 
 pub mod coverage;
 pub mod model;
 pub mod srs;
 pub mod text;
+pub mod wordlist;
 
 pub use coverage::{Coverage, CoverageBand};
 pub use model::{Card, CardKind, CardState, LemmaId, ProfileId, Rating, ReviewLog};
