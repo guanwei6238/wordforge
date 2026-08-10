@@ -152,3 +152,329 @@ button:hover {
   color: var(--error);
   margin: 0;
 }
+
+/* ---------------------------------------------------------------- 版面 */
+
+.app {
+  max-width: 980px;
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1.5rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.75rem;
+}
+
+.topbar h1 {
+  margin: 0;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.tab {
+  border: none;
+  background: none;
+  padding: 0.35rem 0.75rem;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.tab:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.tab.active {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+/* ---------------------------------------------------------------- 通用 */
+
+.tag {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.tag.in-deck {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.ok {
+  color: var(--accent);
+  margin: 0;
+}
+
+button.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ---------------------------------------------------------------- 字典 */
+
+.dictionary {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.search {
+  font: inherit;
+  font-size: 1.1rem;
+  padding: 0.65rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.dict-body {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(0, 1.4fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.hits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 65vh;
+  overflow-y: auto;
+}
+
+.hit {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  background: none;
+  border: 1px solid transparent;
+}
+
+.hit:hover,
+.hit.selected {
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+.hit-word {
+  font-weight: 500;
+}
+
+.hit-gloss {
+  color: var(--muted);
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.empty {
+  padding: 1rem 0.75rem;
+  font-size: 0.9rem;
+}
+
+.detail {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+}
+
+.detail header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.detail h2 {
+  margin: 0;
+  font-size: 1.6rem;
+}
+
+.detail .add {
+  margin-left: auto;
+}
+
+.prons {
+  display: flex;
+  gap: 1rem;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+
+.pron {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.senses {
+  padding-left: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.senses .gloss {
+  margin: 0;
+}
+
+.senses .translation {
+  margin: 0.15rem 0 0;
+  color: var(--muted);
+}
+
+.senses .labels {
+  margin: 0.25rem 0 0;
+  display: flex;
+  gap: 0.3rem;
+}
+
+.example {
+  margin: 0.35rem 0 0;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border);
+  font-size: 0.9rem;
+}
+
+.attribution {
+  margin: 0.4rem 0 0;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.forms {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 1rem;
+}
+
+/* ---------------------------------------------------------------- 匯入 */
+
+.import {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.panel h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.panel label {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.9rem;
+}
+
+.panel select,
+.panel input {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.path {
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.progress progress {
+  width: 100%;
+  height: 0.5rem;
+}
+
+.progress p {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+}
+
+.sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+}
+
+.note {
+  font-size: 0.9rem;
+}
+
+.note p,
+.note ul {
+  margin: 0;
+}
+
+.note ul {
+  padding-left: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+code {
+  background: var(--bg);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}

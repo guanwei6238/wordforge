@@ -3,15 +3,19 @@
 //! 這一層刻意只做三件事：組裝依賴、轉換型別、把錯誤變成前端看得懂的字串。
 //! 任何演算法都不該寫在這裡。
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use tauri::{AppHandle, Emitter, Manager};
 use time::OffsetDateTime;
 use wordforge_core::model::{CardKind, LemmaId, ProfileId, Rating};
 use wordforge_core::srs::Scheduler;
 use wordforge_db::Db;
+use wordforge_db::dict::{DictStats, SearchHit, WordDetail};
 use wordforge_db::repo::{cards, lemmas, profiles};
+use wordforge_import::{FreqFormat, ImportOptions, ImportProgress, ProgressSink};
 
 /// 「算是會了」的 stability 門檻（天）。撐得過三週不複習才計入詞彙量。
 const KNOWN_STABILITY_DAYS: f64 = 21.0;
@@ -19,6 +23,10 @@ const KNOWN_STABILITY_DAYS: f64 = 21.0;
 pub struct AppState {
     db: Db,
     scheduler: Arc<Scheduler>,
+    /// 匯入中斷旗標。使用者按下取消時設為 true，匯入迴圈在批次邊界檢查。
+    import_cancel: Arc<AtomicBool>,
+    /// 同時只允許一個匯入任務：兩個任務同時寫同一個 SQLite 檔只會互相卡住。
+    import_running: Arc<AtomicBool>,
 }
 
 /// Tauri command 的錯誤型別。前端只需要一段可顯示的訊息。
@@ -52,10 +60,12 @@ macro_rules! from_error {
 from_error!(
     wordforge_db::DbError,
     wordforge_dict::DictError,
+    wordforge_import::ImportError,
     wordforge_llm::LlmError,
     sqlx::Error,
     std::io::Error,
     anyhow::Error,
+    tauri::Error,
 );
 
 type CmdResult<T> = std::result::Result<T, CommandError>;
@@ -226,6 +236,207 @@ async fn study_stats(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdR
     })
 }
 
+// ---------------------------------------------------------------- 查字典
+
+#[tauri::command]
+async fn search_words(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    lang: String,
+    query: String,
+    limit: i64,
+) -> CmdResult<Vec<SearchHit>> {
+    Ok(wordforge_db::dict::search(&state.db, &lang, &query, profile_id, limit).await?)
+}
+
+#[tauri::command]
+async fn word_detail(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    lemma_id: i64,
+) -> CmdResult<Option<WordDetail>> {
+    Ok(wordforge_db::dict::detail(&state.db, lemma_id, profile_id).await?)
+}
+
+#[tauri::command]
+async fn dictionary_stats(state: tauri::State<'_, AppState>) -> CmdResult<DictStats> {
+    Ok(wordforge_db::dict::stats(&state.db).await?)
+}
+
+/// 把查到的字加進牌組。`kinds` 空著就只建立辨識卡。
+#[tauri::command]
+async fn add_lemma_to_deck(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    lemma_id: i64,
+    kinds: Vec<String>,
+) -> CmdResult<()> {
+    let now = OffsetDateTime::now_utc();
+    let kinds: Vec<CardKind> = if kinds.is_empty() {
+        vec![CardKind::Recognition]
+    } else {
+        kinds
+            .iter()
+            .map(|k| match k.as_str() {
+                "recognition" => Ok(CardKind::Recognition),
+                "recall" => Ok(CardKind::Recall),
+                "listening" => Ok(CardKind::Listening),
+                "spelling" => Ok(CardKind::Spelling),
+                other => Err(CommandError::new(format!("未知的卡片類型：{other}"))),
+            })
+            .collect::<CmdResult<_>>()?
+    };
+
+    for kind in kinds {
+        cards::ensure(
+            &state.db,
+            ProfileId(profile_id),
+            LemmaId(lemma_id),
+            kind,
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 匯入
+
+/// 匯入的檔案格式。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportKind {
+    /// kaikki.org 的 Wiktionary JSONL
+    WiktionaryJsonl,
+    Csv,
+    Tsv,
+    /// 一行一個字的排序詞頻表
+    FreqRanked,
+    /// `word<TAB>count`
+    FreqTab,
+    /// `word,count`
+    FreqComma,
+}
+
+/// 把匯入進度轉成 Tauri 事件送給前端。
+struct TauriProgress {
+    app: AppHandle,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ProgressSink for TauriProgress {
+    fn report(&self, progress: &ImportProgress) {
+        // 發送失敗代表視窗已經關了，這時沒必要中斷匯入——
+        // 讓它把當前批次寫完比較乾淨。
+        if let Err(e) = self.app.emit("import://progress", progress) {
+            tracing::warn!(error = %e, "進度事件送不出去");
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+}
+
+/// 開始匯入。這個 command 會立刻回傳，實際工作在背景進行。
+///
+/// 匯入一份完整的 Wiktionary 要好幾分鐘，讓 `invoke` 一直卡著的話，
+/// 前端不但拿不到進度，還會誤以為當機。
+#[tauri::command]
+async fn start_import(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    kind: ImportKind,
+    lang: String,
+) -> CmdResult<()> {
+    if state
+        .import_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(CommandError::new("已經有一個匯入正在進行中"));
+    }
+    state.import_cancel.store(false, Ordering::SeqCst);
+
+    let db = state.db.clone();
+    let cancel = Arc::clone(&state.import_cancel);
+    let running = Arc::clone(&state.import_running);
+    let path = PathBuf::from(path);
+
+    tauri::async_runtime::spawn(async move {
+        let sink = TauriProgress {
+            app: app.clone(),
+            cancel,
+        };
+        let opts = ImportOptions::default();
+
+        let result = match kind {
+            ImportKind::WiktionaryJsonl => {
+                wordforge_import::import_wiktionary_jsonl(&db, &path, &lang, &opts, &sink).await
+            }
+            ImportKind::Csv | ImportKind::Tsv => {
+                let delimiter = if matches!(kind, ImportKind::Tsv) {
+                    b'\t'
+                } else {
+                    b','
+                };
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("我的單字表")
+                    .to_string();
+                wordforge_import::import_csv(&db, &path, &lang, delimiter, &name, &opts, &sink)
+                    .await
+            }
+            ImportKind::FreqRanked | ImportKind::FreqTab | ImportKind::FreqComma => {
+                let format = match kind {
+                    ImportKind::FreqRanked => FreqFormat::RankedList,
+                    ImportKind::FreqTab => FreqFormat::TabCounts,
+                    _ => FreqFormat::CommaCounts,
+                };
+                // 詞頻表只是更新既有詞條的排名，沒有逐筆進度可回報
+                wordforge_import::import_freq_list(&db, &path, &lang, format)
+                    .await
+                    .map(|updated| ImportProgress {
+                        processed: updated,
+                        imported: updated,
+                        ..Default::default()
+                    })
+            }
+        };
+
+        let emitted = match result {
+            Ok(progress) => {
+                tracing::info!(?progress, "匯入完成");
+                app.emit("import://done", progress)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "匯入失敗");
+                app.emit("import://error", e.to_string())
+            }
+        };
+        if let Err(e) = emitted {
+            tracing::warn!(error = %e, "完成事件送不出去");
+        }
+
+        running.store(false, Ordering::SeqCst);
+    });
+
+    Ok(())
+}
+
+/// 要求中止匯入。已經寫入的批次會保留。
+#[tauri::command]
+fn cancel_import(state: tauri::State<'_, AppState>) {
+    state.import_cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn import_running(state: tauri::State<'_, AppState>) -> bool {
+    state.import_running.load(Ordering::SeqCst)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -259,6 +470,8 @@ pub fn run() {
             app.manage(AppState {
                 db,
                 scheduler: Arc::new(Scheduler::default()),
+                import_cancel: Arc::new(AtomicBool::new(false)),
+                import_running: Arc::new(AtomicBool::new(false)),
             });
             Ok(())
         })
@@ -266,7 +479,14 @@ pub fn run() {
             list_due_cards,
             review_card,
             add_word,
-            study_stats
+            study_stats,
+            search_words,
+            word_detail,
+            dictionary_stats,
+            add_lemma_to_deck,
+            start_import,
+            cancel_import,
+            import_running,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 應用程式啟動失敗");

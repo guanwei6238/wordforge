@@ -15,7 +15,7 @@ cargo test
 # 桌面 App：Linux 需要先裝 WebView 相關套件
 sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
     patchelf build-essential curl wget file libxdo-dev libssl-dev
-cd apps/desktop && pnpm install && pnpm tauri dev
+cd apps/desktop && npm install && npm run tauri dev
 ```
 
 macOS 需要 Xcode Command Line Tools；Windows 需要
@@ -27,7 +27,7 @@ Microsoft C++ Build Tools 與 WebView2（Win11 已內建）。
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
-cd apps/desktop && pnpm typecheck
+cd apps/desktop && npm run typecheck
 ```
 
 CI 會跑同樣的檢查。

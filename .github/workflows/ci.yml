@@ -41,22 +41,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf libxdo-dev libssl-dev
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
-          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
       - name: 安裝前端依賴
         working-directory: apps/desktop
-        run: pnpm install --no-frozen-lockfile
+        run: npm ci
       - name: 前端型別檢查
         working-directory: apps/desktop
-        run: pnpm typecheck
+        run: npm run typecheck
       - name: 建置前端
         working-directory: apps/desktop
-        run: pnpm build
+        run: npm run build
       - name: 檢查 Rust 端
         run: cargo check -p wordforge-desktop

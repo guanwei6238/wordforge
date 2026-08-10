@@ -1,0 +1,556 @@
+//! # wordforge-import
+//!
+//! 把 [`wordforge_dict`] 解析出來的詞條批次寫進資料庫。
+//!
+//! 這一層獨立存在的理由：字典 dump 動輒數 GB、上百萬筆，匯入不是
+//! 「跑一個 for 迴圈」那麼單純，還要處理
+//!
+//! - **批次 transaction**：每筆各自 commit 的話，一百萬筆要跑好幾個小時
+//! - **進度回報**：使用者需要知道還要等多久，且不能每筆都發事件淹沒 UI
+//! - **中斷**：按下取消要在合理時間內停下，且已匯入的部分要保留
+//! - **容錯**：幾百萬行裡有幾行壞掉是常態，不該讓整批失敗
+//!
+//! `wordforge-dict` 只負責解析、`wordforge-db` 只負責 SQL，這些流程控制
+//! 放在兩者之間。
+
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::Serialize;
+use time::OffsetDateTime;
+use wordforge_db::Db;
+use wordforge_db::dict::{
+    self, EntryWrite, NewExample, NewPronunciation, NewSense, NewSource, SourceId,
+};
+use wordforge_dict::{DictEntry, DictError, SourceMeta};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ImportError {
+    #[error(transparent)]
+    Db(#[from] wordforge_db::DbError),
+
+    #[error(transparent)]
+    Dict(#[from] DictError),
+
+    #[error("讀取檔案失敗：{0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("資料庫操作失敗：{0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+pub type Result<T> = std::result::Result<T, ImportError>;
+
+/// 匯入進度。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ImportProgress {
+    /// 讀到的資料筆數（含跳過與失敗的）
+    pub processed: u64,
+    /// 實際寫進資料庫的詞條數
+    pub imported: u64,
+    /// 沒有任何釋義而跳過的（重定向頁、格式雜訊）
+    pub skipped: u64,
+    /// 解析失敗的行
+    pub failed: u64,
+    /// 已讀位元組數，用於算百分比
+    pub bytes_read: u64,
+    /// 檔案總位元組數；未知時為 0
+    pub bytes_total: u64,
+    /// 是否因為使用者取消而提早結束
+    pub cancelled: bool,
+}
+
+impl ImportProgress {
+    /// 完成度 0.0~1.0。無法得知檔案大小時回傳 `None`。
+    pub fn fraction(&self) -> Option<f64> {
+        (self.bytes_total > 0)
+            .then(|| (self.bytes_read as f64 / self.bytes_total as f64).clamp(0.0, 1.0))
+    }
+}
+
+/// 進度回報與取消的介面。
+///
+/// UI 端實作它來發 Tauri 事件；測試與 CLI 用 [`NoProgress`]。
+pub trait ProgressSink: Send + Sync {
+    fn report(&self, progress: &ImportProgress);
+
+    /// 每個批次結束時會問一次。回傳 `true` 就會在 commit 完當前批次後停止。
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// 什麼都不做的實作。
+pub struct NoProgress;
+
+impl ProgressSink for NoProgress {
+    fn report(&self, _: &ImportProgress) {}
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportOptions {
+    /// 每幾筆 commit 一次。太小會慢，太大會讓取消變遲鈍、記憶體佔用上升。
+    pub batch_size: usize,
+    /// 每處理幾筆回報一次進度。
+    pub report_every: u64,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: 1_000,
+            report_every: 2_000,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 型別轉換
+
+/// `DictEntry` → 資料庫寫入結構。借用而不複製字串，百萬筆時差很多。
+fn to_write<'a>(entry: &'a DictEntry) -> EntryWrite<'a> {
+    EntryWrite {
+        lang: &entry.lang,
+        headword: &entry.headword,
+        pos: &entry.pos,
+        freq_rank: entry.freq_rank,
+        cefr: entry.cefr.as_deref(),
+        senses: entry
+            .senses
+            .iter()
+            .map(|s| NewSense {
+                gloss: &s.gloss,
+                gloss_lang: &s.gloss_lang,
+                translation: s.translation.as_deref(),
+                register: s.register.as_deref(),
+                domain: s.domain.as_deref(),
+                examples: s
+                    .examples
+                    .iter()
+                    .map(|e| NewExample {
+                        text: &e.text,
+                        translation: e.translation.as_deref(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        pronunciations: entry
+            .pronunciations
+            .iter()
+            .map(|p| NewPronunciation {
+                accent: p.accent.as_deref(),
+                ipa: p.ipa.as_deref(),
+                // 音檔是否下載由使用者另外決定，這裡只記 IPA 與授權
+                audio_path: None,
+                audio_license: p.audio_license.as_deref(),
+                is_synthetic: false,
+            })
+            .collect(),
+        forms: entry
+            .forms
+            .iter()
+            .map(|(f, tag)| (f.as_str(), tag.as_str()))
+            .collect(),
+    }
+}
+
+/// 登記來源。
+pub async fn register_source(db: &Db, meta: &SourceMeta) -> Result<SourceId> {
+    Ok(dict::upsert_source(
+        db,
+        NewSource {
+            slug: &meta.slug,
+            name: &meta.name,
+            license: meta.license.as_deref(),
+            attribution: meta.attribution.as_deref(),
+            homepage: meta.homepage.as_deref(),
+            version: meta.version.as_deref(),
+        },
+        OffsetDateTime::now_utc(),
+    )
+    .await?)
+}
+
+// ---------------------------------------------------------------- 匯入
+
+/// 批次寫入詞條。
+///
+/// 解析失敗的項目會被計入 `failed` 並跳過，不會中斷整批匯入。
+/// 資料庫層級的錯誤（磁碟滿、schema 不符）則會直接中止——
+/// 那代表環境有問題，繼續跑只是浪費時間。
+pub async fn import_entries<I>(
+    db: &Db,
+    source: SourceId,
+    entries: I,
+    opts: &ImportOptions,
+    sink: &dyn ProgressSink,
+) -> Result<ImportProgress>
+where
+    I: IntoIterator<Item = std::result::Result<DictEntry, DictError>>,
+{
+    let mut progress = ImportProgress::default();
+    let mut iter = entries.into_iter();
+    let mut exhausted = false;
+
+    while !exhausted {
+        let mut tx = db.pool().begin().await?;
+        let mut in_batch = 0usize;
+
+        while in_batch < opts.batch_size {
+            let Some(item) = iter.next() else {
+                exhausted = true;
+                break;
+            };
+            progress.processed += 1;
+
+            match item {
+                Err(e) => {
+                    tracing::debug!(error = %e, "跳過一筆無法解析的資料");
+                    progress.failed += 1;
+                }
+                Ok(entry) if !entry.is_usable() => progress.skipped += 1,
+                Ok(entry) => {
+                    dict::write_entry(&mut tx, source, &to_write(&entry)).await?;
+                    progress.imported += 1;
+                    in_batch += 1;
+                }
+            }
+
+            if progress.processed % opts.report_every == 0 {
+                sink.report(&progress);
+            }
+        }
+
+        tx.commit().await?;
+
+        // 取消只在批次邊界檢查：這樣已寫入的資料一定是完整的批次，
+        // 不會留下寫到一半的詞條。
+        if !exhausted && sink.cancelled() {
+            progress.cancelled = true;
+            break;
+        }
+    }
+
+    sink.report(&progress);
+    Ok(progress)
+}
+
+// ---------------------------------------------------------------- 檔案入口
+
+/// 邊讀邊記位元組數，讓進度條有東西可以顯示。
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// 幫進度補上位元組資訊的轉接層。
+struct ByteAwareSink<'a> {
+    inner: &'a dyn ProgressSink,
+    count: Arc<AtomicU64>,
+    total: u64,
+}
+
+impl ProgressSink for ByteAwareSink<'_> {
+    fn report(&self, progress: &ImportProgress) {
+        let mut p = *progress;
+        p.bytes_read = self.count.load(Ordering::Relaxed);
+        p.bytes_total = self.total;
+        self.inner.report(&p);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+}
+
+/// 匯入 kaikki.org 的 Wiktionary JSONL。
+pub async fn import_wiktionary_jsonl(
+    db: &Db,
+    path: &Path,
+    lang: &str,
+    opts: &ImportOptions,
+    sink: &dyn ProgressSink,
+) -> Result<ImportProgress> {
+    let meta = SourceMeta::wiktionary(lang);
+    let source = register_source(db, &meta).await?;
+
+    let file = File::open(path)?;
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let count = Arc::new(AtomicU64::new(0));
+    let reader = BufReader::with_capacity(
+        1 << 20,
+        CountingReader {
+            inner: file,
+            count: Arc::clone(&count),
+        },
+    );
+
+    let byte_sink = ByteAwareSink {
+        inner: sink,
+        count: Arc::clone(&count),
+        total,
+    };
+
+    let mut progress = import_entries(
+        db,
+        source,
+        wordforge_dict::kaikki::parse_reader(reader),
+        opts,
+        &byte_sink,
+    )
+    .await?;
+
+    progress.bytes_read = count.load(Ordering::Relaxed);
+    progress.bytes_total = total;
+    Ok(progress)
+}
+
+/// 匯入 CSV / TSV 單字表。
+///
+/// 這種檔案通常只有幾百行，一次全讀進記憶體沒問題。
+pub async fn import_csv(
+    db: &Db,
+    path: &Path,
+    lang: &str,
+    delimiter: u8,
+    source_name: &str,
+    opts: &ImportOptions,
+    sink: &dyn ProgressSink,
+) -> Result<ImportProgress> {
+    let slug = format!(
+        "csv-{}",
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled")
+    );
+    let meta = SourceMeta {
+        slug,
+        name: source_name.to_string(),
+        // 使用者自己的單字表，授權由使用者自行認定
+        license: None,
+        attribution: None,
+        homepage: None,
+        version: None,
+    };
+    let source = register_source(db, &meta).await?;
+
+    let entries = wordforge_dict::tabular::parse(File::open(path)?, lang, delimiter)?;
+    import_entries(db, source, entries.into_iter().map(Ok), opts, sink).await
+}
+
+/// 詞頻表的格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreqFormat {
+    /// 一行一個字，行號就是排名
+    RankedList,
+    /// `word<TAB>count`
+    TabCounts,
+    /// `word,count`
+    CommaCounts,
+}
+
+/// 套用詞頻表。回傳實際更新到的詞條數。
+pub async fn import_freq_list(db: &Db, path: &Path, lang: &str, format: FreqFormat) -> Result<u64> {
+    let reader = BufReader::new(File::open(path)?);
+    let table = match format {
+        FreqFormat::RankedList => wordforge_dict::freq::load_ranked_list(reader)?,
+        FreqFormat::TabCounts => wordforge_dict::freq::load_counts(reader, '\t')?,
+        FreqFormat::CommaCounts => wordforge_dict::freq::load_counts(reader, ',')?,
+    };
+    Ok(dict::apply_freq_ranks(db, lang, &table).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use wordforge_dict::{ExampleEntry, SenseEntry};
+
+    /// 記錄每次回報的測試用 sink，可設定在第幾次回報後取消。
+    #[derive(Default)]
+    struct Recorder {
+        reports: Mutex<Vec<ImportProgress>>,
+        cancel_after: Option<u64>,
+        cancelled: AtomicBool,
+    }
+
+    impl ProgressSink for Recorder {
+        fn report(&self, p: &ImportProgress) {
+            self.reports.lock().unwrap().push(*p);
+            if let Some(n) = self.cancel_after
+                && p.imported >= n
+            {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+    }
+
+    fn entry(word: &str) -> DictEntry {
+        DictEntry {
+            lang: "en".into(),
+            headword: word.into(),
+            pos: "noun".into(),
+            senses: vec![SenseEntry {
+                gloss: format!("meaning of {word}"),
+                gloss_lang: "en".into(),
+                examples: vec![ExampleEntry {
+                    text: format!("A sentence with {word}."),
+                    translation: None,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn setup() -> (Db, SourceId) {
+        let db = Db::open_in_memory().await.unwrap();
+        let source = register_source(&db, &SourceMeta::wiktionary("en"))
+            .await
+            .unwrap();
+        (db, source)
+    }
+
+    #[tokio::test]
+    async fn imports_entries_and_counts_them() {
+        let (db, source) = setup().await;
+        let entries = vec![Ok(entry("apple")), Ok(entry("banana"))];
+
+        let p = import_entries(&db, source, entries, &ImportOptions::default(), &NoProgress)
+            .await
+            .unwrap();
+
+        assert_eq!(p.imported, 2);
+        assert_eq!(p.processed, 2);
+        assert!(!p.cancelled);
+
+        let stats = dict::stats(&db).await.unwrap();
+        assert_eq!(stats.lemmas, 2);
+        assert_eq!(stats.senses, 2);
+    }
+
+    /// 壞掉的行與沒有釋義的詞條都不該中斷整批匯入。
+    #[tokio::test]
+    async fn bad_rows_are_counted_not_fatal() {
+        let (db, source) = setup().await;
+        let entries = vec![
+            Ok(entry("apple")),
+            Err(DictError::Malformed {
+                line: 2,
+                reason: "壞掉".into(),
+            }),
+            Ok(DictEntry {
+                headword: "redirect".into(),
+                ..Default::default()
+            }),
+            Ok(entry("banana")),
+        ];
+
+        let p = import_entries(&db, source, entries, &ImportOptions::default(), &NoProgress)
+            .await
+            .unwrap();
+
+        assert_eq!(p.processed, 4);
+        assert_eq!(p.imported, 2);
+        assert_eq!(p.failed, 1);
+        assert_eq!(p.skipped, 1, "沒有釋義的詞條要跳過而不是寫進去");
+    }
+
+    /// 取消之後，已經 commit 的批次必須保留。
+    #[tokio::test]
+    async fn cancelling_keeps_committed_batches() {
+        let (db, source) = setup().await;
+        let entries: Vec<_> = (0..25).map(|i| Ok(entry(&format!("word{i:03}")))).collect();
+
+        let sink = Recorder {
+            cancel_after: Some(5),
+            ..Default::default()
+        };
+        let opts = ImportOptions {
+            batch_size: 5,
+            report_every: 5,
+        };
+
+        let p = import_entries(&db, source, entries, &opts, &sink)
+            .await
+            .unwrap();
+
+        assert!(p.cancelled, "應該要中途停下來");
+        assert!(p.imported < 25, "取消之後不該把剩下的都匯入");
+        assert!(p.imported >= 5, "已經 commit 的批次要保留");
+
+        let stats = dict::stats(&db).await.unwrap();
+        assert_eq!(
+            stats.lemmas, p.imported as i64,
+            "資料庫裡的筆數要跟回報的一致"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_is_reported_periodically() {
+        let (db, source) = setup().await;
+        let entries: Vec<_> = (0..10).map(|i| Ok(entry(&format!("w{i}")))).collect();
+        let sink = Recorder::default();
+
+        import_entries(
+            &db,
+            source,
+            entries,
+            &ImportOptions {
+                batch_size: 100,
+                report_every: 4,
+            },
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let reports = sink.reports.lock().unwrap();
+        // 第 4、8 筆各一次，結束時一次
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports.last().unwrap().imported, 10);
+    }
+
+    #[tokio::test]
+    async fn fraction_needs_a_known_total() {
+        let p = ImportProgress {
+            bytes_read: 50,
+            bytes_total: 200,
+            ..Default::default()
+        };
+        assert_eq!(p.fraction(), Some(0.25));
+        assert_eq!(ImportProgress::default().fraction(), None);
+    }
+
+    #[tokio::test]
+    async fn reimporting_the_same_file_does_not_duplicate() {
+        let (db, source) = setup().await;
+        let make = || vec![Ok(entry("apple")), Ok(entry("banana"))];
+
+        import_entries(&db, source, make(), &ImportOptions::default(), &NoProgress)
+            .await
+            .unwrap();
+        import_entries(&db, source, make(), &ImportOptions::default(), &NoProgress)
+            .await
+            .unwrap();
+
+        let stats = dict::stats(&db).await.unwrap();
+        assert_eq!(stats.lemmas, 2);
+        assert_eq!(stats.senses, 2, "重複匯入不該讓釋義變兩倍");
+    }
+}

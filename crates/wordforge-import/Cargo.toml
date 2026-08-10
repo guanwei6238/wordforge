@@ -1,0 +1,23 @@
+[package]
+name = "wordforge-import"
+description = "把解析出來的字典資料批次寫入資料庫，含進度回報與中斷"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+wordforge-core = { workspace = true }
+wordforge-db = { workspace = true }
+wordforge-dict = { workspace = true }
+
+serde = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -5935,6 +5935,7 @@ dependencies = [
  "wordforge-core",
  "wordforge-db",
  "wordforge-dict",
+ "wordforge-import",
  "wordforge-llm",
 ]
 
@@ -5948,6 +5949,21 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "wordforge-core",
+]
+
+[[package]]
+name = "wordforge-import"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tracing",
+ "wordforge-core",
+ "wordforge-db",
+ "wordforge-dict",
 ]
 
 [[package]]

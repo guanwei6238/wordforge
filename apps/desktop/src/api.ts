@@ -75,3 +75,144 @@ export function addWord(word: string, lang = "en", profileId = DEFAULT_PROFILE_I
 export function studyStats(profileId = DEFAULT_PROFILE_ID): Promise<StudyStats> {
   return invoke("study_stats", { profileId });
 }
+
+/* ------------------------------------------------------------------ 查字典 */
+
+export interface SearchHit {
+  lemma_id: number;
+  text: string;
+  pos: string;
+  freq_rank: number | null;
+  cefr: string | null;
+  gloss: string | null;
+  translation: string | null;
+  in_deck: boolean;
+}
+
+export interface ExampleView {
+  text: string;
+  translation: string | null;
+}
+
+export interface SenseView {
+  gloss: string;
+  translation: string | null;
+  register: string | null;
+  domain: string | null;
+  examples: ExampleView[];
+  /** CC BY-SA 要求顯示的出處 */
+  attribution: string | null;
+}
+
+export interface PronunciationView {
+  accent: string | null;
+  ipa: string | null;
+  audio_path: string | null;
+  is_synthetic: boolean;
+}
+
+export interface WordDetail {
+  lemma_id: number;
+  text: string;
+  pos: string;
+  freq_rank: number | null;
+  cefr: string | null;
+  senses: SenseView[];
+  pronunciations: PronunciationView[];
+  /** [詞形, 標籤] */
+  forms: [string, string][];
+  in_deck: boolean;
+}
+
+export function searchWords(
+  query: string,
+  lang = "en",
+  limit = 30,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<SearchHit[]> {
+  return invoke("search_words", { profileId, lang, query, limit });
+}
+
+export function wordDetail(
+  lemmaId: number,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<WordDetail | null> {
+  return invoke("word_detail", { profileId, lemmaId });
+}
+
+export function addLemmaToDeck(
+  lemmaId: number,
+  kinds: CardKind[] = ["recognition"],
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<void> {
+  return invoke("add_lemma_to_deck", { profileId, lemmaId, kinds });
+}
+
+/* -------------------------------------------------------------------- 匯入 */
+
+export interface SourceInfo {
+  slug: string;
+  name: string;
+  license: string | null;
+  attribution: string | null;
+  imported_at: string;
+  lemma_count: number;
+}
+
+export interface DictStats {
+  lemmas: number;
+  senses: number;
+  with_audio: number;
+  sources: SourceInfo[];
+}
+
+export interface ImportProgress {
+  processed: number;
+  imported: number;
+  skipped: number;
+  failed: number;
+  bytes_read: number;
+  bytes_total: number;
+  cancelled: boolean;
+}
+
+/** 與 Rust 端的 `ImportKind` 對應 */
+export type ImportKind =
+  | "wiktionary_jsonl"
+  | "csv"
+  | "tsv"
+  | "freq_ranked"
+  | "freq_tab"
+  | "freq_comma";
+
+export const IMPORT_KINDS: { value: ImportKind; label: string; extensions: string[] }[] = [
+  { value: "wiktionary_jsonl", label: "Wiktionary (kaikki JSONL)", extensions: ["jsonl", "json"] },
+  { value: "csv", label: "單字表 CSV", extensions: ["csv"] },
+  { value: "tsv", label: "單字表 TSV", extensions: ["tsv", "txt"] },
+  { value: "freq_ranked", label: "詞頻表：一行一個字", extensions: ["txt"] },
+  { value: "freq_tab", label: "詞頻表：字<TAB>次數", extensions: ["txt", "tsv"] },
+  { value: "freq_comma", label: "詞頻表：字,次數", extensions: ["txt", "csv"] },
+];
+
+export function dictionaryStats(): Promise<DictStats> {
+  return invoke("dictionary_stats");
+}
+
+/** 立刻回傳；進度透過 `import://progress` 等事件送達。 */
+export function startImport(path: string, kind: ImportKind, lang = "en"): Promise<void> {
+  return invoke("start_import", { path, kind, lang });
+}
+
+export function cancelImport(): Promise<void> {
+  return invoke("cancel_import");
+}
+
+export function importRunning(): Promise<boolean> {
+  return invoke("import_running");
+}
+
+export const IMPORT_EVENTS = {
+  progress: "import://progress",
+  done: "import://done",
+  error: "import://error",
+} as const;

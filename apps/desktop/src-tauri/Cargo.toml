@@ -20,6 +20,7 @@ tauri-build = { version = "2", features = [] }
 wordforge-core = { workspace = true }
 wordforge-db = { workspace = true }
 wordforge-dict = { workspace = true }
+wordforge-import = { workspace = true }
 wordforge-llm = { workspace = true }
 
 sqlx = { workspace = true }

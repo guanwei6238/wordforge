@@ -4,6 +4,7 @@ members = [
     "crates/wordforge-core",
     "crates/wordforge-db",
     "crates/wordforge-dict",
+    "crates/wordforge-import",
     "crates/wordforge-llm",
     "apps/desktop/src-tauri",
 ]
@@ -11,6 +12,7 @@ default-members = [
     "crates/wordforge-core",
     "crates/wordforge-db",
     "crates/wordforge-dict",
+    "crates/wordforge-import",
     "crates/wordforge-llm",
 ]
 
@@ -26,6 +28,7 @@ authors = ["Wordforge Contributors"]
 wordforge-core = { path = "crates/wordforge-core" }
 wordforge-db = { path = "crates/wordforge-db" }
 wordforge-dict = { path = "crates/wordforge-dict" }
+wordforge-import = { path = "crates/wordforge-import" }
 wordforge-llm = { path = "crates/wordforge-llm" }
 
 anyhow = "1"

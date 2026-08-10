@@ -5,7 +5,9 @@
 //!
 //! 這一層只負責存取，不放商業邏輯：排程算法在 `wordforge-core`。
 
+pub mod dict;
 pub mod repo;
+pub(crate) mod ts;
 
 use std::path::Path;
 

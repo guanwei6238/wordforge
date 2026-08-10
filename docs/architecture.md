@@ -14,8 +14,11 @@
 wordforge-core     wordforge-db        wordforge-llm
 （純運算）          （SQLite）          （HTTP / 本機模型）
    ▲                    ▲
+   │            wordforge-import
+   │           （批次寫入 / 進度 / 中斷）
+   │                    ▲
    └──── wordforge-dict ┘
-        （字典匯入解析）
+          （格式解析）
 ```
 
 ## 模組邊界
@@ -25,6 +28,7 @@ wordforge-core     wordforge-db        wordforge-llm
 | `wordforge-core` | FSRS 排程、覆蓋率計算、領域型別、文字正規化 | 任何 I/O、資料庫、網路、時鐘 |
 | `wordforge-db` | SQLite schema、migration、查詢 | 演算法、業務規則 |
 | `wordforge-dict` | 把外部字典格式解析成 `DictEntry` | 寫入資料庫、下載檔案 |
+| `wordforge-import` | 批次 transaction、進度回報、中斷、容錯 | 解析格式、SQL |
 | `wordforge-llm` | 供應商協定、prompt 模板 | 決定「該出什麼題」的教學邏輯 |
 | `src-tauri` | command 註冊、狀態管理、錯誤轉字串 | 上述任何一項 |
 
@@ -47,6 +51,22 @@ wordforge-core     wordforge-db        wordforge-llm
 
 前端送來的只有 `card_id` 與評分，卡片狀態一律以資料庫為準——
 否則視窗開著放一天再按下按鈕，就會用過期的 stability 算出錯誤間隔。
+
+## 資料流：匯入一份字典
+
+一份完整的英文 Wiktionary 有上百萬筆、數 GB，逐筆 commit 會跑上好幾個小時，
+所以匯入不是一個 for 迴圈：
+
+```
+1. dict   : 逐行串流解析 JSONL（不整份載入記憶體）
+2. import : 每 1000 筆包成一個 transaction
+3. import : 每 2000 筆回報一次進度（每筆都發事件會淹沒 UI）
+4. db     : write_entry 對同一來源冪等——重匯不會讓釋義越疊越多
+5. import : 每個批次結束時檢查取消旗標，已 commit 的批次保留
+```
+
+解析失敗的行只計入 `failed` 並跳過；資料庫錯誤才中止整批。
+幾百萬行裡有幾行壞掉是常態，不該讓整份匯入白費。
 
 ## 資料流：產生一篇閱讀理解
 

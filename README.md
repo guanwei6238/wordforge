@@ -72,8 +72,11 @@ Cambridge、Oxford、朗文等商業字典的釋義、例句與錄音**受著作
 ├─────────────────────────────────────────────┤
 │  wordforge-db     SQLite (sqlx) + migrations │
 ├─────────────────────────────────────────────┤
-│  wordforge-dict   字典匯入器 / 詞形還原 /    │
-│                   音檔管理                   │
+│  wordforge-dict   字典格式解析器             │
+│                   Wiktionary / CSV / 詞頻表  │
+├─────────────────────────────────────────────┤
+│  wordforge-import 批次匯入：transaction /    │
+│                   進度回報 / 中斷 / 容錯     │
 ├─────────────────────────────────────────────┤
 │  wordforge-llm    LLM 供應商抽象層           │
 │                   Anthropic / OpenAI / Ollama│
@@ -86,7 +89,7 @@ Cambridge、Oxford、朗文等商業字典的釋義、例句與錄音**受著作
 
 ## 開發環境
 
-需求：**Rust 1.85+**、**Node.js 20+**、**pnpm**（或 npm）。
+需求：**Rust 1.85+**、**Node.js 20+**、**npm**。
 
 Linux 另需 Tauri 的系統依賴：
 
@@ -102,15 +105,18 @@ sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
 cargo test
 
 # 完整桌面 App（開發模式）
-cd apps/desktop && pnpm install && pnpm tauri dev
+cd apps/desktop && npm install && npm run tauri dev
 ```
 
 ---
 
 ## 專案狀態
 
-🚧 **v0.1 骨架階段** — 架構與資料模型已定案，功能開發中。
-路線圖見 [`docs/roadmap.md`](docs/roadmap.md)，歡迎在 Issues 討論。
+🚧 **v0.2 開發中** — 已經可以匯入字典、查字典、用 FSRS 背單字。
+AI 出題（v0.3）尚未接上。路線圖見 [`docs/roadmap.md`](docs/roadmap.md)，歡迎在 Issues 討論。
+
+第一次使用：到「匯入」頁載入一份 [kaikki.org](https://kaikki.org/) 的 Wiktionary JSONL
+或你自己的 CSV 單字表，就可以開始查字典與背單字。
 
 ## 文件
 
