@@ -132,7 +132,14 @@ curl -LO https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv
 ./target/release/wordforge stats           # 看字典規模與來源授權
 ./target/release/wordforge search run      # 查一個字
 ./target/release/wordforge path            # 資料庫在哪
+
+# 依考試範圍批次建卡（依詞頻由常用排到罕見）
+./target/release/wordforge deck tags                        # 有哪些範圍、各幾個字
+./target/release/wordforge deck add --tag zk --limit 500    # 國中會考範圍前 500 個常用字
 ```
+
+`zk` 國中會考、`gk` 學測、`cet4`/`cet6`、`ky` 考研、`toefl`、`ielts`、`gre`、
+`oxford3000` 牛津核心三千——這些標籤來自 ECDICT。
 
 ## 專案狀態
 
