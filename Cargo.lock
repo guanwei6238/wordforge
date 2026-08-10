@@ -6067,6 +6067,7 @@ dependencies = [
  "wordforge-dict",
  "wordforge-import",
  "wordforge-llm",
+ "wordforge-tts",
 ]
 
 [[package]]
@@ -6108,6 +6109,14 @@ dependencies = [
  "tokio",
  "tracing",
  "wordforge-core",
+]
+
+[[package]]
+name = "wordforge-tts"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

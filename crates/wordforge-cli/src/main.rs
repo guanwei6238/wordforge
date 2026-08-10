@@ -90,6 +90,9 @@ enum DeckCmd {
         /// 連 the / of / and 這類功能詞也一起加入（預設排除，它們該從閱讀中學）
         #[arg(long)]
         include_function_words: bool,
+        /// 跳過比這個詞頻排名更常用的字（已經會的就不用再排）
+        #[arg(long, default_value_t = 0)]
+        from_rank: i64,
     },
 }
 
@@ -309,6 +312,7 @@ async fn main() -> Result<()> {
             limit,
             kinds,
             include_function_words,
+            from_rank,
         }) => {
             let kinds: Vec<CardKind> = kinds
                 .iter()
@@ -330,6 +334,7 @@ async fn main() -> Result<()> {
                     kinds: &kinds,
                     limit,
                     skip_function_words: !include_function_words,
+                    min_freq_rank: from_rank,
                 },
                 OffsetDateTime::now_utc(),
             )

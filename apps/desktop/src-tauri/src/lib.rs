@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use time::OffsetDateTime;
 use wordforge_core::model::{CardKind, LemmaId, ProfileId, Rating};
+use wordforge_core::placement::{self, PlacementAnswer, PlacementResult};
 use wordforge_core::srs::Scheduler;
 use wordforge_db::Db;
+use wordforge_db::dict::PlacementItem;
 use wordforge_db::dict::{DictStats, SearchHit, WordDetail};
 use wordforge_db::repo::{cards, lemmas, profiles};
 use wordforge_import::{FreqFormat, ImportOptions, ImportProgress, ProgressSink};
@@ -384,10 +386,107 @@ async fn add_words_by_tag(
             limit,
             // 功能詞不做成卡片，理由見 wordforge_core::wordlist
             skip_function_words: true,
+            // 分級測驗說已經會的字就不要再排進來
+            min_freq_rank: start_rank(&state.db, profile_id).await?,
         },
         OffsetDateTime::now_utc(),
     )
     .await?)
+}
+
+// ---------------------------------------------------------------- 發音
+
+/// 朗讀一個字。
+///
+/// 目前用系統內建的語音合成（Linux 是 speech-dispatcher）。真人錄音品質好很多，
+/// 之後會以 Wiktionary 的音檔為優先來源，TTS 退為後備。
+#[tauri::command]
+async fn speak(text: String, lang: String) -> CmdResult<()> {
+    // 語音合成會阻塞到唸完，不能佔住 async runtime 的執行緒
+    tauri::async_runtime::spawn_blocking(move || wordforge_tts::speak(&text, &lang))
+        .await
+        .map_err(|e| CommandError::new(e.to_string()))?
+        .map_err(|e| CommandError::new(e.to_string()))
+}
+
+#[tauri::command]
+fn speech_available() -> bool {
+    wordforge_tts::is_available()
+}
+
+// ---------------------------------------------------------------- 分級測驗
+
+/// 每個詞頻層抽幾題。七層共 35 題，大約三分鐘。
+const PLACEMENT_ITEMS_PER_BAND: i64 = 5;
+
+#[tauri::command]
+async fn placement_items(
+    state: tauri::State<'_, AppState>,
+    lang: String,
+) -> CmdResult<Vec<PlacementItem>> {
+    Ok(wordforge_db::dict::sample_for_placement(
+        &state.db,
+        &lang,
+        &placement::default_bands(),
+        PLACEMENT_ITEMS_PER_BAND,
+    )
+    .await?)
+}
+
+/// 收下測驗結果：估計詞彙量、記住起始詞頻，並把牌組裡太簡單的新卡收起來。
+#[derive(Debug, Serialize)]
+pub struct PlacementOutcome {
+    #[serde(flatten)]
+    pub result: PlacementResult,
+    /// 被收起來的「早就會了」的卡片數
+    pub suspended_cards: u64,
+}
+
+#[tauri::command]
+async fn submit_placement(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    lang: String,
+    answers: Vec<PlacementAnswer>,
+) -> CmdResult<PlacementOutcome> {
+    let result = placement::estimate(&placement::default_bands(), &answers);
+
+    // 起始詞頻存進 profile，之後加入新字都會從這裡開始
+    sqlx::query(
+        "UPDATE profile
+         SET settings_json = json_set(
+                 CASE WHEN json_valid(settings_json) THEN settings_json ELSE '{}' END,
+                 '$.start_rank', ?,
+                 '$.estimated_vocabulary', ?)
+         WHERE id = ?",
+    )
+    .bind(result.start_rank)
+    .bind(result.estimated_vocabulary)
+    .bind(profile_id)
+    .execute(state.db.pool())
+    .await?;
+
+    let suspended =
+        cards::suspend_easy_new_cards(&state.db, ProfileId(profile_id), &lang, result.start_rank)
+            .await?;
+
+    Ok(PlacementOutcome {
+        result,
+        suspended_cards: suspended,
+    })
+}
+
+/// 讀出 profile 設定裡的起始詞頻；沒做過測驗就是 0（從頭開始）。
+async fn start_rank(db: &Db, profile_id: i64) -> CmdResult<i64> {
+    let rank: Option<i64> = sqlx::query_scalar(
+        "SELECT CAST(json_extract(settings_json, '$.start_rank') AS INTEGER)
+         FROM profile WHERE id = ? AND json_valid(settings_json)",
+    )
+    .bind(profile_id)
+    .fetch_optional(db.pool())
+    .await?
+    .flatten();
+    Ok(rank.unwrap_or(0))
 }
 
 // ---------------------------------------------------------------- 匯入
@@ -576,6 +675,10 @@ pub fn run() {
             add_lemma_to_deck,
             deck_tags,
             add_words_by_tag,
+            speak,
+            speech_available,
+            placement_items,
+            submit_placement,
             start_import,
             cancel_import,
             import_running,

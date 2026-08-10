@@ -183,6 +183,57 @@ export function addLemmaToDeck(
   return invoke("add_lemma_to_deck", { profileId, lemmaId, kinds });
 }
 
+/* -------------------------------------------------------------------- 發音 */
+
+/** 朗讀一個字。回傳時已經唸完。 */
+export function speak(text: string, lang = "en"): Promise<void> {
+  return invoke("speak", { text, lang });
+}
+
+export function speechAvailable(): Promise<boolean> {
+  return invoke("speech_available");
+}
+
+/* ---------------------------------------------------------------- 分級測驗 */
+
+export interface PlacementItem {
+  lemma_id: number;
+  text: string;
+  freq_rank: number;
+  band_index: number;
+  translation: string | null;
+}
+
+export interface PlacementAnswer {
+  band_index: number;
+  known: boolean;
+}
+
+export interface FrequencyBand {
+  start_rank: number;
+  end_rank: number;
+}
+
+export interface PlacementOutcome {
+  estimated_vocabulary: number;
+  start_rank: number;
+  /** [區間, 認識率] */
+  band_rates: [FrequencyBand, number][];
+  suspended_cards: number;
+}
+
+export function placementItems(lang = "en"): Promise<PlacementItem[]> {
+  return invoke("placement_items", { lang });
+}
+
+export function submitPlacement(
+  answers: PlacementAnswer[],
+  lang = "en",
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<PlacementOutcome> {
+  return invoke("submit_placement", { profileId, lang, answers });
+}
+
 /* -------------------------------------------------------------------- 牌組 */
 
 export interface TagSummary {

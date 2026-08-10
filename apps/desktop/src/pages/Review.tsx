@@ -10,6 +10,7 @@ import {
   type StudyStats,
   studyStats,
 } from "../api";
+import SpeakButton from "../components/SpeakButton";
 
 /**
  * 複習頁：只做「看字 → 想意思 → 自評」這一條路徑。
@@ -125,7 +126,10 @@ export default function Review() {
         <p className="muted">載入中…</p>
       ) : current ? (
         <section className="card">
-          <p className="word">{current.word}</p>
+          <p className="word">
+            {current.word}
+            <SpeakButton text={current.word} audioPath={current.audio_path} />
+          </p>
           {current.ipa && <p className="ipa">{current.ipa}</p>}
 
           {revealed ? (

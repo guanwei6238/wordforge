@@ -1,0 +1,13 @@
+[package]
+name = "wordforge-tts"
+description = "呼叫作業系統內建的語音合成朗讀單字"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }

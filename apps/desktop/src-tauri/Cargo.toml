@@ -22,6 +22,7 @@ wordforge-db = { workspace = true }
 wordforge-dict = { workspace = true }
 wordforge-import = { workspace = true }
 wordforge-llm = { workspace = true }
+wordforge-tts = { workspace = true }
 
 sqlx = { workspace = true }
 tauri = { version = "2", features = [] }

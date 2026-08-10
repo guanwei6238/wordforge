@@ -348,6 +348,9 @@ pub mod cards {
         pub limit: i64,
         /// 排除 the / of / and 這類功能詞。除非有特別理由，都該是 `true`。
         pub skip_function_words: bool,
+        /// 跳過比這個排名更常用的字。分級測驗的結果會填在這裡，
+        /// 學過幾年英文的人不必從第一個字重背。
+        pub min_freq_rank: i64,
     }
 
     /// 依標籤批次建卡，例如「把國中範圍的字全部加進牌組」。
@@ -370,6 +373,7 @@ pub mod cards {
             kinds,
             limit,
             skip_function_words,
+            min_freq_rank,
         } = opts;
         // 標籤在資料庫裡存成 " zk gk "，前後補空白比對才不會讓 zk 誤中 zkk
         let pattern = format!("% {} %", tag.trim());
@@ -400,6 +404,7 @@ pub mod cards {
                  FROM (
                      SELECT id FROM lemma
                      WHERE lang = ? AND ' ' || tags || ' ' LIKE ? {exclusion}
+                       AND (freq_rank IS NULL OR freq_rank >= ?)
                      ORDER BY freq_rank IS NULL, freq_rank, id
                      LIMIT ?
                  ) AS pick
@@ -411,6 +416,7 @@ pub mod cards {
             .bind(&due)
             .bind(lang)
             .bind(&pattern)
+            .bind(min_freq_rank)
             .bind(limit)
             .execute(&mut *tx)
             .await?;
@@ -419,6 +425,35 @@ pub mod cards {
         tx.commit().await?;
 
         Ok(added)
+    }
+
+    /// 把「其實早就會」的新卡收起來。
+    ///
+    /// 分級測驗說使用者大概掌握了前 N 個常用字，但牌組裡可能已經排了一堆
+    /// 比 N 更常用的字。這些卡直接**暫停**而不是刪除——判斷可能不準，
+    /// 使用者之後想學隨時可以恢復，複習歷程也不會消失。
+    ///
+    /// 只動從未複習過的卡，任何已經開始學的進度都保留。
+    pub async fn suspend_easy_new_cards(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+        below_rank: i64,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE card SET suspended = 1
+             WHERE profile_id = ? AND suspended = 0 AND state = 'new' AND reps = 0
+               AND lemma_id IN (
+                   SELECT id FROM lemma
+                   WHERE lang = ? AND freq_rank IS NOT NULL AND freq_rank < ?
+               )",
+        )
+        .bind(profile_id.0)
+        .bind(lang)
+        .bind(below_rank)
+        .execute(db.pool())
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// 今天還可以引入幾張新卡。
@@ -830,6 +865,7 @@ mod tests {
                 kinds: &[CardKind::Recognition],
                 limit: 2,
                 skip_function_words: false,
+                min_freq_rank: 0,
             },
             t0(),
         )
@@ -872,6 +908,7 @@ mod tests {
                 kinds: &[CardKind::Recognition],
                 limit: 10,
                 skip_function_words: false,
+                min_freq_rank: 0,
             },
             t0(),
         )
@@ -891,6 +928,7 @@ mod tests {
                 kinds: &[CardKind::Recognition],
                 limit: 10,
                 skip_function_words: false,
+                min_freq_rank: 0,
             },
             t0(),
         )
@@ -933,6 +971,7 @@ mod tests {
                 kinds: &[CardKind::Recognition],
                 limit: 10,
                 skip_function_words: true,
+                min_freq_rank: 0,
             },
             t0(),
         )
@@ -946,6 +985,128 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(words, vec!["water", "book"], "功能詞不該進牌組");
+    }
+
+    /// 分級測驗說「你大概會前 2000 個字」，就不該再從第一個字開始排。
+    #[tokio::test]
+    async fn add_by_tag_can_skip_words_the_learner_already_knows() {
+        let (db, profile) = setup().await;
+        for (word, freq) in [("easy", 100), ("medium", 2500), ("hard", 9000)] {
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', ?, ' zk ')",
+            )
+            .bind(word)
+            .bind(word)
+            .bind(freq)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 10,
+                skip_function_words: false,
+                min_freq_rank: 2_000,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let words: Vec<String> = sqlx::query_scalar(
+            "SELECT l.text FROM card c JOIN lemma l ON l.id = c.lemma_id ORDER BY l.freq_rank",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(words, vec!["medium", "hard"], "太簡單的字不該再排進來");
+    }
+
+    /// 已經在牌組裡但其實早就會的新卡，應該能一次收起來。
+    #[tokio::test]
+    async fn easy_new_cards_can_be_suspended_in_bulk() {
+        let (db, profile) = setup().await;
+        for (word, freq) in [("easy", 100), ("hard", 9000)] {
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', ?, ' zk ')",
+            )
+            .bind(word)
+            .bind(word)
+            .bind(freq)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        cards::add_by_tag(
+            &db,
+            profile,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 10,
+                skip_function_words: false,
+                min_freq_rank: 0,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        // 先讓 easy 有複習紀錄，確認有進度的卡不會被動到
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 10, 100)
+            .await
+            .unwrap();
+        let easy = queue.iter().find(|c| c.lemma_id.0 == 1).unwrap();
+        let (next, log) = Scheduler::default().review(easy, Rating::Good, t0(), None);
+        cards::record_review(&db, &next, &log).await.unwrap();
+
+        let suspended = cards::suspend_easy_new_cards(&db, profile, "en", 2_000)
+            .await
+            .unwrap();
+        assert_eq!(suspended, 0, "已經開始學的卡不該被收起來");
+
+        // 換一個乾淨的情境：沒複習過的簡單卡
+        let (db2, profile2) = setup().await;
+        sqlx::query(
+            "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+             VALUES ('en', 'easy', 'easy', '', 100, ' zk ')",
+        )
+        .execute(db2.pool())
+        .await
+        .unwrap();
+        cards::add_by_tag(
+            &db2,
+            profile2,
+            cards::AddByTag {
+                lang: "en",
+                tag: "zk",
+                kinds: &[CardKind::Recognition],
+                limit: 10,
+                skip_function_words: false,
+                min_freq_rank: 0,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let suspended = cards::suspend_easy_new_cards(&db2, profile2, "en", 2_000)
+            .await
+            .unwrap();
+        assert_eq!(suspended, 1);
+        let queue = cards::daily_queue(&db2, profile2, t0(), t0(), 10, 100)
+            .await
+            .unwrap();
+        assert!(queue.is_empty(), "收起來的卡不該再出現在佇列裡");
     }
 
     /// 標籤比對必須精確：zk 不能命中 zkk。
@@ -969,6 +1130,7 @@ mod tests {
                 kinds: &[CardKind::Recognition],
                 limit: 10,
                 skip_function_words: false,
+                min_freq_rank: 0,
             },
             t0(),
         )
@@ -1001,6 +1163,7 @@ mod tests {
                 kinds: &[CardKind::Recognition],
                 limit: 1,
                 skip_function_words: false,
+                min_freq_rank: 0,
             },
             t0(),
         )
@@ -1041,6 +1204,7 @@ mod tests {
                 kinds: &[CardKind::Recognition],
                 limit: n,
                 skip_function_words: false,
+                min_freq_rank: 0,
             },
             t0(),
         )

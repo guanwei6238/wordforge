@@ -8,6 +8,7 @@ import {
   type WordDetail,
   wordDetail,
 } from "../api";
+import SpeakButton from "../components/SpeakButton";
 
 /**
  * 查字典頁。
@@ -115,6 +116,10 @@ export default function Dictionary() {
           <article className="detail">
             <header>
               <h2>{selected.text}</h2>
+              <SpeakButton
+                text={selected.text}
+                audioPath={selected.pronunciations[0]?.audio_path}
+              />
               {selected.pos && <span className="tag">{selected.pos}</span>}
               {selected.freq_rank != null && (
                 <span className="tag" title="詞頻排名，越小越常用">

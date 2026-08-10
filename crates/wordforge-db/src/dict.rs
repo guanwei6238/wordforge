@@ -538,6 +538,80 @@ fn bind_list(ids: &[i64]) -> String {
         .join(",")
 }
 
+/// 分級測驗的一題。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlacementItem {
+    pub lemma_id: i64,
+    pub text: String,
+    pub freq_rank: i64,
+    /// 對應 [`wordforge_core::placement`] 分層的索引
+    pub band_index: usize,
+    /// 作答後才顯示，用來讓使用者對照自己判斷得準不準
+    pub translation: Option<String>,
+}
+
+/// 從每個詞頻層抽幾個字出來當測驗題目。
+///
+/// 抽樣時排除功能詞與沒有翻譯的詞條：問「你認識 the 嗎」量不到任何東西，
+/// 而答完之後要能顯示意思讓使用者對照，沒有翻譯就辦不到。
+pub async fn sample_for_placement(
+    db: &Db,
+    lang: &str,
+    bands: &[wordforge_core::placement::FrequencyBand],
+    per_band: i64,
+) -> Result<Vec<PlacementItem>> {
+    let function_words = wordforge_core::wordlist::function_words(lang);
+    let exclusion = if function_words.is_empty() {
+        String::new()
+    } else {
+        let quoted: Vec<String> = function_words.iter().map(|w| format!("'{w}'")).collect();
+        format!("AND l.normalized NOT IN ({})", quoted.join(","))
+    };
+
+    let mut items = Vec::new();
+    for (band_index, band) in bands.iter().enumerate() {
+        // RANDOM() 在這裡是安全的：freq_rank 範圍先用索引縮到幾千筆，
+        // 排序的是那幾千筆而不是整本字典。
+        // 過濾條件是實際抽樣之後補上的：原本會抽到 Montgomery、Abu、
+        // Englishman 這類專有名詞，還有 B、nov 這種單字母與縮寫。
+        // 「你認識 Montgomery 嗎」量不到詞彙量，只會讓估計失準。
+        let rows = sqlx::query(&format!(
+            "SELECT l.id, l.text, l.freq_rank,
+                    (SELECT translation FROM sense
+                     WHERE lemma_id = l.id AND translation IS NOT NULL
+                     ORDER BY sort_order LIMIT 1) AS translation
+             FROM lemma l
+             WHERE l.lang = ? AND l.freq_rank BETWEEN ? AND ? {exclusion}
+               AND length(l.text) >= 3
+               AND l.text = lower(l.text)   -- 大寫開頭幾乎都是專有名詞
+               AND l.text NOT LIKE '% %'    -- 片語不適合當單字測驗
+               AND l.text NOT LIKE '%.%'    -- 縮寫
+               AND EXISTS (SELECT 1 FROM sense
+                           WHERE lemma_id = l.id AND translation IS NOT NULL)
+             ORDER BY RANDOM()
+             LIMIT ?"
+        ))
+        .bind(lang)
+        .bind(band.start_rank)
+        .bind(band.end_rank)
+        .bind(per_band)
+        .fetch_all(db.pool())
+        .await?;
+
+        for row in rows {
+            items.push(PlacementItem {
+                lemma_id: row.get("id"),
+                text: row.get("text"),
+                freq_rank: row.get("freq_rank"),
+                band_index,
+                translation: row.get("translation"),
+            });
+        }
+    }
+
+    Ok(items)
+}
+
 /// 字典規模統計，顯示在匯入畫面上。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DictStats {
@@ -1019,6 +1093,124 @@ mod tests {
         let a = detail(&db, ids[0], profile).await.unwrap().unwrap();
         let b = detail(&db, ids[1], profile).await.unwrap().unwrap();
         assert_eq!(a, b);
+    }
+
+    /// 測驗題目的品質決定估計準不準。
+    #[tokio::test]
+    async fn placement_sampling_excludes_unsuitable_words() {
+        let (db, source, _) = setup().await;
+
+        // 每種都是實際抽樣時真的跑出來過的雜訊
+        let candidates = [
+            ("water", true),       // 正常的字
+            ("Montgomery", false), // 專有名詞
+            ("B", false),          // 單字母
+            ("a lot of", false),   // 片語
+            ("etc.", false),       // 縮寫
+            ("the", false),        // 功能詞
+        ];
+        for (i, (word, _)) in candidates.iter().enumerate() {
+            write(
+                &db,
+                source,
+                &EntryWrite {
+                    lang: "en",
+                    headword: word,
+                    pos: "",
+                    freq_rank: Some(i as i64 + 1),
+                    senses: vec![NewSense {
+                        gloss: "意思",
+                        gloss_lang: "zh-CN",
+                        translation: Some("意思"),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+
+        let bands = vec![wordforge_core::placement::FrequencyBand {
+            start_rank: 1,
+            end_rank: 100,
+        }];
+        let items = sample_for_placement(&db, "en", &bands, 50).await.unwrap();
+        let picked: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+
+        assert_eq!(
+            picked,
+            vec!["water"],
+            "抽到了不適合當測驗題的詞：{picked:?}"
+        );
+    }
+
+    /// 沒有翻譯的詞條不能當題目——答完要顯示意思讓使用者對照。
+    #[tokio::test]
+    async fn placement_sampling_requires_a_translation() {
+        let (db, source, _) = setup().await;
+        write(
+            &db,
+            source,
+            &EntryWrite {
+                lang: "en",
+                headword: "obscure",
+                pos: "",
+                freq_rank: Some(10),
+                senses: vec![NewSense {
+                    gloss: "only an english definition",
+                    gloss_lang: "en",
+                    translation: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let bands = vec![wordforge_core::placement::FrequencyBand {
+            start_rank: 1,
+            end_rank: 100,
+        }];
+        assert!(
+            sample_for_placement(&db, "en", &bands, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 每一層各抽固定題數，且標上正確的層索引。
+    #[tokio::test]
+    async fn placement_sampling_covers_every_band() {
+        let (db, source, _) = setup().await;
+        for rank in [10, 20, 1_500, 1_600, 9_000] {
+            write(
+                &db,
+                source,
+                &EntryWrite {
+                    lang: "en",
+                    headword: &format!("word{rank}"),
+                    pos: "",
+                    freq_rank: Some(rank),
+                    senses: vec![NewSense {
+                        gloss: "意思",
+                        gloss_lang: "zh-CN",
+                        translation: Some("意思"),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+
+        let bands = wordforge_core::placement::default_bands();
+        let items = sample_for_placement(&db, "en", &bands, 1).await.unwrap();
+
+        // 1~500 抽 1、1001~2000 抽 1、8001~16000 抽 1
+        assert_eq!(items.len(), 3);
+        let band_indexes: Vec<usize> = items.iter().map(|i| i.band_index).collect();
+        assert_eq!(band_indexes, vec![0, 2, 5]);
     }
 
     #[tokio::test]

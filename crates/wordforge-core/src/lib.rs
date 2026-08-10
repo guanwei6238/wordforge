@@ -8,11 +8,13 @@
 //! - [`srs`]：FSRS-5 間隔重複排程
 //! - [`coverage`]：可理解輸入（90% 法則）的覆蓋率計算與目標詞挑選
 //! - [`model`]：跨層共用的領域型別
+//! - [`placement`]：分級測驗，估計詞彙量決定從哪裡開始學
 //! - [`text`]：字串正規化與斷詞的共用工具
 //! - [`wordlist`]：不適合做成單字卡的功能詞
 
 pub mod coverage;
 pub mod model;
+pub mod placement;
 pub mod srs;
 pub mod text;
 pub mod wordlist;
