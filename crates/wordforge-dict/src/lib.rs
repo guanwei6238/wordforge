@@ -14,6 +14,7 @@
 //! 所有匯入器都產出 [`DictEntry`]，寫入資料庫的動作由上層負責，
 //! 這個 crate 不碰 I/O 之外的東西，也不依賴資料庫。
 
+pub mod ecdict;
 pub mod freq;
 pub mod kaikki;
 pub mod tabular;
@@ -102,6 +103,9 @@ pub struct DictEntry {
     /// 詞形變化：(表面形, 標籤)，例如 `("ran", "past")`
     pub forms: Vec<(String, String)>,
     pub pronunciations: Vec<PronunciationEntry>,
+    /// 分類標籤，如 `zk`(國中會考) / `gk`(學測) / `cet4` / `oxford3000`。
+    /// 「只背國中單字」這類篩選就靠它。
+    pub tags: Vec<String>,
 }
 
 impl DictEntry {

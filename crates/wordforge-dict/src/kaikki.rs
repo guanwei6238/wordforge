@@ -163,6 +163,8 @@ fn convert(raw: RawEntry) -> DictEntry {
         senses,
         forms,
         pronunciations,
+        // Wiktionary 沒有考試範圍這類標籤
+        tags: Vec::new(),
     }
 }
 

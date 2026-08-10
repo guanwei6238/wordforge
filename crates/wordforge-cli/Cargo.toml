@@ -1,0 +1,25 @@
+[package]
+name = "wordforge-cli"
+description = "Wordforge 的命令列工具：批次匯入字典、查詢、統計"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "wordforge"
+path = "src/main.rs"
+
+[dependencies]
+wordforge-core = { workspace = true }
+wordforge-db = { workspace = true }
+wordforge-dict = { workspace = true }
+wordforge-import = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

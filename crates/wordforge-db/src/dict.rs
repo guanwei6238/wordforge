@@ -66,6 +66,8 @@ pub struct EntryWrite<'a> {
     pub pronunciations: Vec<NewPronunciation<'a>>,
     /// (詞形, 標籤)，例如 `("ran", "past")`
     pub forms: Vec<(&'a str, &'a str)>,
+    /// 分類標籤（`zk`、`cet4`、`oxford3000`…）
+    pub tags: Vec<&'a str>,
 }
 
 // ---------------------------------------------------------------- 寫入
@@ -108,13 +110,21 @@ pub async fn write_entry(
     entry: &EntryWrite<'_>,
 ) -> Result<LemmaId> {
     let normalized = wordforge_core::text::normalize(entry.headword);
+    // 前後各補一個空白，這樣 LIKE '% zk %' 不會誤中 'zkk'
+    let tags = if entry.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", entry.tags.join(" "))
+    };
 
     let lemma_id: i64 = sqlx::query_scalar(
-        "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, cefr)
-         VALUES (?, ?, ?, ?, ?, ?)
+        "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, cefr, tags)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (lang, text, pos) DO UPDATE SET
              freq_rank = COALESCE(excluded.freq_rank, lemma.freq_rank),
-             cefr      = COALESCE(excluded.cefr, lemma.cefr)
+             cefr      = COALESCE(excluded.cefr, lemma.cefr),
+             -- 空字串代表這個來源沒有標籤，不該把別的來源標好的洗掉
+             tags      = CASE WHEN excluded.tags = '' THEN lemma.tags ELSE excluded.tags END
          RETURNING id",
     )
     .bind(entry.lang)
@@ -123,6 +133,7 @@ pub async fn write_entry(
     .bind(entry.pos)
     .bind(entry.freq_rank)
     .bind(entry.cefr)
+    .bind(&tags)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -250,8 +261,48 @@ pub struct SearchHit {
     /// 第一個釋義，用於在清單上預覽
     pub gloss: Option<String>,
     pub translation: Option<String>,
+    /// 分類標籤（`zk`、`cet4`…）
+    pub tags: Vec<String>,
     /// 這個字是否已經在學習者的牌組裡
     pub in_deck: bool,
+}
+
+/// 查字典的 SQL。抽成常數是為了讓測試能對它跑 `EXPLAIN QUERY PLAN`——
+/// 這個查詢的重點是「有沒有走索引」，複製一份到測試裡就失去意義了。
+const SEARCH_SQL: &str = "WITH matched(id, match_rank) AS (
+             SELECT id, 0 FROM lemma WHERE lang = ? AND normalized = ?
+             UNION ALL
+             SELECT lemma_id, 1 FROM surface_form WHERE lang = ? AND normalized = ?
+             UNION ALL
+             SELECT id, 2 FROM lemma
+               WHERE lang = ? AND normalized >= ? AND normalized < ?
+         ),
+         best(id, match_rank) AS (
+             SELECT id, MIN(match_rank) FROM matched GROUP BY id
+         ),
+         top(id, match_rank) AS (
+             SELECT b.id, b.match_rank
+             FROM best b JOIN lemma l ON l.id = b.id
+             ORDER BY b.match_rank, l.freq_rank IS NULL, l.freq_rank,
+                      length(l.text), l.text
+             LIMIT ?
+         )
+         SELECT l.id, l.text, l.pos, l.freq_rank, l.cefr, l.tags, t.match_rank,
+                (SELECT gloss FROM sense WHERE lemma_id = l.id ORDER BY sort_order LIMIT 1) AS gloss,
+                (SELECT translation FROM sense WHERE lemma_id = l.id
+                   AND translation IS NOT NULL ORDER BY sort_order LIMIT 1) AS translation,
+                EXISTS (SELECT 1 FROM card WHERE lemma_id = l.id AND profile_id = ?) AS in_deck
+         FROM top t JOIN lemma l ON l.id = t.id
+         ORDER BY t.match_rank, l.freq_rank IS NULL, l.freq_rank,
+                  length(l.text), l.text";
+
+/// 前綴範圍查詢的上界。
+///
+/// `U+10FFFF` 是 Unicode 的最大碼位，所以任何以 `prefix` 開頭的字串
+/// 都排在 `prefix + U+10FFFF` 之前。用它取代 `LIKE 'prefix%'`，
+/// 就能走索引，也不必處理 `%` 與 `_` 的跳脫。
+fn prefix_upper_bound(prefix: &str) -> String {
+    format!("{prefix}\u{10FFFF}")
 }
 
 /// 查字典。
@@ -270,46 +321,32 @@ pub async fn search(
     if normalized.is_empty() {
         return Ok(Vec::new());
     }
-    // LIKE 的萬用字元必須跳脫，否則使用者輸入 `%` 會撈出整本字典
-    let prefix = format!(
-        "{}%",
-        normalized
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    );
+    let upper = prefix_upper_bound(&normalized);
 
-    // 全部用裸 `?` 依序綁定。混用 `?N` 位置參數雖然能少 bind 幾次，
-    // 但只要中間插入一個條件，整串索引就會錯位而且不會有編譯錯誤。
-    let rows = sqlx::query(
-        "SELECT l.id, l.text, l.pos, l.freq_rank, l.cefr,
-                (SELECT gloss FROM sense WHERE lemma_id = l.id ORDER BY sort_order LIMIT 1) AS gloss,
-                (SELECT translation FROM sense WHERE lemma_id = l.id
-                   AND translation IS NOT NULL ORDER BY sort_order LIMIT 1) AS translation,
-                EXISTS (SELECT 1 FROM card WHERE lemma_id = l.id AND profile_id = ?) AS in_deck,
-                CASE
-                    WHEN l.normalized = ? THEN 0
-                    WHEN EXISTS (SELECT 1 FROM surface_form s
-                                 WHERE s.lemma_id = l.id AND s.normalized = ?) THEN 1
-                    ELSE 2
-                END AS match_rank
-         FROM lemma l
-         WHERE l.lang = ?
-           AND (l.normalized LIKE ? ESCAPE '\\'
-                OR EXISTS (SELECT 1 FROM surface_form s
-                           WHERE s.lemma_id = l.id AND s.normalized = ?))
-         ORDER BY match_rank, l.freq_rank IS NULL, l.freq_rank, length(l.text), l.text
-         LIMIT ?",
-    )
-    .bind(profile_id)
-    .bind(&normalized)
-    .bind(&normalized)
-    .bind(lang)
-    .bind(&prefix)
-    .bind(&normalized)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
+    // 這個查詢的形狀是為了「能用索引」而長成這樣，不是為了好看：
+    //
+    // 1. 前綴比對用範圍條件而不是 `LIKE 'x%'`。SQLite 的 LIKE 只在很嚴格的
+    //    條件下才會走索引，而且**只要出現 ESCAPE 子句就一定退化成全表掃描**。
+    //    77 萬詞條掃一次要 1.5 秒，打字時每個字母都卡一下。
+    //    改成 `normalized >= 'run' AND normalized < 'run\u{10FFFF}'` 之後
+    //    走的是 idx_lemma_normalized，順便也不用煩惱 `%`、`_` 的跳脫。
+    //
+    // 2. 三種比對各自成為一個能吃索引的子查詢再 UNION，而不是用 `OR` 串起來。
+    //
+    // 3. 先排序取前 N 筆（`top`），才去撈釋義。相關子查詢很貴，
+    //    只該對真正要顯示的那幾筆執行。
+    let rows = sqlx::query(SEARCH_SQL)
+        .bind(lang)
+        .bind(&normalized)
+        .bind(lang)
+        .bind(&normalized)
+        .bind(lang)
+        .bind(&normalized)
+        .bind(&upper)
+        .bind(limit)
+        .bind(profile_id)
+        .fetch_all(db.pool())
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -321,6 +358,7 @@ pub async fn search(
             cefr: r.get("cefr"),
             gloss: r.get("gloss"),
             translation: r.get("translation"),
+            tags: split_tags(r.get::<String, _>("tags")),
             in_deck: r.get::<i64, _>("in_deck") != 0,
         })
         .collect())
@@ -361,13 +399,18 @@ pub struct WordDetail {
     pub senses: Vec<SenseView>,
     pub pronunciations: Vec<PronunciationView>,
     pub forms: Vec<(String, String)>,
+    pub tags: Vec<String>,
     pub in_deck: bool,
+}
+
+fn split_tags(raw: String) -> Vec<String> {
+    raw.split_whitespace().map(str::to_string).collect()
 }
 
 /// 取得一個詞條的完整內容。
 pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<WordDetail>> {
     let Some(head) = sqlx::query(
-        "SELECT l.id, l.text, l.pos, l.freq_rank, l.cefr,
+        "SELECT l.id, l.text, l.pos, l.freq_rank, l.cefr, l.tags,
                 EXISTS (SELECT 1 FROM card WHERE lemma_id = l.id AND profile_id = ?) AS in_deck
          FROM lemma l WHERE l.id = ?",
     )
@@ -444,6 +487,7 @@ pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<Wo
         senses,
         pronunciations,
         forms,
+        tags: split_tags(head.get::<String, _>("tags")),
         in_deck: head.get::<i64, _>("in_deck") != 0,
     }))
 }
@@ -564,6 +608,7 @@ mod tests {
                 ("running", "gerund"),
                 ("run", "infinitive"),
             ],
+            tags: vec!["zk", "gk"],
         }
     }
 
@@ -591,6 +636,7 @@ mod tests {
             "CC BY-SA 要求顯示出處"
         );
         assert_eq!(d.pronunciations[0].ipa.as_deref(), Some("/ɹʌn/"));
+        assert_eq!(d.tags, vec!["zk", "gk"], "考試標籤要能存進去也讀得回來");
         assert!(!d.in_deck);
     }
 
@@ -754,6 +800,64 @@ mod tests {
         assert_eq!(s.sources[0].slug, "wiktionary-en");
         assert_eq!(s.sources[0].lemma_count, 1);
         assert_eq!(s.sources[0].license.as_deref(), Some("CC BY-SA 4.0"));
+    }
+
+    /// 查字典會在每次按鍵時執行，全表掃描是不能接受的。
+    ///
+    /// 這個測試存在的原因很具體：原本的 `LIKE 'x%' ESCAPE '\'` 看起來沒問題，
+    /// 但 SQLite 只要看到 ESCAPE 就放棄索引，77 萬詞條要掃 1.5 秒。
+    /// 純看程式碼看不出來，只有查詢計畫會說實話。
+    #[tokio::test]
+    async fn search_never_falls_back_to_a_full_scan() {
+        let (db, source, profile) = setup().await;
+        write(&db, source, &run_entry()).await;
+
+        let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {SEARCH_SQL}"))
+            .bind("en")
+            .bind("run")
+            .bind("en")
+            .bind("run")
+            .bind("en")
+            .bind("run")
+            .bind(prefix_upper_bound("run"))
+            .bind(10i64)
+            .bind(profile)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect();
+
+        let plan_text = plan.join("\n");
+
+        // 正向斷言最能抓到迴歸：前綴比對必須是走索引的範圍查詢。
+        // 改回 `LIKE 'x%'` 的話這一行就會消失。
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("idx_lemma_normalized") && d.contains("normalized>")),
+            "前綴比對沒有走索引範圍查詢：\n{plan_text}"
+        );
+        // 完全相符與詞形相符也各自要有索引
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("idx_lemma_normalized") && d.contains("normalized=")),
+            "完全相符沒有走索引：\n{plan_text}"
+        );
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("surface_form") && d.starts_with("SEARCH")),
+            "詞形比對沒有走索引：\n{plan_text}"
+        );
+        // CTE（matched / best / top 與它們的別名）本來就只能掃，
+        // 但實體表出現在 SCAN 裡就是出事了
+        assert!(
+            !plan.iter().any(|d| d.starts_with("SCAN")
+                && ["lemma", "surface_form", "sense", "card"]
+                    .iter()
+                    .any(|t| d.contains(t))),
+            "有實體表被全表掃描：\n{plan_text}"
+        );
     }
 
     #[tokio::test]

@@ -86,6 +86,8 @@ export interface SearchHit {
   cefr: string | null;
   gloss: string | null;
   translation: string | null;
+  /** 分類標籤，如 zk / cet4 / oxford3000 */
+  tags: string[];
   in_deck: boolean;
 }
 
@@ -121,7 +123,35 @@ export interface WordDetail {
   pronunciations: PronunciationView[];
   /** [詞形, 標籤] */
   forms: [string, string][];
+  tags: string[];
   in_deck: boolean;
+}
+
+/**
+ * 詞條標籤的中文名稱。
+ *
+ * ECDICT 的標籤是簡稱（zk = 中考、gk = 高考），對台灣使用者要換成
+ * 對應的本地說法，否則看不懂。沒收錄的標籤原樣顯示。
+ */
+export const TAG_LABELS: Record<string, string> = {
+  zk: "國中",
+  gk: "高中",
+  cet4: "四級",
+  cet6: "六級",
+  ky: "考研",
+  toefl: "托福",
+  ielts: "雅思",
+  gre: "GRE",
+  oxford3000: "牛津核心",
+  collins1: "★",
+  collins2: "★★",
+  collins3: "★★★",
+  collins4: "★★★★",
+  collins5: "★★★★★",
+};
+
+export function tagLabel(tag: string): string {
+  return TAG_LABELS[tag] ?? tag;
 }
 
 export function searchWords(

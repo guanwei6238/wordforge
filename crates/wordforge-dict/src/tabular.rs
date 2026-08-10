@@ -112,6 +112,7 @@ fn to_entry(row: Row, lang: &str) -> DictEntry {
         senses,
         forms: Vec::new(),
         pronunciations,
+        tags: Vec::new(),
     }
 }
 

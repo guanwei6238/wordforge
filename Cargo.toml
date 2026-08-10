@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/wordforge-cli",
     "crates/wordforge-core",
     "crates/wordforge-db",
     "crates/wordforge-dict",
@@ -9,6 +10,7 @@ members = [
     "apps/desktop/src-tauri",
 ]
 default-members = [
+    "crates/wordforge-cli",
     "crates/wordforge-core",
     "crates/wordforge-db",
     "crates/wordforge-dict",
@@ -25,6 +27,7 @@ repository = "https://github.com/guanwei6238/wordforge"
 authors = ["Wordforge Contributors"]
 
 [workspace.dependencies]
+wordforge-cli = { path = "crates/wordforge-cli" }
 wordforge-core = { path = "crates/wordforge-core" }
 wordforge-db = { path = "crates/wordforge-db" }
 wordforge-dict = { path = "crates/wordforge-dict" }

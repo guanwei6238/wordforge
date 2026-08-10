@@ -114,6 +114,26 @@ cd apps/desktop && npm install && npm run tauri dev
 
 ---
 
+## 命令列工具
+
+首次載入一份完整字典要處理幾 GB 資料，跑在 GUI 裡會綁住視窗好幾十分鐘。
+CLI 寫的是**同一個資料庫檔案**，匯入完打開 App 立刻就看得到：
+
+```bash
+cargo build --release -p wordforge-cli
+
+# 英漢字典（含中文翻譯、音標、國中/高中/多益等考試標籤）
+curl -LO https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv
+./target/release/wordforge import ecdict ecdict.csv
+
+# Wiktionary：補上英文定義與例句，與上面那份並存
+./target/release/wordforge import wiktionary kaikki-en.jsonl --lang en
+
+./target/release/wordforge stats           # 看字典規模與來源授權
+./target/release/wordforge search run      # 查一個字
+./target/release/wordforge path            # 資料庫在哪
+```
+
 ## 專案狀態
 
 🚧 **v0.2 開發中** — 已經可以匯入字典、查字典、用 FSRS 背單字。

@@ -153,6 +153,7 @@ fn to_write<'a>(entry: &'a DictEntry) -> EntryWrite<'a> {
             .iter()
             .map(|(f, tag)| (f.as_str(), tag.as_str()))
             .collect(),
+        tags: entry.tags.iter().map(String::as_str).collect(),
     }
 }
 
@@ -357,6 +358,8 @@ pub enum FreqFormat {
     TabCounts,
     /// `word,count`
     CommaCounts,
+    /// `word count`（OpenSubtitles 的 FrequencyWords 用這種）
+    SpaceCounts,
 }
 
 /// 套用詞頻表。回傳實際更新到的詞條數。
@@ -366,6 +369,7 @@ pub async fn import_freq_list(db: &Db, path: &Path, lang: &str, format: FreqForm
         FreqFormat::RankedList => wordforge_dict::freq::load_ranked_list(reader)?,
         FreqFormat::TabCounts => wordforge_dict::freq::load_counts(reader, '\t')?,
         FreqFormat::CommaCounts => wordforge_dict::freq::load_counts(reader, ',')?,
+        FreqFormat::SpaceCounts => wordforge_dict::freq::load_counts(reader, ' ')?,
     };
     Ok(dict::apply_freq_ranks(db, lang, &table).await?)
 }

@@ -478,3 +478,9 @@ code {
   border-radius: 4px;
   font-size: 0.85em;
 }
+
+/* 考試範圍標籤要跟詞性、CEFR 這類中性標籤區分開來 */
+.tag.exam {
+  border-color: var(--accent);
+  color: var(--accent);
+}

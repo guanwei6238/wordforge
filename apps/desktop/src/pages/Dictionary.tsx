@@ -4,6 +4,7 @@ import {
   errorMessage,
   type SearchHit,
   searchWords,
+  tagLabel,
   type WordDetail,
   wordDetail,
 } from "../api";
@@ -93,6 +94,11 @@ export default function Dictionary() {
                 <span className="hit-word">{h.text}</span>
                 {h.pos && <span className="tag">{h.pos}</span>}
                 {h.cefr && <span className="tag">{h.cefr}</span>}
+                {h.tags.slice(0, 2).map((t) => (
+                  <span key={t} className="tag exam">
+                    {tagLabel(t)}
+                  </span>
+                ))}
                 {h.in_deck && <span className="tag in-deck">已在牌組</span>}
                 <span className="hit-gloss">{h.translation ?? h.gloss ?? ""}</span>
               </button>
@@ -115,6 +121,11 @@ export default function Dictionary() {
                   #{selected.freq_rank}
                 </span>
               )}
+              {selected.tags.map((t) => (
+                <span key={t} className="tag exam" title={t}>
+                  {tagLabel(t)}
+                </span>
+              ))}
               <button
                 className="add"
                 disabled={selected.in_deck}

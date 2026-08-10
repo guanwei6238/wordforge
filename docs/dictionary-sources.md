@@ -20,7 +20,28 @@ Linux 發行版也不會收錄。這個限制反而讓專案更好活。
 
 ## 建議的來源
 
-### Wiktionary（首選）
+### ECDICT（中文母語者首選）
+
+- **內容**：中文翻譯、音標、詞形變化、詞頻排名，以及**考試範圍標籤**
+- **授權**：MIT
+- **大小**：63 MB、77 萬詞條
+- **取得**：
+
+```bash
+curl -LO https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv
+wordforge import ecdict ecdict.csv
+```
+
+考試標籤是它最值得的地方：`zk`(國中會考)、`gk`(學測)、`cet4`、`cet6`、
+`ky`(考研)、`toefl`、`ielts`、`gre`，加上 `oxford3000` 與柯林斯星級。
+「只背國中範圍的單字」這種需求就靠這些標籤。
+
+匯入器：[`wordforge_dict::ecdict`](../crates/wordforge-dict/src/ecdict.rs)
+
+⚠️ 翻譯是**簡體中文**，目前原樣匯入並標記 `gloss_lang = "zh-CN"`。
+繁體轉換還沒做（逐字替換會出錯，需要 OpenCC 等級的詞彙對照）。
+
+### Wiktionary（英文釋義與例句最齊全）
 
 - **內容**：釋義、詞性、詞形變化、IPA、例句、同義詞
 - **授權**：CC BY-SA 4.0（需標示出處，衍生作品需同樣授權）
@@ -32,7 +53,10 @@ wget https://kaikki.org/dictionary/English/kaikki.org-dictionary-English.jsonl
 
 匯入器：[`wordforge_dict::kaikki`](../crates/wordforge-dict/src/kaikki.rs)
 
-英文版約 100 萬個詞條、數 GB，逐行串流解析，不會吃光記憶體。
+英文版 3.2 GB、約 100 萬詞條，逐行串流解析，不會吃光記憶體。
+
+**兩份可以並存**：ECDICT 給你中文翻譯與考試範圍，Wiktionary 補上
+英文定義與例句。資料庫依來源分開存放，同一個字會同時顯示兩邊的釋義。
 
 ### Wikimedia Commons（發音）
 
