@@ -1,0 +1,21 @@
+[package]
+name = "wordforge-llm"
+description = "LLM 供應商抽象層與教學用 prompt 模板（Anthropic / OpenAI 相容 / Ollama）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+wordforge-core = { workspace = true }
+async-trait = "0.1"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -1,0 +1,17 @@
+[package]
+name = "wordforge-dict"
+description = "字典資料匯入器：Wiktionary(kaikki)、CSV/TSV、詞頻表"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+wordforge-core = { workspace = true }
+csv = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

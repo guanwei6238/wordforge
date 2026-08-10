@@ -1,0 +1,34 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Tauri build output
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# 本地資料：字典 dump、音檔、使用者資料庫一律不進版控
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# 秘密
+.env
+.env.*
+!.env.example
+*.key
+
+# 編輯器 / 系統
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

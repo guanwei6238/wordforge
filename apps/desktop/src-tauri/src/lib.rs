@@ -1,0 +1,273 @@
+//! Tauri 後端：把核心 crate 的能力包成前端可呼叫的 command。
+//!
+//! 這一層刻意只做三件事：組裝依賴、轉換型別、把錯誤變成前端看得懂的字串。
+//! 任何演算法都不該寫在這裡。
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use tauri::Manager;
+use time::OffsetDateTime;
+use wordforge_core::model::{CardKind, LemmaId, ProfileId, Rating};
+use wordforge_core::srs::Scheduler;
+use wordforge_db::Db;
+use wordforge_db::repo::{cards, lemmas, profiles};
+
+/// 「算是會了」的 stability 門檻（天）。撐得過三週不複習才計入詞彙量。
+const KNOWN_STABILITY_DAYS: f64 = 21.0;
+
+pub struct AppState {
+    db: Db,
+    scheduler: Arc<Scheduler>,
+}
+
+/// Tauri command 的錯誤型別。前端只需要一段可顯示的訊息。
+///
+/// 這裡逐一列出來源錯誤而不用泛型 blanket impl：
+/// `impl<E: Display> From<E>` 會在日後替 `CommandError` 加上 `Display` 時
+/// 與標準庫的 `From<T> for T` 撞在一起。
+#[derive(Debug, Serialize)]
+pub struct CommandError {
+    message: String,
+}
+
+impl CommandError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+macro_rules! from_error {
+    ($($ty:ty),* $(,)?) => {
+        $(impl From<$ty> for CommandError {
+            fn from(e: $ty) -> Self {
+                Self::new(e.to_string())
+            }
+        })*
+    };
+}
+
+from_error!(
+    wordforge_db::DbError,
+    wordforge_dict::DictError,
+    wordforge_llm::LlmError,
+    sqlx::Error,
+    std::io::Error,
+    anyhow::Error,
+);
+
+type CmdResult<T> = std::result::Result<T, CommandError>;
+
+/// 前端顯示複習卡所需的資料。
+#[derive(Debug, Serialize)]
+pub struct CardView {
+    pub card_id: i64,
+    pub lemma_id: i64,
+    pub word: String,
+    pub kind: String,
+    pub state: String,
+    pub gloss: Option<String>,
+    pub translation: Option<String>,
+    pub ipa: Option<String>,
+    pub audio_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StudyStats {
+    pub due_now: i64,
+    pub known_words: i64,
+    pub total_words: i64,
+    pub reviews_today: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewInput {
+    pub card_id: i64,
+    pub rating: u8,
+    pub duration_ms: Option<u32>,
+}
+
+#[tauri::command]
+async fn list_due_cards(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    limit: i64,
+) -> CmdResult<Vec<CardView>> {
+    let now = OffsetDateTime::now_utc();
+    let due = cards::due(&state.db, ProfileId(profile_id), now, limit).await?;
+
+    let mut views = Vec::with_capacity(due.len());
+    for card in due {
+        // 一張卡一次查詢；卡數上限是使用者設定的每日量（數十到數百），可接受。
+        // 若日後成為瓶頸，改成一次 JOIN 撈回來即可。
+        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT l.text,
+                        (SELECT gloss FROM sense WHERE lemma_id = l.id ORDER BY sort_order LIMIT 1),
+                        (SELECT translation FROM sense WHERE lemma_id = l.id ORDER BY sort_order LIMIT 1),
+                        (SELECT ipa FROM pronunciation WHERE lemma_id = l.id LIMIT 1),
+                        (SELECT audio_path FROM pronunciation WHERE lemma_id = l.id AND audio_path IS NOT NULL LIMIT 1)
+                 FROM lemma l WHERE l.id = ?",
+            )
+            .bind(card.lemma_id.0)
+            .fetch_optional(state.db.pool())
+            .await?;
+
+        let (word, gloss, translation, ipa, audio_path) =
+            row.unwrap_or_else(|| ("?".into(), None, None, None, None));
+
+        views.push(CardView {
+            card_id: card.id.map(|c| c.0).unwrap_or_default(),
+            lemma_id: card.lemma_id.0,
+            word,
+            kind: card.kind.as_str().to_string(),
+            state: card.state.as_str().to_string(),
+            gloss,
+            translation,
+            ipa,
+            audio_path,
+        });
+    }
+    Ok(views)
+}
+
+#[tauri::command]
+async fn review_card(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    input: ReviewInput,
+) -> CmdResult<()> {
+    let rating =
+        Rating::from_i64(input.rating as i64).ok_or_else(|| CommandError::new("評分必須是 1~4"))?;
+
+    let now = OffsetDateTime::now_utc();
+    // 重新讀出卡片，避免前端送來過期狀態
+    let due = cards::due(&state.db, ProfileId(profile_id), now, 1_000).await?;
+    let card = due
+        .into_iter()
+        .find(|c| c.id.map(|id| id.0) == Some(input.card_id))
+        .ok_or_else(|| CommandError::new("找不到這張到期的卡片"))?;
+
+    let (next, log) = state
+        .scheduler
+        .review(&card, rating, now, input.duration_ms);
+    cards::record_review(&state.db, &next, &log).await?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn add_word(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    lang: String,
+    word: String,
+) -> CmdResult<i64> {
+    let now = OffsetDateTime::now_utc();
+    let lemma_id = match lemmas::find_by_form(&state.db, &lang, &word).await? {
+        Some(id) => id,
+        None => {
+            lemmas::upsert(
+                &state.db,
+                wordforge_db::repo::NewLemma {
+                    lang: &lang,
+                    text: &word,
+                    pos: "",
+                    freq_rank: None,
+                    cefr: None,
+                },
+            )
+            .await?
+        }
+    };
+
+    // 預設只建立辨識卡；主動回想卡等使用者在設定裡開啟
+    cards::ensure(
+        &state.db,
+        ProfileId(profile_id),
+        lemma_id,
+        CardKind::Recognition,
+        now,
+    )
+    .await?;
+
+    Ok(lemma_id.0)
+}
+
+#[tauri::command]
+async fn study_stats(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdResult<StudyStats> {
+    let now = OffsetDateTime::now_utc();
+    let due_now = cards::due(&state.db, ProfileId(profile_id), now, i64::MAX)
+        .await?
+        .len() as i64;
+    let known: std::collections::HashSet<LemmaId> =
+        cards::known_lemma_ids(&state.db, ProfileId(profile_id), KNOWN_STABILITY_DAYS).await?;
+
+    let total_words: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM card WHERE profile_id = ?")
+        .bind(profile_id)
+        .fetch_one(state.db.pool())
+        .await?;
+
+    let reviews_today: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM review_log r JOIN card c ON c.id = r.card_id
+         WHERE c.profile_id = ? AND r.reviewed_at >= ?",
+    )
+    .bind(profile_id)
+    .bind(now.date().to_string())
+    .fetch_one(state.db.pool())
+    .await?;
+
+    Ok(StudyStats {
+        due_now,
+        known_words: known.len() as i64,
+        total_words,
+        reviews_today,
+    })
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "wordforge=info".into()),
+        )
+        .init();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            let db_path = dir.join("wordforge.db");
+            tracing::info!(path = %db_path.display(), "開啟資料庫");
+
+            // Tauri 的 setup 是同步的，這裡阻塞等待初始化完成；
+            // 資料庫還沒開好就讓 UI 出現只會得到一堆錯誤。
+            let db = tauri::async_runtime::block_on(Db::open(&db_path))?;
+
+            // 首次啟動時建立預設 profile
+            tauri::async_runtime::block_on(async {
+                if profiles::list(&db).await?.is_empty() {
+                    profiles::create(&db, "我", "zh-TW", "en", OffsetDateTime::now_utc()).await?;
+                }
+                Ok::<_, wordforge_db::DbError>(())
+            })?;
+
+            app.manage(AppState {
+                db,
+                scheduler: Arc::new(Scheduler::default()),
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            list_due_cards,
+            review_card,
+            add_word,
+            study_stats
+        ])
+        .run(tauri::generate_context!())
+        .expect("Tauri 應用程式啟動失敗");
+}

@@ -1,0 +1,16 @@
+[package]
+name = "wordforge-core"
+description = "Wordforge 的領域模型、FSRS-5 間隔重複排程與可理解輸入（90% 法則）計算"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-segmentation = { workspace = true }

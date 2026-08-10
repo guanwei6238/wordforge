@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # 核心 crate 不依賴 Tauri，因此不需要 WebView 系統套件，跑得很快。
+  # workspace 的 default-members 已排除 src-tauri。
+  core:
+    name: Rust 核心
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 格式檢查
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: 測試
+        run: cargo test
+
+  # Tauri 殼只做編譯檢查，不打包（打包需要圖示與簽章）。
+  desktop:
+    name: 桌面殼編譯檢查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 安裝 Tauri 系統依賴
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libxdo-dev libssl-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - name: 安裝前端依賴
+        working-directory: apps/desktop
+        run: pnpm install --no-frozen-lockfile
+      - name: 前端型別檢查
+        working-directory: apps/desktop
+        run: pnpm typecheck
+      - name: 建置前端
+        working-directory: apps/desktop
+        run: pnpm build
+      - name: 檢查 Rust 端
+        run: cargo check -p wordforge-desktop
