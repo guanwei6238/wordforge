@@ -101,6 +101,8 @@ export interface SenseView {
   translation: string | null;
   register: string | null;
   domain: string | null;
+  /** 這條釋義所屬詞條的詞性；同一個字合併顯示後用它區分 */
+  pos: string;
   examples: ExampleView[];
   /** CC BY-SA 要求顯示的出處 */
   attribution: string | null;

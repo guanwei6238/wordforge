@@ -150,7 +150,10 @@ export default function Dictionary() {
             <ol className="senses">
               {selected.senses.map((s, i) => (
                 <li key={i}>
-                  <p className="gloss">{s.gloss}</p>
+                  <p className="gloss">
+                    {s.pos && <span className="tag pos">{s.pos}</span>}
+                    {s.gloss}
+                  </p>
                   {s.translation && <p className="translation">{s.translation}</p>}
                   {(s.register || s.domain) && (
                     <p className="labels">

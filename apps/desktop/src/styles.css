@@ -484,3 +484,8 @@ code {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* 合併顯示後，釋義前面標出它屬於哪個詞性 */
+.gloss .tag.pos {
+  margin-right: 0.4rem;
+}

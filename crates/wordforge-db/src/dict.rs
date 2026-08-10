@@ -343,12 +343,17 @@ pub async fn search(
         .bind(lang)
         .bind(&normalized)
         .bind(&upper)
-        .bind(limit)
+        // 多撈幾倍再去重：同一個字常被不同來源拆成好幾筆詞條
+        .bind(limit.saturating_mul(4))
         .bind(profile_id)
         .fetch_all(db.pool())
         .await?;
 
-    Ok(rows
+    // 同一個字只留一筆。ECDICT 不標詞性、Wiktionary 把 run 拆成 noun 與 verb，
+    // 直接顯示會變成三筆長得很像的結果。結果已照相關性排序，
+    // 留下的第一筆就是最好的代表（有詞頻的來源排在前面）。
+    let mut seen = std::collections::HashSet::new();
+    let hits = rows
         .into_iter()
         .map(|r| SearchHit {
             lemma_id: r.get("id"),
@@ -361,7 +366,11 @@ pub async fn search(
             tags: split_tags(r.get::<String, _>("tags")),
             in_deck: r.get::<i64, _>("in_deck") != 0,
         })
-        .collect())
+        .filter(|h| seen.insert(wordforge_core::text::normalize(&h.text)))
+        .take(limit.max(0) as usize)
+        .collect();
+
+    Ok(hits)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -370,6 +379,8 @@ pub struct SenseView {
     pub translation: Option<String>,
     pub register: Option<String>,
     pub domain: Option<String>,
+    /// 這條釋義所屬詞條的詞性。合併顯示後，用它區分 noun / verb 的釋義。
+    pub pos: String,
     pub examples: Vec<ExampleView>,
     /// 來源標示，CC BY-SA 要求顯示
     pub attribution: Option<String>,
@@ -408,26 +419,48 @@ fn split_tags(raw: String) -> Vec<String> {
 }
 
 /// 取得一個詞條的完整內容。
+///
+/// **會把同一個字的所有詞條合在一起顯示。** 不同來源對詞性的處理不一樣：
+/// ECDICT 多半不標詞性，Wiktionary 則把 `run` 拆成 noun 與 verb 兩筆。
+/// 資料層分開存是對的（詞性確實不同），但使用者查 `run` 只想看到一頁，
+/// 上面同時有中文翻譯和英文定義，而不是兩三筆長得很像的結果。
 pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<WordDetail>> {
-    let Some(head) = sqlx::query(
-        "SELECT l.id, l.text, l.pos, l.freq_rank, l.cefr, l.tags,
-                EXISTS (SELECT 1 FROM card WHERE lemma_id = l.id AND profile_id = ?) AS in_deck
-         FROM lemma l WHERE l.id = ?",
+    // 同一個字的所有詞條（同語言、同正規化拼寫，不分詞性與來源）。
+    // 代表詞條選有詞頻的那筆——那通常是資料比較完整的來源。
+    let family: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM lemma
+         WHERE lang = (SELECT lang FROM lemma WHERE id = ?)
+           AND normalized = (SELECT normalized FROM lemma WHERE id = ?)
+         ORDER BY freq_rank IS NULL, freq_rank, id",
     )
-    .bind(profile_id)
     .bind(lemma_id)
-    .fetch_optional(db.pool())
-    .await?
-    else {
-        return Ok(None);
-    };
+    .bind(lemma_id)
+    .fetch_all(db.pool())
+    .await?;
 
-    let sense_rows = sqlx::query(
-        "SELECT s.id, s.gloss, s.translation, s.register, s.domain, d.attribution
-         FROM sense s LEFT JOIN dict_source d ON d.id = s.source_id
-         WHERE s.lemma_id = ? ORDER BY s.sort_order, s.id",
-    )
-    .bind(lemma_id)
+    if family.is_empty() {
+        return Ok(None);
+    }
+    let ids = bind_list(&family);
+
+    let head = sqlx::query(&format!(
+        "SELECT l.id, l.text, l.pos, l.freq_rank, l.cefr, l.tags,
+                EXISTS (SELECT 1 FROM card WHERE lemma_id IN ({ids}) AND profile_id = ?) AS in_deck
+         FROM lemma l WHERE l.id = ?"
+    ))
+    .bind(profile_id)
+    .bind(family[0])
+    .fetch_one(db.pool())
+    .await?;
+
+    let sense_rows = sqlx::query(&format!(
+        "SELECT s.id, s.gloss, s.translation, s.register, s.domain, l.pos, d.attribution
+         FROM sense s
+           JOIN lemma l ON l.id = s.lemma_id
+           LEFT JOIN dict_source d ON d.id = s.source_id
+         WHERE s.lemma_id IN ({ids})
+         ORDER BY l.freq_rank IS NULL, l.freq_rank, s.lemma_id, s.sort_order, s.id"
+    ))
     .fetch_all(db.pool())
     .await?;
 
@@ -450,15 +483,16 @@ pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<Wo
             translation: row.get("translation"),
             register: row.get("register"),
             domain: row.get("domain"),
+            pos: row.get("pos"),
             examples,
             attribution: row.get("attribution"),
         });
     }
 
-    let pronunciations = sqlx::query(
-        "SELECT accent, ipa, audio_path, is_synthetic FROM pronunciation WHERE lemma_id = ?",
-    )
-    .bind(lemma_id)
+    let pronunciations = sqlx::query(&format!(
+        "SELECT DISTINCT accent, ipa, audio_path, is_synthetic
+         FROM pronunciation WHERE lemma_id IN ({ids})"
+    ))
     .fetch_all(db.pool())
     .await?
     .into_iter()
@@ -470,13 +504,14 @@ pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<Wo
     })
     .collect();
 
-    let forms = sqlx::query("SELECT form, tag FROM surface_form WHERE lemma_id = ? ORDER BY form")
-        .bind(lemma_id)
-        .fetch_all(db.pool())
-        .await?
-        .into_iter()
-        .map(|f| (f.get("form"), f.get("tag")))
-        .collect();
+    let forms = sqlx::query(&format!(
+        "SELECT DISTINCT form, tag FROM surface_form WHERE lemma_id IN ({ids}) ORDER BY form"
+    ))
+    .fetch_all(db.pool())
+    .await?
+    .into_iter()
+    .map(|f| (f.get("form"), f.get("tag")))
+    .collect();
 
     Ok(Some(WordDetail {
         lemma_id: head.get("id"),
@@ -490,6 +525,17 @@ pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<Wo
         tags: split_tags(head.get::<String, _>("tags")),
         in_deck: head.get::<i64, _>("in_deck") != 0,
     }))
+}
+
+/// 把一串 id 拼成可以直接放進 `IN (...)` 的字面值。
+///
+/// 這些 id 全部來自資料庫本身（上一個查詢的結果），不是使用者輸入，
+/// 所以直接內嵌不會有注入問題；用 bind 反而要動態組出對應數量的 `?`。
+fn bind_list(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 字典規模統計，顯示在匯入畫面上。
@@ -858,6 +904,121 @@ mod tests {
                     .any(|t| d.contains(t))),
             "有實體表被全表掃描：\n{plan_text}"
         );
+    }
+
+    /// 建立「同一個字被兩個來源分別收錄」的情境：
+    /// ECDICT 不標詞性只給中文，Wiktionary 標 verb 並給英文定義。
+    async fn two_sources_for_run(db: &Db, ecdict: SourceId) -> LemmaId {
+        let wiktionary = upsert_source(
+            db,
+            NewSource {
+                slug: "wiktionary-en",
+                name: "Wiktionary",
+                license: Some("CC BY-SA 4.0"),
+                attribution: Some("Wiktionary contributors"),
+                homepage: None,
+                version: None,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        // ECDICT 風格：沒有詞性、有詞頻與中文翻譯
+        let id = write(
+            db,
+            ecdict,
+            &EntryWrite {
+                lang: "en",
+                headword: "run",
+                pos: "",
+                freq_rank: Some(300),
+                senses: vec![NewSense {
+                    gloss: "v. 跑",
+                    gloss_lang: "zh-CN",
+                    translation: Some("跑"),
+                    ..Default::default()
+                }],
+                tags: vec!["zk"],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Wiktionary 風格：有詞性、沒有詞頻、英文定義加例句
+        write(
+            db,
+            wiktionary,
+            &EntryWrite {
+                lang: "en",
+                headword: "run",
+                pos: "verb",
+                freq_rank: None,
+                senses: vec![NewSense {
+                    gloss: "To move swiftly on foot",
+                    gloss_lang: "en",
+                    examples: vec![NewExample {
+                        text: "She ran to the station.",
+                        translation: None,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        id
+    }
+
+    /// 一個字在清單上只該出現一次，即使資料層拆成好幾筆詞條。
+    #[tokio::test]
+    async fn search_shows_each_word_once() {
+        let (db, ecdict, profile) = setup().await;
+        two_sources_for_run(&db, ecdict).await;
+
+        let hits = search(&db, "en", "run", profile, 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "同一個字重複出現在結果裡：{hits:?}");
+        assert_eq!(
+            hits[0].translation.as_deref(),
+            Some("跑"),
+            "代表詞條應該是資料較完整（有詞頻）的那筆，預覽才有中文"
+        );
+        assert_eq!(hits[0].tags, vec!["zk"]);
+    }
+
+    /// 點開之後要看到全部：中文翻譯、英文定義、例句，並標明各自的詞性。
+    #[tokio::test]
+    async fn detail_merges_every_source_and_pos() {
+        let (db, ecdict, profile) = setup().await;
+        let id = two_sources_for_run(&db, ecdict).await;
+
+        let d = detail(&db, id.0, profile).await.unwrap().unwrap();
+        assert_eq!(d.text, "run");
+        assert_eq!(d.senses.len(), 2, "兩個來源的釋義都要在同一頁");
+
+        assert_eq!(d.senses[0].gloss, "v. 跑", "有詞頻的來源排前面");
+        assert_eq!(d.senses[0].pos, "", "ECDICT 這筆沒有詞性");
+        assert_eq!(d.senses[1].gloss, "To move swiftly on foot");
+        assert_eq!(d.senses[1].pos, "verb", "要看得出這條屬於哪個詞性");
+        assert_eq!(d.senses[1].examples[0].text, "She ran to the station.");
+    }
+
+    /// 從任何一筆詞條點進去，看到的都該是同一個合併結果。
+    #[tokio::test]
+    async fn detail_is_the_same_from_any_entry_of_the_word() {
+        let (db, ecdict, profile) = setup().await;
+        two_sources_for_run(&db, ecdict).await;
+
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM lemma WHERE normalized = 'run'")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 2, "資料層本來就該分開存");
+
+        let a = detail(&db, ids[0], profile).await.unwrap().unwrap();
+        let b = detail(&db, ids[1], profile).await.unwrap().unwrap();
+        assert_eq!(a, b);
     }
 
     #[tokio::test]
