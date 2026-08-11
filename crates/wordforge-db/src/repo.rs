@@ -318,6 +318,41 @@ pub mod lemmas {
     ///
     /// 一個詞形可能對到多個 lemma（`saw` = see 的過去式，也是「鋸子」）；
     /// 這裡回傳詞頻最高的那個，需要精確消歧時交給 LLM 或上下文判斷。
+    /// 一個表面形可能對應到的**所有** lemma。
+    ///
+    /// [`find_by_form`] 只回一個 id，而它挑的是「id 最小的那個」——
+    /// 也就是匯入順序最早的那個，實際上等於字母序。這對判斷
+    /// 「這個字他會不會」是錯的：`ran` 在字典裡自己也是一個詞條，
+    /// 而 `ran` < `run`，所以會回 `ran` 而不是 `run`。學習者明明學過
+    /// `run`，文章裡的 `ran` 卻被算成生字。`better`（該對到 `good`）、
+    /// `studied`（該對到 `study`）都有同樣的問題。
+    ///
+    /// 挑「正確的那一個」需要真正的詞形還原，而那是有歧義的
+    /// （`saw` 可以是 see 的過去式，也可以是「鋸子」）。判斷懂不懂
+    /// 不需要解決這個歧義：整個家族有任何一個是他會的，就算他看得懂。
+    pub async fn family(db: &Db, lang: &str, form: &str) -> Result<Vec<LemmaId>> {
+        let normalized = wordforge_core::text::normalize(form);
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM lemma
+             WHERE lang = ? AND normalized = ?
+             UNION
+             SELECT l.id FROM lemma l
+               JOIN surface_form s ON s.lemma_id = l.id
+             WHERE s.lang = ? AND s.normalized = ?",
+        )
+        .bind(lang)
+        .bind(&normalized)
+        .bind(lang)
+        .bind(&normalized)
+        .fetch_all(db.pool())
+        .await?;
+
+        Ok(ids.into_iter().map(LemmaId).collect())
+    }
+
     pub async fn find_by_form(db: &Db, lang: &str, form: &str) -> Result<Option<LemmaId>> {
         let normalized = wordforge_core::text::normalize(form);
         let id: Option<i64> = sqlx::query_scalar(
@@ -2204,5 +2239,75 @@ mod tests {
             vec![("en".to_string(), 2), ("ja".to_string(), 1)],
             "詞條多的排前面，使用者最可能要的排第一個"
         );
+    }
+
+    /// 學過 run 的人看到 ran 是懂的——90% 法則靠這件事成立。
+    ///
+    /// 這條測試存在的理由是它曾經是錯的：`find_by_form` 挑「id 最小的」，
+    /// 而 `ran` 自己在字典裡也是一個詞條，且 `ran` < `run`，
+    /// 所以查 `ran` 會回到 `ran` 而不是 `run`，學過的字被算成生字。
+    #[tokio::test]
+    async fn an_inflection_resolves_to_the_whole_family() {
+        let (db, _) = setup().await;
+        let run = add_word(&db, "run", 100).await;
+        // 變化形自己也是詞條，而且拼字排在原形前面——這正是當初踩到的情況
+        let ran_entry = add_word(&db, "ran", 900).await;
+        lemmas::add_surface_form(&db, "en", "ran", run, "past")
+            .await
+            .unwrap();
+
+        let family = lemmas::family(&db, "en", "ran").await.unwrap();
+        assert!(family.contains(&run), "沒有把 ran 對回 run：{family:?}");
+        assert!(family.contains(&ran_entry), "ran 自己那個詞條也該在家族裡");
+
+        // 反過來：原形查得到自己
+        assert!(
+            lemmas::family(&db, "en", "run")
+                .await
+                .unwrap()
+                .contains(&run)
+        );
+    }
+
+    /// 大小寫與標點不能影響詞形比對。
+    #[tokio::test]
+    async fn family_lookup_normalizes_the_form() {
+        let (db, _) = setup().await;
+        let study = add_word(&db, "study", 100).await;
+        lemmas::add_surface_form(&db, "en", "studied", study, "past")
+            .await
+            .unwrap();
+
+        assert!(
+            lemmas::family(&db, "en", "Studied,")
+                .await
+                .unwrap()
+                .contains(&study),
+            "文章裡的字會帶大寫與標點"
+        );
+        assert!(lemmas::family(&db, "en", "  ").await.unwrap().is_empty());
+    }
+
+    /// 別的語言的同拼字不能混進來。
+    #[tokio::test]
+    async fn family_lookup_stays_within_one_language() {
+        let (db, _) = setup().await;
+        let english = add_word(&db, "die", 100).await;
+        let german = lemmas::upsert(
+            &db,
+            NewLemma {
+                lang: "de",
+                text: "die",
+                pos: "article",
+                freq_rank: Some(1),
+                cefr: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let family = lemmas::family(&db, "en", "die").await.unwrap();
+        assert!(family.contains(&english));
+        assert!(!family.contains(&german), "德文的 die 不該算進英文");
     }
 }

@@ -569,10 +569,8 @@ impl<'a> PracticeEngine<'a> {
             if wordforge_core::wordlist::is_function_word(&self.target_lang, token) {
                 continue;
             }
-            let id = lemmas::find_by_form(self.db, &self.target_lang, token).await?;
-            match id {
-                Some(id) if known.contains(&id) => {}
-                _ => unknown_words.push(token.clone()),
+            if !self.knows_token(token, known).await? {
+                unknown_words.push(token.clone());
             }
         }
 
@@ -813,6 +811,10 @@ impl<'a> PracticeEngine<'a> {
     }
 
     /// 算出文章對這位學習者的實際覆蓋率。
+    ///
+    /// 「懂不懂」看的是整個詞形家族：學過 `run` 的人看到 `ran` 是懂的。
+    /// 這件事必須做對，否則 90% 法則會系統性低估——文章明明剛好，
+    /// 卻因為裡面有幾個變化形被判定太難而重寫。
     async fn measure_coverage(
         &self,
         passage: &str,
@@ -820,18 +822,29 @@ impl<'a> PracticeEngine<'a> {
     ) -> Result<wordforge_core::coverage::Coverage> {
         // 一次把文章裡的詞查完，避免在 async 閉包裡查資料庫
         let tokens = wordforge_core::text::tokenize(passage);
-        let mut lookup = std::collections::HashMap::new();
+        let mut resolved: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         for token in &tokens {
-            if lookup.contains_key(token) {
+            if resolved.contains_key(token) {
                 continue;
             }
-            let id = lemmas::find_by_form(self.db, &self.target_lang, token).await?;
-            lookup.insert(token.clone(), id);
+            let familiar = self.knows_token(token, known).await?;
+            resolved.insert(token.clone(), familiar);
         }
 
-        Ok(wordforge_core::coverage::analyze(passage, known, |w| {
-            lookup.get(w).copied().flatten()
+        Ok(wordforge_core::coverage::analyze(passage, |w| {
+            resolved.get(w).copied().unwrap_or(false)
         }))
+    }
+
+    /// 這個表面形學習者懂不懂：詞形家族裡有任何一個在已知集合裡就算懂。
+    async fn knows_token(
+        &self,
+        token: &str,
+        known: &std::collections::HashSet<LemmaId>,
+    ) -> Result<bool> {
+        let family = lemmas::family(self.db, &self.target_lang, token).await?;
+        Ok(family.iter().any(|id| known.contains(id)))
     }
 
     #[allow(clippy::too_many_arguments)]

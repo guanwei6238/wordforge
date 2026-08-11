@@ -78,20 +78,25 @@ impl Coverage {
 
 /// 分析一段文本對特定學習者的覆蓋率。
 ///
-/// `lookup` 負責把表面形對應到 lemma（例如 `running` → `run`），
-/// 由 `wordforge-dict` 提供實作；查不到的詞一律視為未知。
-pub fn analyze<F>(text: &str, known: &HashSet<LemmaId>, lookup: F) -> Coverage
+/// `is_known` 判斷一個表面形學習者懂不懂。呼叫端要負責詞形還原
+/// （`running`、`ran` 都該算成學過 `run`），查不到的詞一律視為未知。
+///
+/// 這裡收的是「懂不懂」而不是「對到哪個 lemma」，因為詞形還原有歧義
+/// （`saw` 可以是 see 的過去式，也可以是「鋸子」），而判斷懂不懂
+/// 不需要解決那個歧義。詳見 `lemmas::family`。
+pub fn analyze<F>(text: &str, is_known: F) -> Coverage
 where
-    F: Fn(&str) -> Option<LemmaId>,
+    F: Fn(&str) -> bool,
 {
     let tokens = crate::text::tokenize(text);
     let mut known_tokens = 0usize;
     let mut unknown: HashMap<String, usize> = HashMap::new();
 
     for token in &tokens {
-        match lookup(token) {
-            Some(id) if known.contains(&id) => known_tokens += 1,
-            _ => *unknown.entry(token.clone()).or_insert(0) += 1,
+        if is_known(token) {
+            known_tokens += 1;
+        } else {
+            *unknown.entry(token.clone()).or_insert(0) += 1;
         }
     }
 
@@ -173,32 +178,34 @@ mod tests {
         ids.iter().copied().map(LemmaId).collect()
     }
 
-    /// 用詞本身的長度當假 lemma id，方便在測試裡控制哪些字「會」。
-    fn fake_lookup<'a>(vocab: &'a [(&'static str, i64)]) -> impl Fn(&str) -> Option<LemmaId> + 'a {
-        move |w: &str| {
-            vocab
-                .iter()
-                .find(|(text, _)| *text == w)
-                .map(|(_, id)| LemmaId(*id))
-        }
+    /// 會的字清單，模擬呼叫端做完詞形還原之後的結果。
+    fn knows<'a>(words: &'a [&'static str]) -> impl Fn(&str) -> bool + 'a {
+        move |w: &str| words.contains(&w)
     }
 
     #[test]
     fn coverage_counts_known_and_unknown() {
-        let vocab = [("the", 1), ("cat", 2), ("sat", 3), ("mat", 4)];
-        let known = known_set(&[1, 2, 3]);
-        let cov = analyze("The cat sat on the mat", &known, fake_lookup(&vocab));
+        let cov = analyze("The cat sat on the mat", knows(&["the", "cat", "sat"]));
 
         assert_eq!(cov.total_tokens, 6);
         assert_eq!(cov.known_tokens, 4); // the, cat, sat, the
-        assert_eq!(cov.unknown_tokens(), 2); // on（查不到）, mat（查得到但不會）
+        assert_eq!(cov.unknown_tokens(), 2); // on, mat
         assert!((cov.ratio() - 4.0 / 6.0).abs() < 1e-9);
+    }
+
+    /// 詞形變化算不算會，由呼叫端的還原決定；這裡確認 analyze 忠實反映它。
+    #[test]
+    fn inflections_count_as_known_when_the_caller_says_so() {
+        let cov = analyze("He ran and she runs", |w| {
+            matches!(w, "he" | "she" | "and" | "ran" | "runs")
+        });
+        assert_eq!(cov.known_tokens, 5);
+        assert_eq!(cov.ratio(), 1.0);
     }
 
     #[test]
     fn unknown_types_sorted_by_frequency() {
-        let known = known_set(&[]);
-        let cov = analyze("zebra apple apple apple zebra kiwi", &known, |_| None);
+        let cov = analyze("zebra apple apple apple zebra kiwi", |_| false);
         assert_eq!(
             cov.unknown_types,
             vec![
@@ -223,7 +230,7 @@ mod tests {
 
     #[test]
     fn empty_text_is_not_usable() {
-        let cov = analyze("", &known_set(&[]), |_| None);
+        let cov = analyze("", |_| false);
         assert_eq!(cov.total_tokens, 0);
         assert_eq!(cov.ratio(), 0.0);
         assert_eq!(cov.band(), CoverageBand::TooHard);
