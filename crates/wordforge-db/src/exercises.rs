@@ -142,52 +142,6 @@ pub async fn record_attempt(
     Ok(())
 }
 
-/// 批改結果累積出來的文法弱點，最常錯的排前面。
-///
-/// 只看最近的紀錄：三個月前老是搞錯時態，現在早就會了，
-/// 拿舊資料出題只是浪費時間。
-pub async fn weak_grammar_points(
-    db: &Db,
-    profile_id: ProfileId,
-    recent_attempts: i64,
-    limit: i64,
-) -> Result<Vec<String>> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT a.feedback_json FROM attempt a
-           JOIN exercise e ON e.id = a.exercise_id
-         WHERE e.profile_id = ? AND a.feedback_json IS NOT NULL
-         ORDER BY a.created_at DESC LIMIT ?",
-    )
-    .bind(profile_id.0)
-    .bind(recent_attempts)
-    .fetch_all(db.pool())
-    .await?;
-
-    // 文法點藏在 feedback JSON 的 corrections 陣列裡。用 SQL 的 json_each
-    // 也做得到，但在 Rust 這邊數比較好讀，而且筆數本來就不多。
-    let mut counts: std::collections::HashMap<String, usize> = Default::default();
-    for raw in rows {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(corrections) = value.get("corrections").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        for c in corrections {
-            if let Some(point) = c.get("grammar_point").and_then(|p| p.as_str())
-                && !point.trim().is_empty()
-            {
-                *counts.entry(point.trim().to_string()).or_default() += 1;
-            }
-        }
-    }
-
-    let mut points: Vec<(String, usize)> = counts.into_iter().collect();
-    points.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    points.truncate(limit.max(0) as usize);
-    Ok(points.into_iter().map(|(p, _)| p).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,9 +244,10 @@ mod tests {
         assert_eq!(kinds, vec!["reading", "grammar", "cloze"], "舊到新");
     }
 
-    /// 文法弱點要從批改結果累積出來，最常錯的排前面。
+    /// 文法弱點現在存在 grammar_point 表（有 FSRS 排程），
+    /// 這裡只驗證批改結果有被完整保存下來。
     #[tokio::test]
-    async fn weak_points_are_counted_from_corrections() {
+    async fn feedback_is_stored_verbatim() {
         let (db, profile) = setup().await;
         let id = add(&db, profile, "translation_to_target", t0()).await;
 
@@ -311,8 +266,9 @@ mod tests {
         .await
         .unwrap();
 
-        let points = weak_grammar_points(&db, profile, 20, 5).await.unwrap();
-        assert_eq!(points, vec!["past tense", "articles"], "錯兩次的排前面");
+        let stored = get(&db, id).await.unwrap().unwrap().feedback_json.unwrap();
+        assert!(stored.contains("past tense"));
+        assert!(stored.contains("articles"));
     }
 
     /// 批改結果格式壞掉不該讓整個查詢失敗。
@@ -335,19 +291,13 @@ mod tests {
         .await
         .unwrap();
 
-        let points = weak_grammar_points(&db, profile, 20, 5).await.unwrap();
-        assert_eq!(points, vec!["tense"]);
+        let stored = get(&db, id).await.unwrap().unwrap().feedback_json.unwrap();
+        assert!(stored.contains("tense"), "最後一次的批改要保留下來");
     }
 
     #[tokio::test]
-    async fn no_attempts_means_no_weak_points() {
+    async fn a_fresh_profile_has_no_history() {
         let (db, profile) = setup().await;
-        assert!(
-            weak_grammar_points(&db, profile, 20, 5)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         assert!(recent_kinds(&db, profile, 5).await.unwrap().is_empty());
         assert!(recent(&db, profile, 5).await.unwrap().is_empty());
     }

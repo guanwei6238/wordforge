@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use wordforge_core::model::ProfileId;
 use wordforge_core::practice::ExerciseKind;
 use wordforge_db::Db;
@@ -416,8 +416,13 @@ async fn wrong_grammar_answers_become_recorded_weak_points() {
         .unwrap();
     assert_eq!(unanswered.original, "（沒有作答）");
 
-    // 真的累積進學習者狀態，下次出題才用得到
-    let learner = engine.learner_profile(profile).await.unwrap();
+    // 真的累積進學習者狀態，下次出題才用得到。
+    // 剛答錯的文法點是排「一分鐘後」再練，所以要讓時間往前走一點——
+    // 實際使用時，看完批改再點下一題本來就不只一分鐘。
+    let learner = engine
+        .learner_profile(profile, t0() + Duration::minutes(5))
+        .await
+        .unwrap();
     assert!(learner.weak_grammar.contains(&"articles".to_string()));
     assert!(!learner.weak_grammar.contains(&"tense".to_string()));
 }
@@ -536,7 +541,10 @@ async fn corrections_accumulate_into_weak_points() {
         .await
         .unwrap();
 
-    let learner = engine.learner_profile(profile).await.unwrap();
+    let learner = engine
+        .learner_profile(profile, t0() + Duration::minutes(5))
+        .await
+        .unwrap();
     assert!(learner.weak_grammar.contains(&"tense".to_string()));
     assert!(learner.weak_grammar.contains(&"articles".to_string()));
 }

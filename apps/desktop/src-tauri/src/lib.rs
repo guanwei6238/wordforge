@@ -862,7 +862,9 @@ async fn practice_status(
     let dummy = wordforge_llm::CliLlm::new(wordforge_llm::CliConfig::claude_code())
         .map_err(|e| CommandError::new(e.to_string()))?;
     let engine = PracticeEngine::new(&state.db, &dummy);
-    let learner = engine.learner_profile(profile_id).await?;
+    let learner = engine
+        .learner_profile(profile_id, OffsetDateTime::now_utc())
+        .await?;
 
     Ok(PracticeStatus {
         llm_ready,

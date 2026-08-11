@@ -23,6 +23,36 @@ const S_MIN: f64 = 0.01;
 /// stability 的上限（100 年）。
 const S_MAX: f64 = 36_500.0;
 
+/// 一個「要記住的東西」的排程狀態。
+///
+/// 單字卡與文法點都用它：兩者都是「錯了要再練、對了可以拉遠」，
+/// 沒有理由各寫一套排程。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReviewState {
+    pub state: CardState,
+    pub memory: Option<MemoryState>,
+    pub due: OffsetDateTime,
+    pub last_review: Option<OffsetDateTime>,
+    /// learning / relearning 走到第幾步
+    pub step: u8,
+    /// 這次排出來的間隔（天）
+    pub scheduled_days: i64,
+}
+
+impl ReviewState {
+    /// 還沒學過的初始狀態。
+    pub fn new(now: OffsetDateTime) -> Self {
+        Self {
+            state: CardState::New,
+            memory: None,
+            due: now,
+            last_review: None,
+            step: 0,
+            scheduled_days: 0,
+        }
+    }
+}
+
 /// FSRS-5 的 19 個權重。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FsrsParams(pub [f64; 19]);
@@ -183,23 +213,23 @@ impl Scheduler {
 
     // ---------- 對外主要入口 ----------
 
-    /// 送出一次複習，回傳更新後的卡片與這次的複習紀錄。
+    /// 一個「要記住的東西」的排程狀態。
     ///
-    /// 這是純函數：不寫資料庫、不讀時鐘，`now` 由呼叫端傳入，測試才好控制。
-    pub fn review(
+    /// 抽出來是因為需要間隔重複的不只單字：文法點同樣是「錯了要再練、
+    /// 對了可以拉遠」，用同一套 FSRS 才不會出現兩種行為不一致的排程。
+    pub fn schedule(
         &self,
-        card: &Card,
+        current: ReviewState,
         rating: Rating,
         now: OffsetDateTime,
-        duration_ms: Option<u32>,
-    ) -> (Card, ReviewLog) {
-        let elapsed = card
+    ) -> ReviewState {
+        let elapsed = current
             .last_review
             .map(|lr| (now - lr).as_seconds_f64() / 86_400.0)
             .unwrap_or(0.0)
             .max(0.0);
 
-        let memory = match card.memory {
+        let memory = match current.memory {
             None => MemoryState {
                 stability: self.initial_stability(rating),
                 difficulty: self.initial_difficulty(rating),
@@ -207,7 +237,6 @@ impl Scheduler {
             Some(prev) => {
                 let r = self.retrievability(elapsed, prev.stability);
                 let stability = if elapsed < 1.0 {
-                    // 同日重複：只做小幅調整
                     self.next_short_term_stability(prev.stability, rating)
                 } else if rating.is_forget() {
                     self.next_forget_stability(prev.difficulty, prev.stability, r)
@@ -221,15 +250,55 @@ impl Scheduler {
             }
         };
 
-        let (state, step, due, scheduled_days) = self.next_schedule(card, rating, now, &memory);
+        let (state, step, due, scheduled_days) =
+            self.next_schedule_for(current.state, current.step, rating, now, &memory);
+
+        ReviewState {
+            state,
+            memory: Some(memory),
+            due,
+            last_review: Some(now),
+            step,
+            scheduled_days,
+        }
+    }
+
+    /// 送出一次複習，回傳更新後的卡片與這次的複習紀錄。
+    ///
+    /// 這是純函數：不寫資料庫、不讀時鐘，`now` 由呼叫端傳入，測試才好控制。
+    pub fn review(
+        &self,
+        card: &Card,
+        rating: Rating,
+        now: OffsetDateTime,
+        duration_ms: Option<u32>,
+    ) -> (Card, ReviewLog) {
+        let elapsed_days = card
+            .last_review
+            .map(|lr| ((now - lr).as_seconds_f64() / 86_400.0).max(0.0))
+            .unwrap_or(0.0);
+
+        let scheduled = self.schedule(
+            ReviewState {
+                state: card.state,
+                memory: card.memory,
+                due: card.due,
+                last_review: card.last_review,
+                step: card.step,
+                scheduled_days: card.scheduled_days,
+            },
+            rating,
+            now,
+        );
+        let memory = scheduled.memory.expect("排程後一定有記憶狀態");
 
         let mut next = card.clone();
-        next.state = state;
-        next.step = step;
+        next.state = scheduled.state;
+        next.step = scheduled.step;
         next.memory = Some(memory);
-        next.due = due;
+        next.due = scheduled.due;
         next.last_review = Some(now);
-        next.scheduled_days = scheduled_days;
+        next.scheduled_days = scheduled.scheduled_days;
         next.reps = card.reps.saturating_add(1);
         if card.state == CardState::Review && rating.is_forget() {
             next.lapses = card.lapses.saturating_add(1);
@@ -240,8 +309,8 @@ impl Scheduler {
             rating,
             state: card.state,
             memory,
-            elapsed_days: elapsed.round() as i64,
-            scheduled_days,
+            elapsed_days: elapsed_days.round() as i64,
+            scheduled_days: scheduled.scheduled_days,
             reviewed_at: now,
             duration_ms,
         };
@@ -253,9 +322,10 @@ impl Scheduler {
     ///
     /// learning / relearning 階段走分鐘級的固定步驟（讓當天真的記起來），
     /// 畢業之後才交給 FSRS 的天級間隔。
-    fn next_schedule(
+    fn next_schedule_for(
         &self,
-        card: &Card,
+        current_state: CardState,
+        current_step: u8,
         rating: Rating,
         now: OffsetDateTime,
         memory: &MemoryState,
@@ -265,7 +335,7 @@ impl Scheduler {
             (CardState::Review, 0u8, now + Duration::days(days), days)
         };
 
-        match card.state {
+        match current_state {
             CardState::New | CardState::Learning => {
                 let steps = &self.config.learning_steps;
                 if steps.is_empty() {
@@ -274,11 +344,11 @@ impl Scheduler {
                 match rating {
                     Rating::Again => (CardState::Learning, 0, now + steps[0], 0),
                     Rating::Hard => {
-                        let idx = (card.step as usize).min(steps.len() - 1);
+                        let idx = (current_step as usize).min(steps.len() - 1);
                         (CardState::Learning, idx as u8, now + steps[idx], 0)
                     }
                     Rating::Good => {
-                        let next_idx = card.step as usize + 1;
+                        let next_idx = current_step as usize + 1;
                         if next_idx >= steps.len() {
                             graduate(memory.stability)
                         } else {
@@ -313,11 +383,11 @@ impl Scheduler {
                 match rating {
                     Rating::Again => (CardState::Relearning, 0, now + steps[0], 0),
                     Rating::Hard => {
-                        let idx = (card.step as usize).min(steps.len() - 1);
+                        let idx = (current_step as usize).min(steps.len() - 1);
                         (CardState::Relearning, idx as u8, now + steps[idx], 0)
                     }
                     Rating::Good | Rating::Easy => {
-                        let next_idx = card.step as usize + 1;
+                        let next_idx = current_step as usize + 1;
                         if next_idx >= steps.len() {
                             graduate(memory.stability)
                         } else {

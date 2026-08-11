@@ -5,6 +5,7 @@ use wordforge_core::model::{CardKind, LemmaId, ProfileId};
 use wordforge_core::practice::{self, ExerciseKind, LearnerProfile};
 use wordforge_db::Db;
 use wordforge_db::exercises::{self, ExerciseId, NewExercise};
+use wordforge_db::grammar;
 use wordforge_db::repo::{cards, lemmas};
 use wordforge_llm::{LlmProvider, prompts};
 
@@ -48,9 +49,17 @@ const READING_COVERAGE: f64 = 0.96;
 /// 而不是無限重試燒 token。
 const COVERAGE_RETRIES: usize = 2;
 
+/// 一次出題最多帶幾個文法點給模型。
+///
+/// 固定上限是重點：練習做得再多，prompt 也不會膨脹。
+/// 沒到期的文法點就是「現在不需要練」，送過去只是浪費 token。
+const GRAMMAR_BATCH: i64 = 5;
+
 pub struct PracticeEngine<'a> {
     db: &'a Db,
     llm: &'a dyn LlmProvider,
+    /// 文法點跟單字用同一套 FSRS 排程
+    scheduler: wordforge_core::srs::Scheduler,
     pub target_lang: String,
     pub native_lang: String,
 }
@@ -60,6 +69,7 @@ impl<'a> PracticeEngine<'a> {
         Self {
             db,
             llm,
+            scheduler: wordforge_core::srs::Scheduler::default(),
             target_lang: "English".into(),
             native_lang: "繁體中文".into(),
         }
@@ -68,7 +78,14 @@ impl<'a> PracticeEngine<'a> {
     // ------------------------------------------------------------ 學習者狀態
 
     /// 蒐集出題需要知道的一切。
-    pub async fn learner_profile(&self, profile_id: i64) -> Result<LearnerProfile> {
+    ///
+    /// `now` 由呼叫端傳入而不是自己讀時鐘：文法點的到期判斷靠它，
+    /// 內部偷讀 now_utc() 會讓測試根本測不到排程行為。
+    pub async fn learner_profile(
+        &self,
+        profile_id: i64,
+        now: OffsetDateTime,
+    ) -> Result<LearnerProfile> {
         let pid = ProfileId(profile_id);
 
         // 分級測驗的估計優先：它反映使用者真正的程度，
@@ -78,7 +95,9 @@ impl<'a> PracticeEngine<'a> {
             .await?
             .len() as i64;
 
-        let weak_grammar = exercises::weak_grammar_points(self.db, pid, 20, 5).await?;
+        // 只拿「今天到期」的文法點：練熟的不必再出，
+        // 而且送給模型的數量固定，token 不會隨練習次數增加
+        let weak_grammar = grammar::due_points(self.db, pid, now, GRAMMAR_BATCH).await?;
         let recent_kinds = exercises::recent_kinds(self.db, pid, 6)
             .await?
             .iter()
@@ -101,7 +120,7 @@ impl<'a> PracticeEngine<'a> {
         kind: Option<ExerciseKind>,
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
-        let learner = self.learner_profile(profile_id).await?;
+        let learner = self.learner_profile(profile_id, now).await?;
         let kind = kind.unwrap_or_else(|| practice::recommend_kind(&learner));
 
         if learner.vocabulary < kind.min_vocabulary() {
@@ -343,7 +362,7 @@ impl<'a> PracticeEngine<'a> {
         // 批改時讓模型看到「這個人最近常犯什麼」，它才判斷得出
         // 這次是同一個老毛病還是新問題
         let weak_points =
-            exercises::weak_grammar_points(self.db, ProfileId(profile_id), 20, 5).await?;
+            grammar::due_points(self.db, ProfileId(profile_id), now, GRAMMAR_BATCH).await?;
 
         let mut feedback = match &body {
             ExerciseBody::Translation { to_target, items } => {
@@ -369,6 +388,9 @@ impl<'a> PracticeEngine<'a> {
 
         feedback.added_to_deck = self
             .add_unknown_words(profile_id, &feedback.unknown_words, now)
+            .await?;
+
+        self.record_grammar_results(profile_id, &body, input, &feedback, now)
             .await?;
 
         let answer_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
@@ -447,6 +469,52 @@ impl<'a> PracticeEngine<'a> {
         let local = grade_choices(questions, input);
         feedback.score = local.score;
         Ok(feedback)
+    }
+
+    /// 把這次的文法表現記進 FSRS。
+    ///
+    /// 答錯的縮短間隔、答對的拉遠。這是「練熟的文法點不再出現」的機制，
+    /// 也是下次出題時 `due_points` 的資料來源。
+    async fn record_grammar_results(
+        &self,
+        profile_id: i64,
+        body: &ExerciseBody,
+        input: &GradeInput,
+        feedback: &Feedback,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let pid = ProfileId(profile_id);
+
+        // 選擇題知道每一題考什麼，對錯都能記
+        if let ExerciseBody::Choices { items }
+        | ExerciseBody::Reading {
+            questions: items, ..
+        } = body
+        {
+            for (i, item) in items.iter().enumerate() {
+                let Some(point) = item.grammar_point.as_ref().filter(|p| !p.trim().is_empty())
+                else {
+                    continue;
+                };
+                let correct = input.choices.get(i).copied().flatten() == Some(item.answer_index);
+                grammar::record(self.db, pid, point, correct, &self.scheduler, now).await?;
+            }
+        }
+
+        // 批改指出來的錯誤一律算錯。這裡沒有「答對」的資訊——
+        // 沒被指出來不代表用對了，可能只是那句話沒用到這個文法。
+        for correction in &feedback.corrections {
+            let Some(point) = correction
+                .grammar_point
+                .as_ref()
+                .filter(|p| !p.trim().is_empty())
+            else {
+                continue;
+            };
+            grammar::record(self.db, pid, point, false, &self.scheduler, now).await?;
+        }
+
+        Ok(())
     }
 
     /// 把不懂的字加進牌組。

@@ -10,4 +10,4 @@
 
 mod fsrs;
 
-pub use fsrs::{DECAY, FACTOR, FsrsParams, Scheduler, SchedulerConfig};
+pub use fsrs::{DECAY, FACTOR, FsrsParams, ReviewState, Scheduler, SchedulerConfig};

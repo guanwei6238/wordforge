@@ -75,6 +75,12 @@
 一份完整的 Wiktionary 音檔集可以到數 GB，塞進 SQLite 會讓資料庫檔案
 難以備份，也拖慢每一次查詢。
 
+### 文法點也是一種卡片
+
+`grammar_point` 表的欄位與 `card` 對齊（state / stability / difficulty / due），
+用同一個 FSRS 排程。理由見 [srs.md](srs.md)：文法點跟單字一樣是記憶，
+沒有理由各寫一套排程，而且「只送今天到期的幾個給模型」讓 prompt 大小固定。
+
 ## 「已知詞」的定義
 
 90% 法則需要一個明確的分母。目前的定義寫在
