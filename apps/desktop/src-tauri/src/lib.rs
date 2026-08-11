@@ -140,14 +140,23 @@ async fn list_due_cards(
     for card in due {
         // 一張卡一次查詢；卡數上限是使用者設定的每日量（數十到數百），可接受。
         // 若日後成為瓶頸，改成一次 JOIN 撈回來即可。
+        // 發音要跨「同一個字的所有詞條」找：卡片指向 ECDICT 建的 lemma，
+        // 但真人錄音掛在 Wiktionary 建的那筆上，兩者 id 不同。
         let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)> =
             sqlx::query_as(
-                "SELECT l.text,
+                "WITH family AS (
+                     SELECT id FROM lemma
+                     WHERE lang = (SELECT lang FROM lemma WHERE id = ?1)
+                       AND normalized = (SELECT normalized FROM lemma WHERE id = ?1)
+                 )
+                 SELECT l.text,
                         (SELECT gloss FROM sense WHERE lemma_id = l.id ORDER BY sort_order LIMIT 1),
                         (SELECT translation FROM sense WHERE lemma_id = l.id ORDER BY sort_order LIMIT 1),
-                        (SELECT ipa FROM pronunciation WHERE lemma_id = l.id LIMIT 1),
-                        (SELECT audio_path FROM pronunciation WHERE lemma_id = l.id AND audio_path IS NOT NULL LIMIT 1)
-                 FROM lemma l WHERE l.id = ?",
+                        (SELECT ipa FROM pronunciation
+                         WHERE lemma_id IN (SELECT id FROM family) AND ipa IS NOT NULL LIMIT 1),
+                        (SELECT audio_path FROM pronunciation
+                         WHERE lemma_id IN (SELECT id FROM family) AND audio_path IS NOT NULL LIMIT 1)
+                 FROM lemma l WHERE l.id = ?1",
             )
             .bind(card.lemma_id.0)
             .fetch_optional(state.db.pool())

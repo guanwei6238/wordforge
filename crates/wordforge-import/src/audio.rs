@@ -69,18 +69,35 @@ fn file_name(p: &Pending) -> String {
     format!("{}-{}.{ext}", p.lemma_id, p.pronunciation_id)
 }
 
+/// 「這個發音屬於牌組裡的某個字」的條件。
+///
+/// 不能直接比對 `lemma_id`：同一個字在資料庫裡可能有好幾筆詞條
+/// （ECDICT 不標詞性、Wiktionary 把 run 拆成 noun 與 verb），
+/// 牌組裡的卡片指向 ECDICT 那筆，而錄音掛在 Wiktionary 那筆上。
+/// 要靠正規化拼寫把它們接起來。
+const IN_DECK_BY_WORD: &str = "EXISTS (
+    SELECT 1 FROM card c
+      JOIN lemma cl ON cl.id = c.lemma_id
+      JOIN lemma pl ON pl.id = p.lemma_id
+    WHERE c.profile_id = ?
+      AND cl.lang = pl.lang
+      AND cl.normalized = pl.normalized
+)";
+
 /// 找出牌組裡「有錄音網址、還沒下載」的發音。
 async fn pending_for_deck(db: &Db, profile_id: i64, limit: i64) -> Result<Vec<Pending>> {
-    let rows = sqlx::query(
-        "SELECT p.id, p.lemma_id, p.audio_url
+    // 一個字只抓一個檔案。同一個字可能同時有多筆詞條（noun / verb）、
+    // 每筆又有多種口音，全抓下來只是重複下載同一個字的發音。
+    // GROUP BY 搭配 MIN() 時，SQLite 保證其他欄位取自同一列。
+    let rows = sqlx::query(&format!(
+        "SELECT MIN(p.id) AS id, p.lemma_id, p.audio_url
          FROM pronunciation p
+           JOIN lemma pl ON pl.id = p.lemma_id
          WHERE p.audio_url IS NOT NULL AND p.audio_path IS NULL
-           AND EXISTS (SELECT 1 FROM card c
-                       WHERE c.lemma_id = p.lemma_id AND c.profile_id = ?)
-         -- 一個字可能有好幾種口音，先抓一個就能發音了
-         GROUP BY p.lemma_id
-         LIMIT ?",
-    )
+           AND {IN_DECK_BY_WORD}
+         GROUP BY pl.lang, pl.normalized
+         LIMIT ?"
+    ))
     .bind(profile_id)
     .bind(limit)
     .fetch_all(db.pool())
@@ -197,22 +214,22 @@ async fn fetch_one(client: &reqwest::Client, p: &Pending, dir: &Path) -> Result<
 
 /// 牌組裡有多少字有錄音、已經下載幾個。
 pub async fn audio_status(db: &Db, profile_id: i64) -> Result<(i64, i64)> {
-    let available: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT p.lemma_id) FROM pronunciation p
-         WHERE p.audio_url IS NOT NULL
-           AND EXISTS (SELECT 1 FROM card c
-                       WHERE c.lemma_id = p.lemma_id AND c.profile_id = ?)",
-    )
+    // 以「字」為單位計數，不是以詞條——同一個字有 noun / verb 兩筆詞條時
+    // 只算一個字，否則會出現「牌組 311 個字，其中 881 個有錄音」這種數字。
+    let available: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(DISTINCT pl.lang || '\u{1f}' || pl.normalized)
+         FROM pronunciation p JOIN lemma pl ON pl.id = p.lemma_id
+         WHERE p.audio_url IS NOT NULL AND {IN_DECK_BY_WORD}"
+    ))
     .bind(profile_id)
     .fetch_one(db.pool())
     .await?;
 
-    let downloaded: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT p.lemma_id) FROM pronunciation p
-         WHERE p.audio_path IS NOT NULL
-           AND EXISTS (SELECT 1 FROM card c
-                       WHERE c.lemma_id = p.lemma_id AND c.profile_id = ?)",
-    )
+    let downloaded: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(DISTINCT pl.lang || '\u{1f}' || pl.normalized)
+         FROM pronunciation p JOIN lemma pl ON pl.id = p.lemma_id
+         WHERE p.audio_path IS NOT NULL AND {IN_DECK_BY_WORD}"
+    ))
     .bind(profile_id)
     .fetch_one(db.pool())
     .await?;
@@ -275,5 +292,113 @@ mod tests {
     async fn status_reports_zero_on_an_empty_deck() {
         let db = Db::open_in_memory().await.unwrap();
         assert_eq!(audio_status(&db, 1).await.unwrap(), (0, 0));
+    }
+
+    /// 卡片指向 ECDICT 建的詞條，錄音卻掛在 Wiktionary 建的那筆上。
+    ///
+    /// 這是實際踩到的：牌組有 311 個字、資料庫有 13 萬筆錄音網址，
+    /// 但用 lemma_id 直接比對算出來「牌組裡有錄音的字：0」。
+    #[tokio::test]
+    async fn finds_audio_on_a_different_entry_of_the_same_word() {
+        let db = Db::open_in_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO profile (name, native_lang, target_lang, created_at)
+                     VALUES ('我', 'zh-TW', 'en', '2026-01-01T00:00:00.000000Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // ECDICT 那筆：沒有詞性，牌組指向它
+        sqlx::query(
+            "INSERT INTO lemma (id, lang, text, normalized, pos) VALUES (1, 'en', 'run', 'run', '')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // Wiktionary 那筆：有詞性，錄音掛在這裡
+        sqlx::query(
+            "INSERT INTO lemma (id, lang, text, normalized, pos)
+             VALUES (2, 'en', 'run', 'run', 'verb')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pronunciation (lemma_id, audio_url) VALUES (2, 'https://x/run.ogg')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO card (profile_id, lemma_id, kind, state, due)
+             VALUES (1, 1, 'recognition', 'new', '2026-01-01T00:00:00.000000Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let (available, downloaded) = audio_status(&db, 1).await.unwrap();
+        assert_eq!(available, 1, "同一個字的錄音掛在別筆詞條上時也要找得到");
+        assert_eq!(downloaded, 0);
+
+        let pending = pending_for_deck(&db, 1, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].url, "https://x/run.ogg");
+
+        // 同一個字再多一筆詞條、再多一個錄音，仍然只算一個字、只下載一次
+        sqlx::query(
+            "INSERT INTO lemma (id, lang, text, normalized, pos)
+             VALUES (3, 'en', 'run', 'run', 'noun')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pronunciation (lemma_id, audio_url) VALUES (3, 'https://x/run-us.ogg')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            audio_status(&db, 1).await.unwrap().0,
+            1,
+            "同一個字有多筆詞條時只該算一個字"
+        );
+        assert_eq!(
+            pending_for_deck(&db, 1, 10).await.unwrap().len(),
+            1,
+            "同一個字不該重複下載"
+        );
+    }
+
+    /// 不在牌組裡的字不該被下載——完整音檔集有好幾 GB。
+    #[tokio::test]
+    async fn ignores_audio_for_words_outside_the_deck() {
+        let db = Db::open_in_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO profile (name, native_lang, target_lang, created_at)
+                     VALUES ('我', 'zh-TW', 'en', '2026-01-01T00:00:00.000000Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO lemma (id, lang, text, normalized, pos)
+             VALUES (1, 'en', 'obscure', 'obscure', '')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pronunciation (lemma_id, audio_url) VALUES (1, 'https://x/obscure.ogg')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(audio_status(&db, 1).await.unwrap(), (0, 0));
+        assert!(pending_for_deck(&db, 1, 10).await.unwrap().is_empty());
     }
 }
