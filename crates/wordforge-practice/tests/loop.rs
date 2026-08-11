@@ -1145,13 +1145,24 @@ async fn a_chosen_material_constrains_what_the_model_sees() {
     )
     .await
     .unwrap();
-    wordforge_db::material::add_chunks(
+    let chunks = wordforge_db::material::add_chunks(
         &db,
         material,
-        &["Amy was reluctant to buy the fish at the market.".into()],
+        &[
+            "The weather was nice on Sunday.".into(),
+            "Amy was reluctant to buy the fish at the market.".into(),
+        ],
     )
     .await
     .unwrap();
+    // reluctant 只出現在第二塊；檢索要挑中它而不是第一塊
+    let reluctant = lemmas::base_form(&db, "en", "reluctant")
+        .await
+        .unwrap()
+        .unwrap();
+    wordforge_db::material::set_chunk_vocab(&db, &[(chunks[1], vec![(reluctant, 1)])])
+        .await
+        .unwrap();
 
     let llm = FakeLlm::new(&[
         r#"{"items":[{"source":"艾米不願意買魚","target_word":"reluctant",

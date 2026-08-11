@@ -136,11 +136,22 @@ impl<'a> PracticeEngine<'a> {
     ///
     /// 沒設教材就回 `None`，prompt 裡那一段整個消失——不會變成
     /// 「請參考以下教材：（空）」那種讓模型困惑的東西。
+    ///
+    /// 要練的字先還原成原形再去查，因為教材詞表存的是原形：
+    /// 練 `go` 要找得到寫 `went` 的那一段。
     async fn material_excerpt(&self, target_words: &[String], seed: u64) -> Result<Option<String>> {
         let Some(id) = self.material_id else {
             return Ok(None);
         };
-        Ok(material::pick_chunk(self.db, id, target_words, seed).await?)
+
+        let mut wanted = Vec::with_capacity(target_words.len());
+        for word in target_words {
+            if let Some(lemma) = lemmas::base_form(self.db, &self.target_lang, word).await? {
+                wanted.push(lemma);
+            }
+        }
+
+        Ok(material::pick_chunk(self.db, id, &wanted, seed).await?)
     }
 
     /// 給模型看的語言名稱。代碼對人類不友善，寫進 prompt 也不自然。

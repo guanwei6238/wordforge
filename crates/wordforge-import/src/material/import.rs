@@ -5,7 +5,7 @@ use std::path::Path;
 use time::OffsetDateTime;
 use wordforge_core::model::{LemmaId, ProfileId};
 use wordforge_db::Db;
-use wordforge_db::material::{self, MaterialId, NewMaterial};
+use wordforge_db::material::{self, NewMaterial};
 use wordforge_db::repo::lemmas;
 
 use super::{MaterialFormat, chunk, text};
@@ -78,63 +78,72 @@ pub async fn import_material(
     .await?;
 
     let chunks = chunk::split(&body);
-    let written = material::add_chunks(db, material_id, &chunks).await?;
+    let chunk_ids = material::add_chunks(db, material_id, &chunks).await?;
 
-    let (vocab, unmatched) = build_vocab(db, material_id, opts.lang, &body).await?;
+    let (vocab, unmatched) = build_vocab(db, opts.lang, &chunk_ids, &chunks).await?;
 
     Ok(MaterialImport {
         material_id: material_id.0,
         chars: body.chars().count() as u64,
-        chunks: written,
+        chunks: chunk_ids.len() as u64,
         vocab,
         unmatched_tokens: unmatched,
     })
 }
 
-/// 統計教材用到哪些字。
+/// 統計每一塊用到哪些字。
 ///
 /// 用 `lemmas::base_form`：課本裡寫 `ran`、`went`，要記成 `run`、`go`，
-/// 否則「這本課本我會幾成」會被詞形變化稀釋掉。
+/// 否則「這本課本我會幾成」會被詞形變化稀釋掉，出題時也找不到
+/// 「講這個字的那一段」。
 ///
 /// 這裡刻意不用 `family`（回傳所有可能的 lemma）。判斷「懂不懂」時
 /// 多記幾個不會出錯，但詞表是要給人看的數字——`family` 會把 `at`
 /// 連到 `@`、`A/T`、`(at)` 這些共用詞形的條目，六十個詞的課文
 /// 會統計出一百八十個「字」。
+///
+/// 回傳 (相異詞數, 查不到的詞元數)。
 async fn build_vocab(
     db: &Db,
-    material_id: MaterialId,
     lang: &str,
-    body: &str,
+    chunk_ids: &[i64],
+    chunks: &[String],
 ) -> Result<(u64, u64)> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
-    let tokens = wordforge_core::text::tokenize(body);
-    let mut counts: HashMap<LemmaId, i64> = HashMap::new();
-    // 同一個表面形在一本書裡會出現幾百次，查一次就好
+    // 同一個表面形在一本書裡會出現幾百次，整本書查一次就好
     let mut resolved: HashMap<String, Option<LemmaId>> = HashMap::new();
     let mut unmatched = 0u64;
+    let mut per_chunk: Vec<(i64, Vec<(LemmaId, i64)>)> = Vec::with_capacity(chunks.len());
+    let mut distinct: HashSet<LemmaId> = HashSet::new();
 
-    for token in &tokens {
-        if wordforge_core::wordlist::is_function_word(lang, token) {
-            continue;
-        }
-        let id = match resolved.get(token) {
-            Some(id) => *id,
-            None => {
-                let id = lemmas::base_form(db, lang, token).await?;
-                resolved.insert(token.clone(), id);
-                id
+    for (id, text) in chunk_ids.iter().zip(chunks) {
+        let mut counts: HashMap<LemmaId, i64> = HashMap::new();
+        for token in wordforge_core::text::tokenize(text) {
+            if wordforge_core::wordlist::is_function_word(lang, &token) {
+                continue;
             }
-        };
-        match id {
-            Some(id) => *counts.entry(id).or_insert(0) += 1,
-            None => unmatched += 1,
+            let lemma = match resolved.get(&token) {
+                Some(id) => *id,
+                None => {
+                    let id = lemmas::base_form(db, lang, &token).await?;
+                    resolved.insert(token, id);
+                    id
+                }
+            };
+            match lemma {
+                Some(lemma) => {
+                    *counts.entry(lemma).or_insert(0) += 1;
+                    distinct.insert(lemma);
+                }
+                None => unmatched += 1,
+            }
         }
+        per_chunk.push((*id, counts.into_iter().collect()));
     }
 
-    let counts: Vec<(LemmaId, i64)> = counts.into_iter().collect();
-    let written = material::set_vocab(db, material_id, &counts).await?;
-    Ok((written, unmatched))
+    material::set_chunk_vocab(db, &per_chunk).await?;
+    Ok((distinct.len() as u64, unmatched))
 }
 
 #[cfg(test)]
@@ -357,7 +366,10 @@ mod tests {
         .unwrap();
 
         let count: i64 = sqlx::query_scalar(
-            "SELECT count FROM material_vocab WHERE material_id = ? AND lemma_id = ?",
+            "SELECT COALESCE(SUM(v.count), 0)
+             FROM material_chunk_vocab v
+             JOIN material_chunk c ON c.id = v.chunk_id
+             WHERE c.material_id = ? AND v.lemma_id = ?",
         )
         .bind(id.material_id)
         .bind(go.0)
