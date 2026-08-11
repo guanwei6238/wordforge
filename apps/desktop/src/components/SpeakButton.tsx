@@ -15,7 +15,7 @@ interface Props {
  * 優先播放真人錄音，沒有才退回系統語音合成。合成音判斷「大概怎麼唸」夠用，
  * 但重音與連音只有真人錄音聽得出來，所以順序不能反過來。
  */
-export default function SpeakButton({ text, lang = "en", audioPath }: Props) {
+export default function SpeakButton({ text, lang, audioPath }: Props) {
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
 

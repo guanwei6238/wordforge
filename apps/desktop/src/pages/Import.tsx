@@ -12,6 +12,7 @@ import {
   type ImportProgress,
   importRunning,
   startImport,
+  targetLang,
 } from "../api";
 
 function formatBytes(n: number): string {
@@ -30,7 +31,8 @@ function formatBytes(n: number): string {
 export default function Import() {
   const [kind, setKind] = useState<ImportKind>("wiktionary_jsonl");
   const [path, setPath] = useState<string | null>(null);
-  const [lang, setLang] = useState("en");
+  // 預設用 profile 正在學的語言；匯入別的語言的字典時可以改
+  const [lang, setLang] = useState("");
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -48,6 +50,7 @@ export default function Import() {
   useEffect(() => {
     void loadStats();
     void importRunning().then(setRunning);
+    void targetLang().then((l) => setLang((cur) => cur || l));
 
     // listen 回傳的 unlisten 是 Promise，卸載時要記得等它
     const subscriptions = [

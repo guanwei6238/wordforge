@@ -171,7 +171,7 @@ async fn list_due_cards(
     limit: i64,
 ) -> CmdResult<Vec<CardView>> {
     // 牌組見底前先自動補上新字，使用者不必自己去牌組頁加
-    refill_deck(&state, profile_id, "en").await?;
+    refill_deck(&state, profile_id).await?;
 
     let now = OffsetDateTime::now_utc();
     let due = cards::daily_queue(
@@ -191,6 +191,15 @@ async fn list_due_cards(
     to_card_views(&state.db, due).await
 }
 
+/// 一張卡顯示時要補的欄位：字、字義、翻譯、IPA、錄音檔名。
+type CardDisplayRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// 把卡片補上顯示所需的字義與發音。
 async fn to_card_views(
     db: &Db,
@@ -202,8 +211,7 @@ async fn to_card_views(
         // 若日後成為瓶頸，改成一次 JOIN 撈回來即可。
         // 發音要跨「同一個字的所有詞條」找：卡片指向 ECDICT 建的 lemma，
         // 但真人錄音掛在 Wiktionary 建的那筆上，兩者 id 不同。
-        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(
+        let row: Option<CardDisplayRow> = sqlx::query_as(
                 "WITH family AS (
                      SELECT id FROM lemma
                      WHERE lang = (SELECT lang FROM lemma WHERE id = ?1)
@@ -368,7 +376,7 @@ async fn queue_status(
     state: tauri::State<'_, AppState>,
     profile_id: i64,
 ) -> CmdResult<QueueStatusView> {
-    refill_deck(&state, profile_id, "en").await?;
+    refill_deck(&state, profile_id).await?;
 
     let now = OffsetDateTime::now_utc();
     let new_per_day = todays_new_limit(&state.db, profile_id, now).await?;
@@ -687,6 +695,31 @@ async fn submit_placement(
 /// 又不會一次塞進幾千張讓「還剩幾個字」失去意義。
 const REFILL_KEEP_AHEAD: i64 = 100;
 
+/// 這個 profile 在學什麼語言。
+///
+/// 先前每個地方都硬編 `"en"`——那讓「換一份字典就能學另一種語言」
+/// 這個設計目標名存實亡。
+async fn target_lang(db: &Db, profile_id: i64) -> CmdResult<String> {
+    Ok(profiles::languages(db, ProfileId(profile_id)).await?.1)
+}
+
+/// 這個 profile 的母語與目標語言。
+#[derive(Debug, Serialize)]
+pub struct ProfileLanguages {
+    pub native: String,
+    pub target: String,
+}
+
+/// 前端要拿這個當各處 `lang` 參數的預設值，而不是自己寫死 `"en"`。
+#[tauri::command]
+async fn profile_languages(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<ProfileLanguages> {
+    let (native, target) = profiles::languages(&state.db, ProfileId(profile_id)).await?;
+    Ok(ProfileLanguages { native, target })
+}
+
 /// 讀出自動補充要用哪個範圍。沒設定就不補。
 async fn refill_tag(db: &Db, profile_id: i64) -> CmdResult<Option<String>> {
     let tag: Option<String> = sqlx::query_scalar(
@@ -701,14 +734,15 @@ async fn refill_tag(db: &Db, profile_id: i64) -> CmdResult<Option<String>> {
 }
 
 /// 需要的話補充牌組。每次取佇列前呼叫，成本是一個 COUNT。
-async fn refill_deck(state: &AppState, profile_id: i64, lang: &str) -> CmdResult<u64> {
+async fn refill_deck(state: &AppState, profile_id: i64) -> CmdResult<u64> {
     let Some(tag) = refill_tag(&state.db, profile_id).await? else {
         return Ok(0);
     };
+    let lang = target_lang(&state.db, profile_id).await?;
     Ok(cards::refill_if_needed(
         &state.db,
         ProfileId(profile_id),
-        lang,
+        &lang,
         &cards::AutoRefill {
             tag: &tag,
             keep_ahead: REFILL_KEEP_AHEAD,
@@ -739,7 +773,7 @@ async fn set_refill_tag(
     .await?;
 
     // 設定完立刻補一次，使用者不用等到下次開啟
-    refill_deck(&state, profile_id, "en").await
+    refill_deck(&state, profile_id).await
 }
 
 #[tauri::command]
@@ -861,7 +895,7 @@ async fn practice_status(
     // 沒有 LLM 也要能顯示程度，讓使用者知道設定完會拿到什麼
     let dummy = wordforge_llm::CliLlm::new(wordforge_llm::CliConfig::claude_code())
         .map_err(|e| CommandError::new(e.to_string()))?;
-    let engine = PracticeEngine::new(&state.db, &dummy);
+    let engine = PracticeEngine::for_profile(&state.db, &dummy, profile_id).await?;
     let learner = engine
         .learner_profile(profile_id, OffsetDateTime::now_utc())
         .await?;
@@ -903,7 +937,7 @@ async fn generate_exercise(
         Some(k) => Some(parse_exercise_kind(k)?),
     };
 
-    let engine = PracticeEngine::new(&state.db, llm.as_ref());
+    let engine = PracticeEngine::for_profile(&state.db, llm.as_ref(), profile_id).await?;
     Ok(engine
         .generate(profile_id, kind, OffsetDateTime::now_utc())
         .await?)
@@ -921,7 +955,7 @@ async fn grade_exercise(
         .build()?
         .ok_or_else(|| CommandError::new("還沒有設定 AI 後端"))?;
 
-    let engine = PracticeEngine::new(&state.db, llm.as_ref());
+    let engine = PracticeEngine::for_profile(&state.db, llm.as_ref(), profile_id).await?;
     Ok(engine
         .grade(profile_id, &input, OffsetDateTime::now_utc())
         .await?)
@@ -1125,6 +1159,7 @@ pub fn run() {
             get_refill_tag,
             get_study_settings,
             update_study_settings,
+            profile_languages,
             detect_ai_backends,
             get_llm_settings,
             update_llm_settings,

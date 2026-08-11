@@ -173,7 +173,7 @@ mod tests {
 
         let loaded = LlmSettings::load(&dir);
         assert_eq!(loaded.backend, Backend::Cli);
-        assert_eq!(loaded.cli.unwrap().program, "claude");
+        assert_eq!(loaded.cli.as_ref().unwrap().program, "claude");
         assert!(loaded.build().unwrap().is_some());
 
         std::fs::remove_dir_all(&dir).ok();

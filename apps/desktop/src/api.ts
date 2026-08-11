@@ -55,6 +55,59 @@ export function errorMessage(e: unknown): string {
 
 export const DEFAULT_PROFILE_ID = 1;
 
+/* ------------------------------------------------------------------ 語言 */
+
+export interface ProfileLanguages {
+  native: string;
+  target: string;
+}
+
+export function profileLanguages(profileId = DEFAULT_PROFILE_ID): Promise<ProfileLanguages> {
+  return invoke("profile_languages", { profileId });
+}
+
+/**
+ * 目標語言的快取。
+ *
+ * 「載入哪個語言的字典就能學哪個語言」是這個專案的設計目標，
+ * 所以查字典、分級測驗、朗讀都必須跟著 profile 走，不能寫死 en。
+ * 這個值在一次啟動內不會變，查一次就夠——但每個呼叫端各自去查
+ * 會變成每張卡一次 IPC，所以在這裡共用同一個 Promise。
+ */
+let languagesCache: Promise<ProfileLanguages> | null = null;
+
+export function currentLanguages(profileId = DEFAULT_PROFILE_ID): Promise<ProfileLanguages> {
+  languagesCache ??= profileLanguages(profileId).catch((e) => {
+    // 查失敗就讓下一次重試，不要把錯誤永久快取起來
+    languagesCache = null;
+    throw e;
+  });
+  return languagesCache;
+}
+
+/** 使用者正在學的語言。各 API 的 `lang` 參數省略時就用它。 */
+export async function targetLang(profileId = DEFAULT_PROFILE_ID): Promise<string> {
+  return (await currentLanguages(profileId)).target;
+}
+
+/** 語言代碼的中文名稱。沒收錄的代碼原樣顯示，總比顯示不出來好。 */
+const LANGUAGE_NAMES: Record<string, string> = {
+  en: "英文",
+  ja: "日文",
+  ko: "韓文",
+  fr: "法文",
+  de: "德文",
+  es: "西班牙文",
+  it: "義大利文",
+  ru: "俄文",
+  "zh-TW": "繁體中文",
+  "zh-CN": "簡體中文",
+};
+
+export function languageName(code: string): string {
+  return LANGUAGE_NAMES[code] ?? LANGUAGE_NAMES[code.split("-")[0]] ?? code;
+}
+
 export function listDueCards(profileId = DEFAULT_PROFILE_ID, limit = 50): Promise<CardView[]> {
   return invoke("list_due_cards", { profileId, limit });
 }
@@ -71,8 +124,12 @@ export function reviewCard(
   });
 }
 
-export function addWord(word: string, lang = "en", profileId = DEFAULT_PROFILE_ID): Promise<number> {
-  return invoke("add_word", { profileId, lang, word });
+export async function addWord(
+  word: string,
+  lang?: string,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<number> {
+  return invoke("add_word", { profileId, lang: lang ?? (await targetLang(profileId)), word });
 }
 
 export function studyStats(profileId = DEFAULT_PROFILE_ID): Promise<StudyStats> {
@@ -189,13 +246,18 @@ export function tagLabel(tag: string): string {
   return TAG_LABELS[tag] ?? tag;
 }
 
-export function searchWords(
+export async function searchWords(
   query: string,
-  lang = "en",
+  lang?: string,
   limit = 30,
   profileId = DEFAULT_PROFILE_ID,
 ): Promise<SearchHit[]> {
-  return invoke("search_words", { profileId, lang, query, limit });
+  return invoke("search_words", {
+    profileId,
+    lang: lang ?? (await targetLang(profileId)),
+    query,
+    limit,
+  });
 }
 
 export function wordDetail(
@@ -216,8 +278,8 @@ export function addLemmaToDeck(
 /* -------------------------------------------------------------------- 發音 */
 
 /** 朗讀一個字。回傳時已經唸完。 */
-export function speak(text: string, lang = "en"): Promise<void> {
-  return invoke("speak", { text, lang });
+export async function speak(text: string, lang?: string): Promise<void> {
+  return invoke("speak", { text, lang: lang ?? (await targetLang()) });
 }
 
 export function speechAvailable(): Promise<boolean> {
@@ -278,16 +340,20 @@ export interface PlacementOutcome {
   suspended_cards: number;
 }
 
-export function placementItems(lang = "en"): Promise<PlacementItem[]> {
-  return invoke("placement_items", { lang });
+export async function placementItems(lang?: string): Promise<PlacementItem[]> {
+  return invoke("placement_items", { lang: lang ?? (await targetLang()) });
 }
 
-export function submitPlacement(
+export async function submitPlacement(
   answers: PlacementAnswer[],
-  lang = "en",
+  lang?: string,
   profileId = DEFAULT_PROFILE_ID,
 ): Promise<PlacementOutcome> {
-  return invoke("submit_placement", { profileId, lang, answers });
+  return invoke("submit_placement", {
+    profileId,
+    lang: lang ?? (await targetLang(profileId)),
+    answers,
+  });
 }
 
 /* -------------------------------------------------------------------- 牌組 */
@@ -298,17 +364,25 @@ export interface TagSummary {
   in_deck: number;
 }
 
-export function deckTags(lang = "en", profileId = DEFAULT_PROFILE_ID): Promise<TagSummary[]> {
-  return invoke("deck_tags", { profileId, lang });
+export async function deckTags(
+  lang?: string,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<TagSummary[]> {
+  return invoke("deck_tags", { profileId, lang: lang ?? (await targetLang(profileId)) });
 }
 
-export function addWordsByTag(
+export async function addWordsByTag(
   tag: string,
   limit: number,
-  lang = "en",
+  lang?: string,
   profileId = DEFAULT_PROFILE_ID,
 ): Promise<number> {
-  return invoke("add_words_by_tag", { profileId, lang, tag, limit });
+  return invoke("add_words_by_tag", {
+    profileId,
+    lang: lang ?? (await targetLang(profileId)),
+    tag,
+    limit,
+  });
 }
 
 /**
@@ -400,8 +474,8 @@ export function dictionaryStats(): Promise<DictStats> {
 }
 
 /** 立刻回傳；進度透過 `import://progress` 等事件送達。 */
-export function startImport(path: string, kind: ImportKind, lang = "en"): Promise<void> {
-  return invoke("start_import", { path, kind, lang });
+export async function startImport(path: string, kind: ImportKind, lang?: string): Promise<void> {
+  return invoke("start_import", { path, kind, lang: lang ?? (await targetLang()) });
 }
 
 export function cancelImport(): Promise<void> {
@@ -483,13 +557,23 @@ export type ExerciseKind =
   | "reading"
   | "grammar";
 
-export const EXERCISE_LABELS: Record<ExerciseKind, string> = {
-  translation_to_native: "英翻中",
-  translation_to_target: "中翻英",
-  cloze: "克漏字",
-  grammar: "文法練習",
-  reading: "閱讀測驗",
-};
+/**
+ * 題型名稱。
+ *
+ * 翻譯題的名字得看使用者在學什麼——寫死「英翻中」的話，
+ * 換一份日文字典之後畫面就在說謊。
+ */
+export function exerciseLabels(langs: ProfileLanguages): Record<ExerciseKind, string> {
+  const target = languageName(langs.target);
+  const native = languageName(langs.native);
+  return {
+    translation_to_native: `${target}翻${native}`,
+    translation_to_target: `${native}翻${target}`,
+    cloze: "克漏字",
+    grammar: "文法練習",
+    reading: "閱讀測驗",
+  };
+}
 
 export interface PracticeStatus {
   llm_ready: boolean;

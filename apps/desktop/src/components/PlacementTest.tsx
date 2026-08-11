@@ -17,7 +17,7 @@ interface Props {
  * 分級測驗。
  *
  * 從各個詞頻層各抽幾個字問「認不認識」，用認識率推估詞彙量，
- * 決定新卡要從哪裡開始排。學過幾年英文的人不必從 the、go、make 重來。
+ * 決定新卡要從哪裡開始排。已經有底子的人不必從最常見的那幾百個字重來。
  *
  * 作答後才顯示中文意思——先看到答案就沒有測到任何東西了。
  */
@@ -92,7 +92,7 @@ export default function PlacementTest({ onFinished }: Props) {
       <section className="panel">
         <h2>測驗結果</h2>
         <p>
-          估計你掌握約 <strong>{outcome.estimated_vocabulary.toLocaleString()}</strong> 個英文單字。
+          估計你掌握約 <strong>{outcome.estimated_vocabulary.toLocaleString()}</strong> 個單字。
         </p>
         <ul className="bands">
           {outcome.band_rates.map(([band, rate]) => (

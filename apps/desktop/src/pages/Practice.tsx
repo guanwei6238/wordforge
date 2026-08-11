@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  currentLanguages,
   errorMessage,
-  EXERCISE_LABELS,
+  exerciseLabels,
   type ExerciseKind,
   type ExerciseView,
   type Feedback,
   generateExercise,
   gradeExercise,
+  languageName,
   practiceStatus,
   type PracticeStatus,
+  type ProfileLanguages,
 } from "../api";
 import LlmSetup from "../components/LlmSetup";
 import SpeakButton from "../components/SpeakButton";
@@ -29,6 +32,9 @@ export default function Practice() {
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [busy, setBusy] = useState<"generating" | "grading" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 題型名稱要說得出「日文翻中文」，不能寫死英文
+  const [langs, setLangs] = useState<ProfileLanguages>({ native: "zh-TW", target: "en" });
+  const labels = exerciseLabels(langs);
 
   const refresh = useCallback(async () => {
     try {
@@ -40,6 +46,7 @@ export default function Practice() {
 
   useEffect(() => {
     void refresh();
+    void currentLanguages().then(setLangs).catch(() => {});
   }, [refresh]);
 
   async function start() {
@@ -125,11 +132,11 @@ export default function Practice() {
                 disabled={busy !== null}
               >
                 <option value="auto">
-                  自動（依程度：{EXERCISE_LABELS[status.recommended]}）
+                  自動（依程度：{labels[status.recommended]}）
                 </option>
                 {status.requirements.map(([k, need]) => (
                   <option key={k} value={k} disabled={status.vocabulary < need}>
-                    {EXERCISE_LABELS[k]}
+                    {labels[k]}
                     {status.vocabulary < need ? `（需要 ${need} 字）` : ""}
                   </option>
                 ))}
@@ -158,7 +165,11 @@ export default function Practice() {
         <section className="panel exercise">
           {exercise.body.kind === "translation" && (
             <>
-              <h2>{exercise.body.to_target ? "翻成英文" : "翻成中文"}</h2>
+              <h2>
+                {exercise.body.to_target
+                  ? `翻成${languageName(langs.target)}`
+                  : `翻成${languageName(langs.native)}`}
+              </h2>
               {exercise.body.items.map((item, i) => (
                 <div key={i} className="question">
                   <p className="prompt">

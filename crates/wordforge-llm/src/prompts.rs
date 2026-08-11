@@ -14,6 +14,26 @@
 
 use crate::{ChatRequest, Message};
 
+/// 文法點標籤的規則。
+///
+/// 有受控清單的語言（目前只有英文）就把清單列出來並禁止其他寫法——
+/// 否則同一個文法點會散成 tense / past tense / Verb Tense 好幾個標籤。
+///
+/// 沒有清單的語言只能請它自己保持一致。這是誠實的作法：
+/// 硬套英文的 articles、gerund-infinitive 去標日文的錯誤只會產生垃圾資料。
+fn grammar_point_rule(target_lang: &str) -> String {
+    match wordforge_core::grammar_points::prompt_list(target_lang) {
+        Some(list) => format!(
+            "**只能從下面這份清單挑一個**：{list}。\n\
+             清單以外的說法一律不接受——這些標籤會累積成長期的弱點紀錄，\n\
+             每次換一種寫法就會被當成不同的問題。真的都不適用時就省略這個欄位。"
+        ),
+        None => "請用一致的英文術語命名（例如 tense、word-order）；\n\
+             同一種問題每次都要用同一個標籤，否則無法累積成弱點紀錄。"
+            .to_string(),
+    }
+}
+
 /// 產生閱讀理解的規格。
 #[derive(Debug, Clone)]
 pub struct ReadingSpec<'a> {
@@ -174,15 +194,13 @@ pub fn writing_feedback(
         target = target_lang
     );
 
-    let points = wordforge_core::grammar_points::prompt_list();
+    let points = grammar_point_rule(target_lang);
     let prompt = format!(
         "# 題目\n{task}\n\n\
          # 學習者的作答\n{submission}\n\n\
          # 批改要求\n\
          - 逐句比對，只標出真正的錯誤或明顯不自然的表達，不要為了改而改。\n\
-         - 每個問題都要標註文法點，而且**只能從下面這份清單挑一個**：\n\
-           {points}\n\
-           清單以外的說法一律不接受。\n\
+         - 每個問題都要標註文法點。{points}\n\
          - severity 用 major（造成誤解）或 minor（可理解但不自然）。\n\
          - 講評用{native}，鼓勵具體的優點，不要空泛稱讚。\n\n\
          # 輸出格式\n\
@@ -237,8 +255,7 @@ pub fn grammar_drill(
 
     prompt.push_str(&format!(
         "# 輸出格式\n\
-         出 {n} 題，每題聚焦一個文法點。\n\
-         grammar_point 只能從這份清單挑：{points}\n\
+         出 {n} 題，每題聚焦一個文法點。{points}\n\
          {{\n\
          \x20 \"items\": [{{\"prompt\": \"題目（含填空）\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \
          \"answer_index\": 0, \"grammar_point\": \"tense\", \"explanation\": \"{native}說明，\
@@ -246,7 +263,7 @@ pub fn grammar_drill(
          }}",
         n = question_count,
         native = native_lang,
-        points = wordforge_core::grammar_points::prompt_list(),
+        points = grammar_point_rule(target_lang),
     ));
 
     ChatRequest {
@@ -302,15 +319,12 @@ pub fn translation_feedback(
         )
     };
 
-    let points = wordforge_core::grammar_points::prompt_list();
+    let points = grammar_point_rule(target_lang);
     let prompt = format!(
         "# 練習方向\n{direction}\n\n{history}# 作答\n{body}\n\
          # 批改要求\n\
          - 意思對就算對，不要為了語法完美而挑剔可接受的說法。\n\
-         - 每個問題都要標註文法點，而且**只能從下面這份清單挑一個**：\n\
-           {points}\n\
-           清單以外的說法一律不接受——這些標籤會累積成長期的弱點紀錄，\n\
-           每次換一種寫法就會被當成不同的問題。真的都不適用時就省略這個欄位。\n\
+         - 每個問題都要標註文法點。{points}\n\
          - **判斷學習者不懂哪些字**：翻錯、漏譯、或用了明顯繞路的說法，\n\
            都代表他不會那個字。把那些{target_lang}單字列在 unknown_words，\n\
            系統會自動排進他的複習。\n\

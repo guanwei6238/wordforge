@@ -156,6 +156,19 @@ pub mod profiles {
         Ok(s)
     }
 
+    /// 這個 profile 在學什麼語言、母語是什麼。
+    ///
+    /// 欄位一直都在，但先前所有地方都硬編 `"en"`——
+    /// 於是「換一份字典就能學另一種語言」這個設計目標名存實亡。
+    pub async fn languages(db: &Db, profile_id: ProfileId) -> Result<(String, String)> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT native_lang, target_lang FROM profile WHERE id = ?")
+                .bind(profile_id.0)
+                .fetch_optional(db.pool())
+                .await?;
+        Ok(row.unwrap_or_else(|| ("zh-TW".into(), "en".into())))
+    }
+
     /// 今天額外加開的新卡額度。
     ///
     /// 存成 `{"extra_new": {"date": "2026-08-11", "count": 10}}`：
@@ -1616,6 +1629,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_today, 3);
+    }
+
+    #[tokio::test]
+    async fn languages_come_from_the_profile() {
+        let (db, profile) = setup().await;
+        assert_eq!(
+            profiles::languages(&db, profile).await.unwrap(),
+            ("zh-TW".to_string(), "en".to_string())
+        );
+
+        let jp = profiles::create(&db, "日文", "zh-TW", "ja", t0())
+            .await
+            .unwrap();
+        assert_eq!(profiles::languages(&db, jp).await.unwrap().1, "ja");
     }
 
     #[tokio::test]

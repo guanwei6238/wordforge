@@ -74,7 +74,9 @@ pub struct PracticeEngine<'a> {
     llm: &'a dyn LlmProvider,
     /// 文法點跟單字用同一套 FSRS 排程
     scheduler: wordforge_core::srs::Scheduler,
+    /// 目標語言的代碼（`en`、`ja`），用來查字典與挑文法點清單
     pub target_lang: String,
+    /// 母語代碼，用來決定用什麼語言解釋
     pub native_lang: String,
 }
 
@@ -84,9 +86,39 @@ impl<'a> PracticeEngine<'a> {
             db,
             llm,
             scheduler: wordforge_core::srs::Scheduler::default(),
-            target_lang: "English".into(),
-            native_lang: "繁體中文".into(),
+            target_lang: "en".into(),
+            native_lang: "zh-TW".into(),
         }
+    }
+
+    /// 依 profile 設定的語言建立引擎。
+    ///
+    /// 「換一份字典就能學另一種語言」是這個專案的設計目標，
+    /// 但那只有在語言真的從 profile 流下來時才成立——
+    /// 先前每個地方都硬編 `"en"`，等於這個目標名存實亡。
+    pub async fn for_profile(
+        db: &'a Db,
+        llm: &'a dyn LlmProvider,
+        profile_id: i64,
+    ) -> Result<Self> {
+        let (native, target) =
+            wordforge_db::repo::profiles::languages(db, ProfileId(profile_id)).await?;
+        Ok(Self {
+            db,
+            llm,
+            scheduler: wordforge_core::srs::Scheduler::default(),
+            target_lang: target,
+            native_lang: native,
+        })
+    }
+
+    /// 給模型看的語言名稱。代碼對人類不友善，寫進 prompt 也不自然。
+    fn target_name(&self) -> &str {
+        display_language(&self.target_lang)
+    }
+
+    fn native_name(&self) -> &str {
+        display_language(&self.native_lang)
     }
 
     // ------------------------------------------------------------ 學習者狀態
@@ -165,7 +197,7 @@ impl<'a> PracticeEngine<'a> {
         let count = practice::translation_count(learner.vocabulary);
 
         let req =
-            prompts::translation_task(&self.target_lang, &self.native_lang, &due_words, count);
+            prompts::translation_task(self.target_name(), self.native_name(), &due_words, count);
         let value = self.ask_json(&req).await?;
 
         let raw_items = value
@@ -221,8 +253,8 @@ impl<'a> PracticeEngine<'a> {
         let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
 
         let spec = prompts::ReadingSpec {
-            target_lang: &self.target_lang,
-            native_lang: &self.native_lang,
+            target_lang: self.target_name(),
+            native_lang: self.native_name(),
             word_count,
             target_coverage: READING_COVERAGE,
             known_word_count: learner.vocabulary as usize,
@@ -332,8 +364,8 @@ impl<'a> PracticeEngine<'a> {
     ) -> Result<ExerciseView> {
         let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
         let req = prompts::grammar_drill(
-            &self.target_lang,
-            &self.native_lang,
+            self.target_name(),
+            self.native_name(),
             &learner.weak_grammar,
             &known_sample,
             5,
@@ -450,8 +482,8 @@ impl<'a> PracticeEngine<'a> {
             .collect();
 
         let req = prompts::translation_feedback(
-            &self.target_lang,
-            &self.native_lang,
+            self.target_name(),
+            self.native_name(),
             to_target,
             &pairs,
             weak_points,
@@ -483,7 +515,7 @@ impl<'a> PracticeEngine<'a> {
             .collect();
 
         let req =
-            prompts::reading_feedback(&self.target_lang, &self.native_lang, passage, &triples);
+            prompts::reading_feedback(self.target_name(), self.native_name(), passage, &triples);
         let value = self.ask_json(&req).await?;
         let mut feedback: Feedback =
             serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))?;
@@ -492,6 +524,18 @@ impl<'a> PracticeEngine<'a> {
         let local = grade_choices(questions, input);
         feedback.score = local.score;
         Ok(feedback)
+    }
+
+    /// 把模型給的文法標籤收斂到該語言的受控清單。
+    ///
+    /// 模型即使被告知只能從清單挑，還是會偶爾寫成 `past tense` 或 `Articles`。
+    /// 沒有這一步的話，同一個文法點會散成好幾個各自排程的標籤。
+    fn normalize_point(&self, raw: &str) -> Option<String> {
+        let normalized = wordforge_core::grammar_points::normalize_point(&self.target_lang, raw);
+        if normalized.is_none() && !raw.trim().is_empty() {
+            tracing::debug!(raw, "認不出來的文法標籤，略過");
+        }
+        normalized
     }
 
     /// 把這次的文法表現記進 FSRS。
@@ -517,13 +561,16 @@ impl<'a> PracticeEngine<'a> {
                 questions: items, ..
             } => {
                 for (i, item) in items.iter().enumerate() {
-                    let Some(point) = item.grammar_point.as_deref().and_then(normalize_point)
+                    let Some(point) = item
+                        .grammar_point
+                        .as_deref()
+                        .and_then(|p| self.normalize_point(p))
                     else {
                         continue;
                     };
                     let correct =
                         input.choices.get(i).copied().flatten() == Some(item.answer_index);
-                    grammar::record(self.db, pid, point, correct, &self.scheduler, now).await?;
+                    grammar::record(self.db, pid, &point, correct, &self.scheduler, now).await?;
                 }
             }
 
@@ -535,11 +582,11 @@ impl<'a> PracticeEngine<'a> {
                     let Some(point) = correction
                         .grammar_point
                         .as_deref()
-                        .and_then(normalize_point)
+                        .and_then(|p| self.normalize_point(p))
                     else {
                         continue;
                     };
-                    grammar::record(self.db, pid, point, false, &self.scheduler, now).await?;
+                    grammar::record(self.db, pid, &point, false, &self.scheduler, now).await?;
                 }
             }
         }
@@ -563,7 +610,9 @@ impl<'a> PracticeEngine<'a> {
             if normalized.is_empty() {
                 continue;
             }
-            let Some(lemma_id) = lemmas::find_by_form(self.db, "en", &normalized).await? else {
+            let Some(lemma_id) =
+                lemmas::find_by_form(self.db, &self.target_lang, &normalized).await?
+            else {
                 tracing::debug!(word, "字典裡查不到，不建卡");
                 continue;
             };
@@ -642,7 +691,7 @@ impl<'a> PracticeEngine<'a> {
                  -- 推定會的：詞頻落在估計詞彙量以內的字。
                  -- 排除大寫開頭與過短的詞，那些多半是專有名詞與縮寫。
                  SELECT text, freq_rank FROM lemma
-                 WHERE lang = 'en' AND freq_rank IS NOT NULL AND freq_rank <= ?2
+                 WHERE lang = ?7 AND freq_rank IS NOT NULL AND freq_rank <= ?2
                    AND text = lower(text) AND length(text) >= 3
                    AND text NOT LIKE '% %'
              ),
@@ -667,6 +716,7 @@ impl<'a> PracticeEngine<'a> {
         .bind(b2)
         .bind(b3)
         .bind(per_band)
+        .bind(&self.target_lang)
         .fetch_all(self.db.pool())
         .await
         .map_err(wordforge_db::DbError::from)?;
@@ -687,7 +737,7 @@ impl<'a> PracticeEngine<'a> {
             if lookup.contains_key(token) {
                 continue;
             }
-            let id = lemmas::find_by_form(self.db, "en", token).await?;
+            let id = lemmas::find_by_form(self.db, &self.target_lang, token).await?;
             lookup.insert(token.clone(), id);
         }
 
@@ -787,16 +837,22 @@ fn grade_choices(items: &[ChoiceItem], input: &GradeInput) -> Feedback {
     }
 }
 
-/// 把模型給的文法標籤收斂到受控清單。
+/// 語言代碼 → 給模型看的名稱。
 ///
-/// 模型即使被告知只能從清單挑，還是會偶爾寫成 `past tense` 或 `Articles`。
-/// 沒有這一步的話，同一個文法點會散成好幾個各自排程的標籤。
-fn normalize_point(raw: &str) -> Option<&'static str> {
-    let normalized = wordforge_core::grammar_points::normalize_point(raw);
-    if normalized.is_none() && !raw.trim().is_empty() {
-        tracing::debug!(raw, "認不出來的文法標籤，略過");
+/// 只列常見的幾個，其餘原樣傳過去——模型認得 `ko`、`vi` 這類代碼，
+/// 硬要維護一份完整對照表反而是負擔。
+fn display_language(code: &str) -> &str {
+    match code {
+        "en" => "English",
+        "ja" => "日本語",
+        "ko" => "한국어",
+        "fr" => "français",
+        "de" => "Deutsch",
+        "es" => "español",
+        "zh-TW" | "zh-Hant" => "繁體中文",
+        "zh-CN" | "zh-Hans" => "简体中文",
+        other => other,
     }
-    normalized
 }
 
 fn parse_kind(s: &str) -> Option<ExerciseKind> {

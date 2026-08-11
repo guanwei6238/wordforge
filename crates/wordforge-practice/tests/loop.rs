@@ -76,8 +76,17 @@ fn t0() -> OffsetDateTime {
 
 /// 建一個有字典、有牌組的資料庫。
 async fn setup(words: &[&str]) -> (Db, i64) {
+    setup_lang("en", words).await
+}
+
+/// 同上，但可以指定學的是哪種語言。
+///
+/// 「載入哪個語言的字典就能學哪個語言」是這個專案的設計目標，
+/// 所以測試裡的語言必須是參數，不能是常數——否則寫死 `"en"` 的
+/// 迴歸不會有任何測試抓得到。
+async fn setup_lang(lang: &str, words: &[&str]) -> (Db, i64) {
     let db = Db::open_in_memory().await.unwrap();
-    let profile = profiles::create(&db, "我", "zh-TW", "en", t0())
+    let profile = profiles::create(&db, "我", "zh-TW", lang, t0())
         .await
         .unwrap();
 
@@ -102,7 +111,7 @@ async fn setup(words: &[&str]) -> (Db, i64) {
             &mut conn,
             source,
             &EntryWrite {
-                lang: "en",
+                lang,
                 headword: word,
                 pos: "",
                 freq_rank: Some(i as i64 + 1),
@@ -869,4 +878,69 @@ async fn unrecognised_grammar_labels_are_dropped() {
         .unwrap();
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].point, "articles");
+}
+
+/// 換一份字典就該能學那個語言：語言必須從 profile 一路流到 prompt 與字典查詢。
+///
+/// 這條測試存在的理由是它曾經整條斷掉——`profile.target_lang` 有寫進去
+/// 但沒有任何地方讀出來，每個查詢都硬編 `"en"`，於是日文 profile 拿到的
+/// 是「請用 English 出題」加上一次查不到東西的英文字典查詢。
+#[tokio::test]
+async fn the_profile_language_drives_prompts_and_lookups() {
+    let (db, profile) = setup_lang("ja", &["公園", "勤勉", "天気"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 1).await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"昨日は公園に行きました","target_word":"公園",
+                      "reference":"I went to the park yesterday"}]}"#,
+        r#"{"score":50,
+            "items":[{"index":1,"correct":false}],
+            "corrections":[],
+            "unknown_words":["勤勉"]}"#,
+    ]);
+
+    let engine = PracticeEngine::for_profile(&db, &llm, profile)
+        .await
+        .unwrap();
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        prompt.contains("日本語"),
+        "出題 prompt 沒提到目標語言：{prompt}"
+    );
+    assert!(
+        !prompt.contains("English"),
+        "出題 prompt 仍然在講英文：{prompt}"
+    );
+
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["公園に行った".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    // 模型說「他不會勤勉」——那個字只存在於日文字典裡，
+    // 查得到才代表字典查詢用的是 profile 的語言。
+    let added: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM card c JOIN lemma l ON l.id = c.lemma_id
+         WHERE c.profile_id = ? AND l.text = '勤勉'",
+    )
+    .bind(profile)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(added, 1, "日文的生字沒有被排進複習");
 }
