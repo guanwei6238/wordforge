@@ -340,9 +340,15 @@ impl<'a> PracticeEngine<'a> {
         let body: ExerciseBody = serde_json::from_str(&record.payload_json)
             .map_err(|e| PracticeError::BadResponse(e.to_string()))?;
 
+        // 批改時讓模型看到「這個人最近常犯什麼」，它才判斷得出
+        // 這次是同一個老毛病還是新問題
+        let weak_points =
+            exercises::weak_grammar_points(self.db, ProfileId(profile_id), 20, 5).await?;
+
         let mut feedback = match &body {
             ExerciseBody::Translation { to_target, items } => {
-                self.grade_translation(*to_target, items, input).await?
+                self.grade_translation(*to_target, items, input, &weak_points)
+                    .await?
             }
             ExerciseBody::Reading {
                 passage, questions, ..
@@ -385,6 +391,7 @@ impl<'a> PracticeEngine<'a> {
         to_target: bool,
         items: &[TranslationItem],
         input: &GradeInput,
+        weak_points: &[String],
     ) -> Result<Feedback> {
         let pairs: Vec<(String, String)> = items
             .iter()
@@ -397,8 +404,13 @@ impl<'a> PracticeEngine<'a> {
             })
             .collect();
 
-        let req =
-            prompts::translation_feedback(&self.target_lang, &self.native_lang, to_target, &pairs);
+        let req = prompts::translation_feedback(
+            &self.target_lang,
+            &self.native_lang,
+            to_target,
+            &pairs,
+            weak_points,
+        );
         let value = self.ask_json(&req).await?;
         serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))
     }
@@ -578,20 +590,38 @@ impl<'a> PracticeEngine<'a> {
 }
 
 /// 選擇題可以在本地判分，不必浪費一次 LLM 呼叫。
+///
+/// 答錯的題目要轉成 `corrections`，文法弱點才累積得起來——
+/// 這些紀錄正是下次出文法題的依據。少了這一步，
+/// 做再多文法練習系統也學不到你哪裡不會。
 fn grade_choices(items: &[ChoiceItem], input: &GradeInput) -> Feedback {
     let mut results = Vec::with_capacity(items.len());
+    let mut corrections = Vec::new();
     let mut correct_count = 0usize;
 
     for (i, item) in items.iter().enumerate() {
         let picked = input.choices.get(i).copied().flatten();
         let correct = picked == Some(item.answer_index);
+        let answer = item.options.get(item.answer_index).cloned();
+
         if correct {
             correct_count += 1;
+        } else if let Some(point) = item.grammar_point.as_ref().filter(|p| !p.trim().is_empty()) {
+            corrections.push(Correction {
+                original: picked
+                    .and_then(|idx| item.options.get(idx).cloned())
+                    .unwrap_or_else(|| "（沒有作答）".to_string()),
+                corrected: answer.clone().unwrap_or_default(),
+                grammar_point: Some(point.trim().to_string()),
+                severity: Some("major".into()),
+                explanation: item.explanation.clone(),
+            });
         }
+
         results.push(ItemResult {
             index: i + 1,
             correct,
-            reference: item.options.get(item.answer_index).cloned(),
+            reference: answer,
             comment: item.explanation.clone(),
         });
     }
@@ -605,6 +635,7 @@ fn grade_choices(items: &[ChoiceItem], input: &GradeInput) -> Feedback {
     Feedback {
         score,
         items: results,
+        corrections,
         ..Default::default()
     }
 }

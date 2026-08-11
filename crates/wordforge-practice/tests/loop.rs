@@ -360,6 +360,113 @@ async fn grammar_choices_are_graded_locally() {
     assert_eq!(feedback.items[1].reference.as_deref(), Some("reads"));
 }
 
+/// 文法題答錯必須留下紀錄，否則做再多練習系統也學不到你哪裡不會。
+///
+/// 這條路徑原本是斷的：選擇題在本地判分，但只產生「對/錯」，
+/// 沒有把 grammar_point 轉成 correction，於是弱點永遠是空的。
+#[tokio::test]
+async fn wrong_grammar_answers_become_recorded_weak_points() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[
+             {"prompt":"I ___ yesterday","options":["go","went"],"answer_index":1,
+              "grammar_point":"tense","explanation":"過去式"},
+             {"prompt":"She ___ a book","options":["read","reads"],"answer_index":1,
+              "grammar_point":"subject-verb agreement"},
+             {"prompt":"___ apple","options":["a","an"],"answer_index":1,
+              "grammar_point":"articles"}
+           ]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    // 第一題對，後兩題錯
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: vec![Some(1), Some(0), None],
+                marked_unknown: vec![],
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(feedback.corrections.len(), 2, "兩題錯就該有兩筆修正");
+    let points: Vec<&str> = feedback
+        .corrections
+        .iter()
+        .filter_map(|c| c.grammar_point.as_deref())
+        .collect();
+    assert!(points.contains(&"subject-verb agreement"));
+    assert!(points.contains(&"articles"));
+    assert!(!points.contains(&"tense"), "答對的題目不該被記成弱點");
+
+    // 沒作答的那題要標示出來，不能假裝他選了什麼
+    let unanswered = feedback
+        .corrections
+        .iter()
+        .find(|c| c.grammar_point.as_deref() == Some("articles"))
+        .unwrap();
+    assert_eq!(unanswered.original, "（沒有作答）");
+
+    // 真的累積進學習者狀態，下次出題才用得到
+    let learner = engine.learner_profile(profile).await.unwrap();
+    assert!(learner.weak_grammar.contains(&"articles".to_string()));
+    assert!(!learner.weak_grammar.contains(&"tense".to_string()));
+}
+
+/// 批改時要讓模型知道這個人的老毛病，它才分得出「又犯了」和「第一次」。
+#[tokio::test]
+async fn grading_tells_the_model_about_past_mistakes() {
+    let (db, profile) = setup(&["park"]).await;
+    set_vocabulary(&db, profile, 500).await;
+
+    let llm = FakeLlm::new(&[
+        // 第一次練習：錯了時態
+        r#"{"items":[{"source":"我去了公園"}]}"#,
+        r#"{"score":40,"corrections":[{"original":"I go","corrected":"I went",
+                                       "grammar_point":"tense"}]}"#,
+        // 第二次練習
+        r#"{"items":[{"source":"她吃了蘋果"}]}"#,
+        r#"{"score":50,"corrections":[]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    for answer in ["I go park", "She eat apple"] {
+        let exercise = engine
+            .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+            .await
+            .unwrap();
+        engine
+            .grade(
+                profile,
+                &GradeInput {
+                    exercise_id: exercise.exercise_id,
+                    answers: vec![answer.into()],
+                    choices: vec![],
+                    marked_unknown: vec![],
+                },
+                t0(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // 第二次批改的 prompt 應該帶著第一次累積的 tense
+    assert!(
+        llm.last_prompt().contains("tense"),
+        "批改時沒有帶上既有弱點：{}",
+        llm.last_prompt()
+    );
+}
+
 /// 詞彙量不夠就不該硬出閱讀測驗——看不懂九成只會變成查字典。
 #[tokio::test]
 async fn reading_is_refused_when_vocabulary_is_too_small() {

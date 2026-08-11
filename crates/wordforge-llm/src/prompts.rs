@@ -262,6 +262,7 @@ pub fn translation_feedback(
     native_lang: &str,
     direction_to_target: bool,
     items: &[(String, String)],
+    known_weak_points: &[String],
 ) -> ChatRequest {
     let system = format!("你是一位{target_lang}老師，正在批改翻譯練習。你只輸出 JSON。");
 
@@ -284,8 +285,21 @@ pub fn translation_feedback(
         format!("{target_lang} → {native_lang}")
     };
 
+    // 讓模型知道這個人的老毛病。同一個錯誤重複出現，
+    // 跟第一次犯的意義完全不同——前者要講得更具體。
+    let history = if known_weak_points.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "# 這位學習者最近常犯的錯\n{}\n\
+             如果這次又犯了同樣的錯，請在 explanation 裡指出這是重複出現的問題，\n\
+             並給一個能記住的判斷方式，而不是重複同樣的說明。\n\n",
+            known_weak_points.join("、")
+        )
+    };
+
     let prompt = format!(
-        "# 練習方向\n{direction}\n\n# 作答\n{body}\n\
+        "# 練習方向\n{direction}\n\n{history}# 作答\n{body}\n\
          # 批改要求\n\
          - 意思對就算對，不要為了語法完美而挑剔可接受的說法。\n\
          - 每個問題標註文法點（tense、articles、word-order…），用一致的英文術語，\n\
@@ -550,7 +564,7 @@ mod tests {
             ),
             ("他很勤奮".to_string(), String::new()),
         ];
-        let req = translation_feedback("English", "繁體中文", true, &items);
+        let req = translation_feedback("English", "繁體中文", true, &items, &[]);
         let text = &req.messages[0].content;
 
         assert!(text.contains("I go to park yesterday"), "要帶上實際作答");
@@ -564,8 +578,24 @@ mod tests {
     #[test]
     fn translation_feedback_states_the_other_direction() {
         let items = vec![("The weather is nice".to_string(), "天氣很好".to_string())];
-        let req = translation_feedback("English", "繁體中文", false, &items);
+        let req = translation_feedback("English", "繁體中文", false, &items, &[]);
         assert!(req.messages[0].content.contains("English → 繁體中文"));
+    }
+
+    /// 同一個錯誤重複出現，跟第一次犯的意義不同——模型要知道這件事。
+    #[test]
+    fn translation_feedback_carries_the_learners_history() {
+        let items = vec![("我昨天去了公園".to_string(), "I go to park".to_string())];
+        let weak = vec!["tense".to_string(), "articles".to_string()];
+
+        let with_history = translation_feedback("English", "繁體中文", true, &items, &weak);
+        let text = &with_history.messages[0].content;
+        assert!(text.contains("tense"), "沒有帶上既有的弱點");
+        assert!(text.contains("重複出現"), "沒有要求指出這是老毛病");
+
+        // 沒有紀錄時不該憑空生出一段空白的「常犯的錯」
+        let fresh = translation_feedback("English", "繁體中文", true, &items, &[]);
+        assert!(!fresh.messages[0].content.contains("常犯的錯"));
     }
 
     /// 閱讀測驗要從答錯的題目往回推斷哪些字看不懂。
