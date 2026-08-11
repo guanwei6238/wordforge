@@ -326,6 +326,29 @@ export function getRefillTag(profileId = DEFAULT_PROFILE_ID): Promise<string | n
   return invoke("get_refill_tag", { profileId });
 }
 
+/* -------------------------------------------------------------------- 設定 */
+
+export interface StudySettings {
+  /** 每天引入幾張新卡 */
+  new_per_day: number;
+  /** 每天最多複習幾張 */
+  max_reviews_per_day: number;
+  /** FSRS 的目標記憶留存率 0.70~0.97 */
+  desired_retention: number;
+}
+
+export function getStudySettings(profileId = DEFAULT_PROFILE_ID): Promise<StudySettings> {
+  return invoke("get_study_settings", { profileId });
+}
+
+/** 回傳實際存下來的值——超出合理範圍的會被後端夾住 */
+export function updateStudySettings(
+  settings: StudySettings,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<StudySettings> {
+  return invoke("update_study_settings", { profileId, settings });
+}
+
 /* -------------------------------------------------------------------- 匯入 */
 
 export interface SourceInfo {

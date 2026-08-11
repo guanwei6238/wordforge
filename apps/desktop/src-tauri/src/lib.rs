@@ -22,16 +22,6 @@ use wordforge_import::{FreqFormat, ImportOptions, ImportProgress, ProgressSink};
 /// 「算是會了」的 stability 門檻（天）。撐得過三週不複習才計入詞彙量。
 const KNOWN_STABILITY_DAYS: f64 = 21.0;
 
-/// 每天引入的新卡上限。
-///
-/// 一次把整個國中範圍 1600 個字設成到期，開啟 App 看到「待複習 1600」
-/// 只會讓人直接關掉；FSRS 的排程也假設新卡是每天少量穩定引入的。
-/// 15 張大約是每天 10 分鐘的量。
-const NEW_CARDS_PER_DAY: i64 = 15;
-
-/// 每天的複習上限，避免長假回來被幾百張卡淹沒。
-const MAX_REVIEWS_PER_DAY: i64 = 200;
-
 /// 今天的起點（UTC）。跨日換算之後會改成使用者所在時區。
 fn day_start(now: OffsetDateTime) -> OffsetDateTime {
     now.replace_time(time::Time::MIDNIGHT)
@@ -48,13 +38,47 @@ fn today_key(now: OffsetDateTime) -> String {
 /// 取佇列、送出評分、算統計是三個獨立的查詢，
 /// 只要有一個還用預設上限，「再學 10 個」就會在下一次重新整理時消失。
 async fn todays_new_limit(db: &Db, profile_id: i64, now: OffsetDateTime) -> CmdResult<i64> {
+    let settings = profiles::study_settings(db, ProfileId(profile_id)).await?;
     let extra = profiles::extra_new_today(db, ProfileId(profile_id), &today_key(now)).await?;
-    Ok(NEW_CARDS_PER_DAY + extra)
+    Ok(settings.new_per_day + extra)
+}
+
+/// 依使用者設定的目標留存率建立排程器。
+///
+/// 每次複習都重新建一個：成本只有幾個 f64，換來的是設定改完立刻生效，
+/// 不必處理「設定變了但 AppState 裡的 scheduler 還是舊的」。
+async fn scheduler_for(db: &Db, profile_id: i64) -> CmdResult<Scheduler> {
+    let settings = profiles::study_settings(db, ProfileId(profile_id)).await?;
+    Scheduler::new(
+        wordforge_core::srs::FsrsParams::default(),
+        wordforge_core::srs::SchedulerConfig {
+            desired_retention: settings.desired_retention,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| CommandError::new(e.to_string()))
+}
+
+#[tauri::command]
+async fn get_study_settings(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<profiles::StudySettings> {
+    Ok(profiles::study_settings(&state.db, ProfileId(profile_id)).await?)
+}
+
+/// 更新學習設定，回傳實際存下來的值（超出合理範圍會被夾住）。
+#[tauri::command]
+async fn update_study_settings(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    settings: profiles::StudySettings,
+) -> CmdResult<profiles::StudySettings> {
+    Ok(profiles::update_study_settings(&state.db, ProfileId(profile_id), settings).await?)
 }
 
 pub struct AppState {
     db: Db,
-    scheduler: Arc<Scheduler>,
     /// 匯入中斷旗標。使用者按下取消時設為 true，匯入迴圈在批次邊界檢查。
     import_cancel: Arc<AtomicBool>,
     /// 同時只允許一個匯入任務：兩個任務同時寫同一個 SQLite 檔只會互相卡住。
@@ -150,7 +174,11 @@ async fn list_due_cards(
         now,
         day_start(now),
         todays_new_limit(&state.db, profile_id, now).await?,
-        limit.min(MAX_REVIEWS_PER_DAY),
+        limit.min(
+            profiles::study_settings(&state.db, ProfileId(profile_id))
+                .await?
+                .max_reviews_per_day,
+        ),
     )
     .await?;
 
@@ -223,7 +251,9 @@ async fn review_card(
         now,
         day_start(now),
         todays_new_limit(&state.db, profile_id, now).await?,
-        MAX_REVIEWS_PER_DAY,
+        profiles::study_settings(&state.db, ProfileId(profile_id))
+            .await?
+            .max_reviews_per_day,
     )
     .await?;
     let card = due
@@ -231,9 +261,10 @@ async fn review_card(
         .find(|c| c.id.map(|id| id.0) == Some(input.card_id))
         .ok_or_else(|| CommandError::new("找不到這張到期的卡片"))?;
 
-    let (next, log) = state
-        .scheduler
-        .review(&card, rating, now, input.duration_ms);
+    let (next, log) =
+        scheduler_for(&state.db, profile_id)
+            .await?
+            .review(&card, rating, now, input.duration_ms);
     cards::record_review(&state.db, &next, &log).await?;
     Ok(())
 }
@@ -372,6 +403,7 @@ async fn study_more(
 
     // 累加到今天的額度上並存起來。前端接著會重新取佇列，
     // 那個查詢也讀同一個設定，兩邊才會一致。
+    let settings = profiles::study_settings(&state.db, ProfileId(profile_id)).await?;
     let total_extra =
         profiles::add_extra_new_today(&state.db, ProfileId(profile_id), &today_key(now), extra)
             .await?;
@@ -381,8 +413,8 @@ async fn study_more(
         ProfileId(profile_id),
         now,
         day_start(now),
-        NEW_CARDS_PER_DAY + total_extra,
-        MAX_REVIEWS_PER_DAY,
+        settings.new_per_day + total_extra,
+        settings.max_reviews_per_day,
     )
     .await?;
     to_card_views(&state.db, cards).await
@@ -894,7 +926,6 @@ pub fn run() {
 
             app.manage(AppState {
                 db,
-                scheduler: Arc::new(Scheduler::default()),
                 import_cancel: Arc::new(AtomicBool::new(false)),
                 import_running: Arc::new(AtomicBool::new(false)),
             });
@@ -910,6 +941,8 @@ pub fn run() {
             unsuspend_cards,
             set_refill_tag,
             get_refill_tag,
+            get_study_settings,
+            update_study_settings,
             search_words,
             word_detail,
             dictionary_stats,

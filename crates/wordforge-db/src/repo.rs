@@ -73,6 +73,89 @@ pub mod profiles {
         Ok(ProfileId(id))
     }
 
+    /// 學習設定。存在 `profile.settings_json`，UI 可以調。
+    #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct StudySettings {
+        /// 每天引入幾張新卡
+        pub new_per_day: i64,
+        /// 每天最多複習幾張
+        pub max_reviews_per_day: i64,
+        /// FSRS 的目標記憶留存率。調高記得更牢但複習量大增。
+        pub desired_retention: f64,
+    }
+
+    impl Default for StudySettings {
+        fn default() -> Self {
+            Self {
+                // 每張新卡當天要按兩三次才畢業，15 張大約是 10 分鐘的量
+                new_per_day: 15,
+                // 長假回來不要被幾百張淹沒
+                max_reviews_per_day: 200,
+                desired_retention: 0.9,
+            }
+        }
+    }
+
+    impl StudySettings {
+        /// 把使用者輸入夾到合理範圍。
+        ///
+        /// 留存率特別要夾：低於 0.7 會忘光，高於 0.97 複習量會爆炸，
+        /// 而且 FSRS 的公式在 0 或 1 會直接壞掉。
+        fn clamped(self) -> Self {
+            Self {
+                new_per_day: self.new_per_day.clamp(0, 500),
+                max_reviews_per_day: self.max_reviews_per_day.clamp(10, 9_999),
+                desired_retention: self.desired_retention.clamp(0.70, 0.97),
+            }
+        }
+    }
+
+    pub async fn study_settings(db: &Db, profile_id: ProfileId) -> Result<StudySettings> {
+        let row: (Option<i64>, Option<i64>, Option<f64>) = sqlx::query_as(
+            "SELECT CAST(json_extract(settings_json, '$.new_per_day') AS INTEGER),
+                    CAST(json_extract(settings_json, '$.max_reviews_per_day') AS INTEGER),
+                    CAST(json_extract(settings_json, '$.desired_retention') AS REAL)
+             FROM profile WHERE id = ? AND json_valid(settings_json)",
+        )
+        .bind(profile_id.0)
+        .fetch_optional(db.pool())
+        .await?
+        .unwrap_or((None, None, None));
+
+        let d = StudySettings::default();
+        Ok(StudySettings {
+            new_per_day: row.0.unwrap_or(d.new_per_day),
+            max_reviews_per_day: row.1.unwrap_or(d.max_reviews_per_day),
+            desired_retention: row.2.unwrap_or(d.desired_retention),
+        }
+        .clamped())
+    }
+
+    /// 更新學習設定，回傳實際存下來的值（已夾到合理範圍）。
+    pub async fn update_study_settings(
+        db: &Db,
+        profile_id: ProfileId,
+        settings: StudySettings,
+    ) -> Result<StudySettings> {
+        let s = settings.clamped();
+        sqlx::query(
+            "UPDATE profile
+             SET settings_json = json_set(
+                     CASE WHEN json_valid(settings_json) THEN settings_json ELSE '{}' END,
+                     '$.new_per_day', ?,
+                     '$.max_reviews_per_day', ?,
+                     '$.desired_retention', ?)
+             WHERE id = ?",
+        )
+        .bind(s.new_per_day)
+        .bind(s.max_reviews_per_day)
+        .bind(s.desired_retention)
+        .bind(profile_id.0)
+        .execute(db.pool())
+        .await?;
+        Ok(s)
+    }
+
     /// 今天額外加開的新卡額度。
     ///
     /// 存成 `{"extra_new": {"date": "2026-08-11", "count": 10}}`：
@@ -1533,6 +1616,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_today, 3);
+    }
+
+    #[tokio::test]
+    async fn study_settings_round_trip_with_sensible_defaults() {
+        let (db, profile) = setup().await;
+
+        let d = profiles::study_settings(&db, profile).await.unwrap();
+        assert_eq!(d, profiles::StudySettings::default());
+
+        let saved = profiles::update_study_settings(
+            &db,
+            profile,
+            profiles::StudySettings {
+                new_per_day: 40,
+                max_reviews_per_day: 300,
+                desired_retention: 0.85,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.new_per_day, 40);
+
+        let loaded = profiles::study_settings(&db, profile).await.unwrap();
+        assert_eq!(loaded, saved);
+    }
+
+    /// 留存率超出範圍會讓 FSRS 的公式壞掉（0 或 1 直接是除以零），
+    /// 而且 0.99 的複習量是 0.9 的好幾倍，不該讓使用者誤設。
+    #[tokio::test]
+    async fn study_settings_are_clamped_to_a_usable_range() {
+        let (db, profile) = setup().await;
+
+        let s = profiles::update_study_settings(
+            &db,
+            profile,
+            profiles::StudySettings {
+                new_per_day: -5,
+                max_reviews_per_day: 0,
+                desired_retention: 1.5,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(s.new_per_day, 0, "0 是合法的（今天先不學新字）");
+        assert_eq!(s.max_reviews_per_day, 10);
+        assert!((s.desired_retention - 0.97).abs() < 1e-9);
+
+        // 存進去的也必須是夾過的值，不能只在回傳時夾
+        assert_eq!(profiles::study_settings(&db, profile).await.unwrap(), s);
+    }
+
+    /// 設定會直接影響佇列，不能只是存起來好看。
+    #[tokio::test]
+    async fn new_per_day_setting_changes_the_queue() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 100).await;
+
+        let s = profiles::update_study_settings(
+            &db,
+            profile,
+            profiles::StudySettings {
+                new_per_day: 40,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), s.new_per_day, 200)
+            .await
+            .unwrap();
+        assert_eq!(queue.len(), 40);
     }
 
     /// 「再學 10 個」必須留得住，而且隔天要自動回到預設。

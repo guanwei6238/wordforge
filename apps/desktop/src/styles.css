@@ -603,3 +603,21 @@ button.link {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+
+/* ---------------------------------------------------------------- 設定 */
+
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.settings input[type="number"] {
+  width: 6rem;
+}
+
+.hint {
+  font-size: 0.85rem;
+  margin: 0;
+  padding-left: 0.1rem;
+}

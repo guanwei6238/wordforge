@@ -3,12 +3,14 @@ import Deck from "./pages/Deck";
 import Dictionary from "./pages/Dictionary";
 import Import from "./pages/Import";
 import Review from "./pages/Review";
+import Settings from "./pages/Settings";
 
 const TABS = [
   { id: "review", label: "複習" },
   { id: "dictionary", label: "字典" },
   { id: "deck", label: "牌組" },
   { id: "import", label: "匯入" },
+  { id: "settings", label: "設定" },
 ] as const;
 
 type Tab = (typeof TABS)[number]["id"];
@@ -38,6 +40,7 @@ export default function App() {
         {tab === "dictionary" && <Dictionary />}
         {tab === "deck" && <Deck />}
         {tab === "import" && <Import />}
+        {tab === "settings" && <Settings />}
       </main>
     </div>
   );
