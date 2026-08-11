@@ -241,10 +241,18 @@ impl LlmProvider for CliLlm {
             })?;
 
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(input.as_bytes())
-                .await
-                .map_err(|e| LlmError::Decode(e.to_string()))?;
+            // 寫不進去**不能**當場放棄。
+            //
+            // CLI 提早結束（沒登入、參數不對、直接爆掉）時，它根本不會讀
+            // stdin，這裡就會拿到 EPIPE。當場 `?` 回去的話，使用者看到的是
+            // 「Broken pipe (os error 32)」——而工具其實已經在 stderr 上
+            // 說清楚問題是什麼了。
+            //
+            // 所以寫失敗只記一筆，繼續往下等行程結束，把它自己的錯誤訊息
+            // 撈出來回報。那才是使用者需要看到的東西。
+            if let Err(e) = stdin.write_all(input.as_bytes()).await {
+                tracing::debug!(error = %e, "prompt 沒寫完，指令可能已經結束了");
+            }
             // 一定要關掉 stdin，否則 CLI 會一直等更多輸入
             drop(stdin);
         }
@@ -483,6 +491,13 @@ mod tests {
     }
 
     /// 指令失敗時要帶著 stderr 回報，不能只說「失敗了」。
+    ///
+    /// 這條測試曾經是不穩的，而原因是個真的 bug：`sh -c 'echo ... >&2; exit 3'`
+    /// 根本不讀 stdin，所以寫 prompt 時會拿到 EPIPE。以前那個錯誤會被
+    /// 當場 `?` 回去，使用者看到「Broken pipe (os error 32)」而不是工具
+    /// 自己印的訊息——沒登入、參數打錯都會變成同一句無用的話。
+    ///
+    /// 誰先跑完是競爭條件，所以本機常常是綠的、CI 上才掛。
     #[tokio::test]
     async fn a_failing_command_reports_stderr() {
         let cli = CliLlm::new(CliConfig {
@@ -498,6 +513,33 @@ mod tests {
 
         let err = cli.chat(&req()).await.unwrap_err();
         assert!(err.to_string().contains("出事了"), "{err}");
+    }
+
+    /// 指令沒讀 stdin 就結束時，要回報它自己的錯誤而不是「Broken pipe」。
+    ///
+    /// 這是上一條測試不穩的根因，值得單獨釘住：prompt 有好幾 KB，
+    /// 一定會填滿管線緩衝區，所以寫入必定失敗。
+    #[tokio::test]
+    async fn a_command_that_ignores_stdin_still_reports_its_own_error() {
+        let cli = CliLlm::new(CliConfig {
+            preset: CliPreset::Custom,
+            program: "sh".into(),
+            // 立刻結束，完全不讀 stdin
+            args: vec!["-c".into(), "echo 請先登入 >&2; exit 1".into()],
+            system_flag: None,
+            model_flag: None,
+            model: String::new(),
+            timeout_secs: 10,
+        })
+        .unwrap();
+
+        // 用一個大到一定會塞爆管線緩衝區的 prompt
+        let mut req = req();
+        req.messages[0].content = "字".repeat(200_000);
+
+        let err = cli.chat(&req).await.unwrap_err().to_string();
+        assert!(err.contains("請先登入"), "應該回報指令自己說的話：{err}");
+        assert!(!err.contains("Broken pipe"), "{err}");
     }
 
     /// 卡住的指令要在時限內放棄，不能讓 UI 永遠轉圈。
