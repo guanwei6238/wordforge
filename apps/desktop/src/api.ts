@@ -191,6 +191,21 @@ export function studyMore(extra: number, profileId = DEFAULT_PROFILE_ID): Promis
   return invoke("study_more", { profileId, extra });
 }
 
+/**
+ * 把一張卡藏到明天，排程不動。
+ *
+ * 跟 suspendCard 的差別是「會不會自己回來」：埋葬明天自動回來，
+ * 暫停要到牌組頁主動恢復。
+ */
+export function buryCard(cardId: number, profileId = DEFAULT_PROFILE_ID): Promise<boolean> {
+  return invoke("bury_card", { profileId, cardId });
+}
+
+/** 收起一張卡，要主動恢復才會回來 */
+export function suspendCard(cardId: number, profileId = DEFAULT_PROFILE_ID): Promise<boolean> {
+  return invoke("suspend_card", { profileId, cardId });
+}
+
 /** 恢復被收起來的卡，最常用的字優先 */
 export function unsuspendCards(count: number, profileId = DEFAULT_PROFILE_ID): Promise<number> {
   return invoke("unsuspend_cards", { profileId, count });
@@ -648,6 +663,32 @@ export function updateLlmSettings(settings: LlmSettings): Promise<LlmSettings> {
 export function testLlm(): Promise<string> {
   return invoke("test_llm");
 }
+
+/** 一段期間的 LLM 用量 */
+export interface UsageSummary {
+  calls: number;
+  /** 失敗的次數。重試會燒額度，所以單獨看得到 */
+  failed: number;
+  prompt_chars: number;
+  response_chars: number;
+  /** 後端有回報才有值。null 代表量不到，不是 0 */
+  input_tokens: number | null;
+  output_tokens: number | null;
+  /** 有幾次呼叫回報了 token */
+  calls_with_tokens: number;
+}
+
+/** [今天, 最近七天, 今天依用途拆開 [用途, 次數, 總字元]] */
+export function llmUsage(
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<[UsageSummary, UsageSummary, [string, number, number][]]> {
+  return invoke("llm_usage", { profileId });
+}
+
+export const PURPOSE_LABELS: Record<string, string> = {
+  generate: "出題",
+  grade: "批改",
+};
 
 export type ExerciseKind =
   | "translation_to_target"

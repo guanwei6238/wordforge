@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { errorMessage, getStudySettings, type StudySettings, updateStudySettings } from "../api";
 import LanguageSettings from "../components/LanguageSettings";
 import MaterialManager from "../components/MaterialManager";
+import UsageStats from "../components/UsageStats";
 import LlmSetup from "../components/LlmSetup";
 
 /** 目標留存率的選項。數字背後的意義比數字本身重要，所以每個都附說明。 */
@@ -120,6 +121,8 @@ export default function Settings() {
       <MaterialManager />
 
       <LlmSetup />
+
+      <UsageStats />
 
       {saved && <p className="ok">{saved}</p>}
       {error && <p className="error">{error}</p>}

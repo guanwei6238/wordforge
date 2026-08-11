@@ -154,6 +154,7 @@ AI 出題（翻譯 / 閱讀 / 文法）已接上：依詞彙量選題型，**批
 
 ## 文件
 
+- [`docs/manual.md`](docs/manual.md) — **使用手冊**（給使用者，其他都是給開發者的）
 - [`docs/architecture.md`](docs/architecture.md) — 架構決策與模組邊界
 - [`docs/data-model.md`](docs/data-model.md) — SQLite schema 與設計理由
 - [`docs/srs.md`](docs/srs.md) — FSRS-5 排程演算法說明

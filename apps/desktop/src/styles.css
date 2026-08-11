@@ -882,3 +882,32 @@ button.link {
   white-space: pre;
   user-select: all;
 }
+
+/* 跳過／收起：刻意做得比評分鈕低調，它們不是主要動線 */
+.card-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.card-actions button {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.7rem;
+  color: var(--muted);
+}
+
+/* --------------------------------------------------------------- 用量 */
+
+.usage-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+}
+
+.usage-label {
+  display: inline-block;
+  min-width: 4.5rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}

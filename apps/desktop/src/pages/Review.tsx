@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 import {
   addWord,
+  buryCard,
   type CardView,
   errorMessage,
   listDueCards,
@@ -11,6 +12,7 @@ import {
   queueStatus,
   type StudyStats,
   studyStats,
+  suspendCard,
 } from "../api";
 import QueueEmpty from "../components/QueueEmpty";
 import SpeakButton from "../components/SpeakButton";
@@ -51,6 +53,29 @@ export default function Review() {
 
   const current = queue[0];
 
+  /**
+   * 從佇列拿掉這張卡，但不評分。
+   *
+   * 埋葬與暫停都不該進 FSRS：使用者按的是「今天不想看到」或
+   * 「這張根本不該出現」，不是「我忘記了」。把它們當成答錯會讓
+   * 間隔被錯誤地縮短，越跳過越常出現，完全相反。
+   */
+  const skip = useCallback(
+    async (action: (id: number) => Promise<boolean>) => {
+      if (!current) return;
+      try {
+        await action(current.card_id);
+        setQueue((q) => q.slice(1));
+        setRevealed(false);
+        setShownAt(Date.now());
+        void refresh();
+      } catch (e) {
+        setError(errorMessage(e));
+      }
+    },
+    [current, refresh],
+  );
+
   const grade = useCallback(
     async (rating: Rating) => {
       if (!current) return;
@@ -68,7 +93,8 @@ export default function Review() {
     [current, shownAt],
   );
 
-  // 鍵盤操作：空白鍵翻牌，1~4 評分。背單字時手不該離開鍵盤。
+  // 鍵盤操作：空白鍵翻牌，1~4 評分，B 跳過、S 收起。
+  // 背單字時手不該離開鍵盤。
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (!current || e.target instanceof HTMLInputElement) return;
@@ -77,13 +103,22 @@ export default function Review() {
         setRevealed(true);
         return;
       }
+      // 跳過與收起不必先翻牌：卡住的時候就是還沒想出來
+      if (e.key === "b" || e.key === "B") {
+        void skip(buryCard);
+        return;
+      }
+      if (e.key === "s" || e.key === "S") {
+        void skip(suspendCard);
+        return;
+      }
       if (!revealed) return;
       const rating = Number(e.key);
       if (rating >= 1 && rating <= 4) void grade(rating as Rating);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [current, revealed, grade]);
+  }, [current, revealed, grade, skip]);
 
   async function onAddWord(e: FormEvent) {
     e.preventDefault();
@@ -152,6 +187,21 @@ export default function Review() {
               顯示答案（空白鍵）
             </button>
           )}
+
+          <div className="card-actions">
+            <button
+              onClick={() => skip(buryCard)}
+              title="今天不想看到這張，明天會自己回來。排程不受影響。"
+            >
+              跳過今天 (B)
+            </button>
+            <button
+              onClick={() => skip(suspendCard)}
+              title="這張不該出現。要到牌組頁主動恢復才會回來。"
+            >
+              收起這張 (S)
+            </button>
+          </div>
         </section>
       ) : status ? (
         <QueueEmpty status={status} onResume={refresh} />

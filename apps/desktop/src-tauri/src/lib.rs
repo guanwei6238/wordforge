@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use time::OffsetDateTime;
-use wordforge_core::model::{CardKind, LemmaId, ProfileId, Rating};
+use wordforge_core::model::{CardId, CardKind, LemmaId, ProfileId, Rating};
 use wordforge_core::placement::{self, PlacementAnswer, PlacementResult};
 use wordforge_core::srs::Scheduler;
 use wordforge_db::Db;
@@ -766,6 +766,52 @@ async fn dictionary_languages(state: tauri::State<'_, AppState>) -> CmdResult<Ve
     Ok(wordforge_db::dict::languages(&state.db).await?)
 }
 
+/// 用量面板要的三份資料：今天、近七天、今天依用途拆開（用途、次數、總字元）。
+type UsageReport = (
+    wordforge_db::llm_usage::UsageSummary,
+    wordforge_db::llm_usage::UsageSummary,
+    Vec<(String, i64, i64)>,
+);
+
+/// LLM 用量：今天與最近七天。
+#[tauri::command]
+async fn llm_usage(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdResult<UsageReport> {
+    let now = OffsetDateTime::now_utc();
+    let today = day_start(now);
+    let week = today - time::Duration::days(6);
+
+    Ok((
+        wordforge_db::llm_usage::summary(&state.db, ProfileId(profile_id), today).await?,
+        wordforge_db::llm_usage::summary(&state.db, ProfileId(profile_id), week).await?,
+        wordforge_db::llm_usage::by_purpose(&state.db, ProfileId(profile_id), today).await?,
+    ))
+}
+
+/// 把一張卡藏到明天。排程不動。
+///
+/// 「明天」用使用者的午夜而不是「24 小時後」——晚上十一點埋一張卡，
+/// 使用者的預期是明天早上會看到，不是明天晚上。
+#[tauri::command]
+async fn bury_card(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    card_id: i64,
+) -> CmdResult<bool> {
+    let now = OffsetDateTime::now_utc();
+    let tomorrow = day_start(now) + time::Duration::days(1);
+    Ok(cards::bury(&state.db, ProfileId(profile_id), CardId(card_id), tomorrow).await?)
+}
+
+/// 收起一張卡，要到牌組頁主動恢復才會回來。
+#[tauri::command]
+async fn suspend_card(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    card_id: i64,
+) -> CmdResult<bool> {
+    Ok(cards::suspend(&state.db, ProfileId(profile_id), CardId(card_id)).await?)
+}
+
 // ------------------------------------------------------------------ 教材
 
 /// 匯入一份教材。
@@ -1281,6 +1327,9 @@ pub fn run() {
             set_profile_languages,
             suspend_other_language_cards,
             dictionary_languages,
+            llm_usage,
+            bury_card,
+            suspend_card,
             import_material,
             list_materials,
             delete_material,

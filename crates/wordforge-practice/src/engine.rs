@@ -7,6 +7,7 @@ use wordforge_db::Db;
 use wordforge_db::dict;
 use wordforge_db::exercises::{self, ExerciseId, NewExercise};
 use wordforge_db::grammar;
+use wordforge_db::llm_usage;
 use wordforge_db::material::{self, MaterialId};
 use wordforge_db::repo::{cards, lemmas};
 use wordforge_llm::{LlmProvider, prompts};
@@ -248,7 +249,7 @@ impl<'a> PracticeEngine<'a> {
             &due_words,
             count,
         );
-        let value = self.ask_json(&req).await?;
+        let value = self.ask_json(profile_id, "generate", &req).await?;
 
         let raw_items = value
             .get("items")
@@ -325,7 +326,7 @@ impl<'a> PracticeEngine<'a> {
         let mut req = prompts::reading_comprehension(&spec);
 
         for attempt in 0..=COVERAGE_RETRIES {
-            let value = self.ask_json(&req).await?;
+            let value = self.ask_json(profile_id, "generate", &req).await?;
             let passage = value
                 .get("passage")
                 .and_then(|p| p.as_str())
@@ -430,7 +431,7 @@ impl<'a> PracticeEngine<'a> {
             GRAMMAR_BATCH as usize,
             excerpt.as_deref(),
         );
-        let value = self.ask_json(&req).await?;
+        let value = self.ask_json(profile_id, "generate", &req).await?;
 
         let items: Vec<ChoiceItem> = value
             .get("items")
@@ -480,7 +481,7 @@ impl<'a> PracticeEngine<'a> {
 
         let mut feedback = match &body {
             ExerciseBody::Translation { to_target, items } => {
-                self.grade_translation(*to_target, items, input, &weak_points)
+                self.grade_translation(profile_id, *to_target, items, input, &weak_points)
                     .await?
             }
             ExerciseBody::Reading {
@@ -527,6 +528,7 @@ impl<'a> PracticeEngine<'a> {
 
     async fn grade_translation(
         &self,
+        profile_id: i64,
         to_target: bool,
         items: &[TranslationItem],
         input: &GradeInput,
@@ -550,7 +552,7 @@ impl<'a> PracticeEngine<'a> {
             &pairs,
             weak_points,
         );
-        let value = self.ask_json(&req).await?;
+        let value = self.ask_json(profile_id, "grade", &req).await?;
         serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))
     }
 
@@ -579,7 +581,7 @@ impl<'a> PracticeEngine<'a> {
 
         let req =
             prompts::reading_feedback(self.target_name(), self.native_name(), passage, &triples);
-        let value = self.ask_json(&req).await?;
+        let value = self.ask_json(profile_id, "grade", &req).await?;
         let mut feedback: Feedback =
             serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))?;
 
@@ -777,9 +779,63 @@ impl<'a> PracticeEngine<'a> {
 
     // ------------------------------------------------------------ 小工具
 
-    async fn ask_json(&self, req: &wordforge_llm::ChatRequest) -> Result<serde_json::Value> {
-        let resp = self.llm.chat(req).await?;
-        Ok(resp.json()?)
+    /// 送出一次請求並解析回應，順便把用量記下來。
+    ///
+    /// 記在這裡而不是各個呼叫點：這是整個 crate 唯一真正打模型的地方，
+    /// 放在這裡就不會有「新加了一種題型但忘了記用量」的漏洞。
+    ///
+    /// 失敗的呼叫也記。prompt 一樣送出去了，額度一樣燒掉了——
+    /// 只記成功的話，重試越多次帳面上反而越乾淨。
+    async fn ask_json(
+        &self,
+        profile_id: i64,
+        purpose: &str,
+        req: &wordforge_llm::ChatRequest,
+    ) -> Result<serde_json::Value> {
+        let prompt_chars = req
+            .system
+            .as_deref()
+            .map(|s| s.chars().count())
+            .unwrap_or(0)
+            + req
+                .messages
+                .iter()
+                .map(|m| m.content.chars().count())
+                .sum::<usize>();
+
+        let result = self.llm.chat(req).await;
+
+        let (response_chars, input_tokens, output_tokens, ok) = match &result {
+            Ok(resp) => (
+                resp.text.chars().count(),
+                resp.input_tokens.map(|t| t as i64),
+                resp.output_tokens.map(|t| t as i64),
+                true,
+            ),
+            Err(_) => (0, None, None, false),
+        };
+
+        // 記用量失敗不該讓整次練習失敗——那是附帶的觀測，不是主線
+        if let Err(e) = llm_usage::record(
+            self.db,
+            ProfileId(profile_id),
+            llm_usage::NewCall {
+                model: self.llm.model(),
+                purpose,
+                prompt_chars: prompt_chars as i64,
+                response_chars: response_chars as i64,
+                input_tokens,
+                output_tokens,
+                ok,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "用量沒記起來");
+        }
+
+        Ok(result?.json()?)
     }
 
     /// 今天到期或即將學到的字，拿來當出題素材。

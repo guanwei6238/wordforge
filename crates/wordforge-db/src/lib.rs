@@ -8,6 +8,7 @@
 pub mod dict;
 pub mod exercises;
 pub mod grammar;
+pub mod llm_usage;
 pub mod material;
 pub mod repo;
 pub(crate) mod ts;

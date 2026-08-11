@@ -454,7 +454,20 @@ pub mod cards {
     }
 
     const SELECT_CARD: &str = "SELECT id, profile_id, lemma_id, kind, state, step, stability,
-        difficulty, due, last_review, reps, lapses, scheduled_days, suspended FROM card";
+        difficulty, due, last_review, reps, lapses, scheduled_days, suspended,
+        buried_until FROM card";
+
+    /// 「這張卡沒有被埋葬」。
+    ///
+    /// 埋葬存的是到期時間而不是布林值，所以判斷要跟 `now` 比。
+    /// 這樣就不需要一支「每天清掉埋葬旗標」的排程工作——
+    /// 那種工作在桌面應用程式上特別不可靠，使用者可能三天沒開 App。
+    ///
+    /// 沒被埋葬的卡存空字串而不是 NULL。空字串排在任何 RFC 3339 時間戳
+    /// 之前，所以這個條件對它永遠成立——而且是**純範圍條件**，
+    /// 索引接得下去。寫成 `IS NULL OR <= ?` 的話那個 OR 會讓索引
+    /// 在這一欄斷掉，連帶後面的 due 也用不到：十萬張卡實測 200 ms 起跳。
+    const NOT_BURIED: &str = "buried_until <= ?";
 
     /// 取得（必要時建立）某個字的某種卡片。
     pub async fn ensure(
@@ -496,10 +509,12 @@ pub mod cards {
         limit: i64,
     ) -> Result<Vec<Card>> {
         let rows = sqlx::query(&format!(
-            "{SELECT_CARD} WHERE profile_id = ? AND suspended = 0 AND due <= ?
+            "{SELECT_CARD} WHERE profile_id = ? AND suspended = 0 AND {NOT_BURIED} AND due <= ?
              ORDER BY due ASC LIMIT ?"
         ))
         .bind(profile_id.0)
+        // NOT_BURIED 與 due 各要一個 now
+        .bind(ts::to_sql(now))
         .bind(ts::to_sql(now))
         .bind(limit)
         .fetch_all(db.pool())
@@ -730,6 +745,36 @@ pub mod cards {
         Ok(n)
     }
 
+    /// 把一張卡藏到明天。
+    ///
+    /// 不動排程：埋葬的意思是「今天不想看到」，不是「我答錯了」。
+    /// 常見情境是同一個字的另一種卡型剛看過，或這題卡住想先跳過——
+    /// 兩種都不該影響 FSRS 對記憶強度的估計。
+    pub async fn bury(
+        db: &Db,
+        profile_id: ProfileId,
+        card_id: CardId,
+        until: OffsetDateTime,
+    ) -> Result<bool> {
+        let res = sqlx::query("UPDATE card SET buried_until = ? WHERE id = ? AND profile_id = ?")
+            .bind(ts::to_sql(until))
+            .bind(card_id.0)
+            .bind(profile_id.0)
+            .execute(db.pool())
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// 收起一張卡，要主動恢復才會回來。
+    pub async fn suspend(db: &Db, profile_id: ProfileId, card_id: CardId) -> Result<bool> {
+        let res = sqlx::query("UPDATE card SET suspended = 1 WHERE id = ? AND profile_id = ?")
+            .bind(card_id.0)
+            .bind(profile_id.0)
+            .execute(db.pool())
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// 把別的語言的卡片收起來。
     ///
     /// 用 suspend 而不是刪除：使用者可能只是暫時換去學日文，
@@ -794,11 +839,12 @@ pub mod cards {
 
         // 學習中 + 到期複習，先來後到
         let mut queue: Vec<Card> = sqlx::query(&format!(
-            "{SELECT_CARD} WHERE profile_id = ? AND suspended = 0
+            "{SELECT_CARD} WHERE profile_id = ? AND suspended = 0 AND {NOT_BURIED}
                AND state <> 'new' AND due <= ?
              ORDER BY due ASC LIMIT ?"
         ))
         .bind(profile_id.0)
+        .bind(&now_sql)
         .bind(&now_sql)
         .bind(max_reviews.max(0))
         .fetch_all(db.pool())
@@ -815,7 +861,7 @@ pub mod cards {
 
         // 新卡依詞頻由常用到罕見引入，跟加入牌組時的順序一致
         let new_cards: Vec<Card> = sqlx::query(&format!(
-            "{SELECT_CARD} AS c WHERE profile_id = ? AND suspended = 0
+            "{SELECT_CARD} AS c WHERE profile_id = ? AND suspended = 0 AND {NOT_BURIED}
                AND state = 'new' AND due <= ?
              ORDER BY (SELECT freq_rank IS NULL FROM lemma WHERE id = c.lemma_id),
                       (SELECT freq_rank FROM lemma WHERE id = c.lemma_id),
@@ -823,6 +869,7 @@ pub mod cards {
              LIMIT ?"
         ))
         .bind(profile_id.0)
+        .bind(&now_sql)
         .bind(&now_sql)
         .bind(remaining)
         .fetch_all(db.pool())
@@ -2405,5 +2452,123 @@ mod tests {
             Some(lemma)
         );
         assert_eq!(lemmas::base_form(&db, "en", "  ").await.unwrap(), None);
+    }
+
+    /// 埋葬是「今天不想看到」，明天要自己回來。
+    #[tokio::test]
+    async fn a_buried_card_comes_back_tomorrow() {
+        let (db, profile) = setup().await;
+        let lemma = add_word(&db, "apple", 1).await;
+        let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+
+        let tomorrow = t0() + Duration::days(1);
+        assert!(
+            cards::bury(&db, profile, card.id.unwrap(), tomorrow)
+                .await
+                .unwrap()
+        );
+
+        let today = cards::daily_queue(&db, profile, t0(), t0(), 10, 10)
+            .await
+            .unwrap();
+        assert!(today.is_empty(), "今天不該再出現");
+
+        let later = cards::daily_queue(
+            &db,
+            profile,
+            tomorrow + Duration::minutes(1),
+            tomorrow,
+            10,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(later.len(), 1, "明天要自己回來，不必使用者做任何事");
+    }
+
+    /// 埋葬不能動排程——那是「跳過」，不是「答錯」。
+    #[tokio::test]
+    async fn burying_does_not_touch_the_schedule() {
+        let (db, profile) = setup().await;
+        let lemma = add_word(&db, "apple", 1).await;
+        let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+        const SCHEDULE: &str = "SELECT due, state, reps FROM card WHERE id = ?";
+        let id = card.id.unwrap();
+
+        let before: (String, String, i64) = sqlx::query_as(SCHEDULE)
+            .bind(id.0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        cards::bury(&db, profile, id, t0() + Duration::days(1))
+            .await
+            .unwrap();
+
+        let after: (String, String, i64) = sqlx::query_as(SCHEDULE)
+            .bind(id.0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(after, before, "埋葬只是藏起來，排程一個欄位都不該動");
+    }
+
+    /// 暫停跟埋葬的差別就是「會不會自己回來」。
+    #[tokio::test]
+    async fn a_suspended_card_does_not_come_back_on_its_own() {
+        let (db, profile) = setup().await;
+        let lemma = add_word(&db, "apple", 1).await;
+        let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+
+        assert!(
+            cards::suspend(&db, profile, card.id.unwrap())
+                .await
+                .unwrap()
+        );
+
+        let much_later = t0() + Duration::days(90);
+        assert!(
+            cards::daily_queue(&db, profile, much_later, much_later, 10, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "九十天後也不該自己回來"
+        );
+
+        assert_eq!(cards::unsuspend(&db, profile, 10).await.unwrap(), 1);
+        assert_eq!(
+            cards::daily_queue(&db, profile, much_later, much_later, 10, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// 別人的卡不能被埋葬或收起來。
+    #[tokio::test]
+    async fn burying_only_touches_your_own_cards() {
+        let (db, profile) = setup().await;
+        let other = profiles::create(&db, "他", "zh-TW", "en", t0())
+            .await
+            .unwrap();
+        let lemma = add_word(&db, "apple", 1).await;
+        let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+
+        assert!(
+            !cards::bury(&db, other, card.id.unwrap(), t0() + Duration::days(1))
+                .await
+                .unwrap()
+        );
+        assert!(!cards::suspend(&db, other, card.id.unwrap()).await.unwrap());
     }
 }
