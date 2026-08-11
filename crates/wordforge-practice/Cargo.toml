@@ -1,0 +1,26 @@
+[package]
+name = "wordforge-practice"
+description = "把詞彙狀態、LLM 出題與批改結果串成一個學習迴圈"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+wordforge-core = { workspace = true }
+wordforge-db = { workspace = true }
+wordforge-llm = { workspace = true }
+
+async-trait = "0.1"
+serde = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+async-trait = "0.1"

@@ -6137,6 +6137,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wordforge-practice"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tracing",
+ "wordforge-core",
+ "wordforge-db",
+ "wordforge-llm",
+]
+
+[[package]]
 name = "wordforge-tts"
 version = "0.1.0"
 dependencies = [

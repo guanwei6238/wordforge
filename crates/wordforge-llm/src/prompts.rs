@@ -252,6 +252,116 @@ pub fn grammar_drill(
     }
 }
 
+/// 批改翻譯，並判斷學習者不懂哪些字。
+///
+/// `unknown_words` 是這整套設計的關鍵：批改不只是打分數，還要看出
+/// 「他其實不會這個字」，把那些字排進複習。使用者不必自己判斷哪裡不會——
+/// 從錯誤裡看出來本來就是老師的工作。
+pub fn translation_feedback(
+    target_lang: &str,
+    native_lang: &str,
+    direction_to_target: bool,
+    items: &[(String, String)],
+) -> ChatRequest {
+    let system = format!("你是一位{target_lang}老師，正在批改翻譯練習。你只輸出 JSON。");
+
+    let body: String = items
+        .iter()
+        .enumerate()
+        .map(|(i, (source, answer))| {
+            let answer = if answer.trim().is_empty() {
+                "（沒有作答）"
+            } else {
+                answer.trim()
+            };
+            format!("{}. 題目：{source}\n   學習者的翻譯：{answer}\n", i + 1)
+        })
+        .collect();
+
+    let direction = if direction_to_target {
+        format!("{native_lang} → {target_lang}")
+    } else {
+        format!("{target_lang} → {native_lang}")
+    };
+
+    let prompt = format!(
+        "# 練習方向\n{direction}\n\n# 作答\n{body}\n\
+         # 批改要求\n\
+         - 意思對就算對，不要為了語法完美而挑剔可接受的說法。\n\
+         - 每個問題標註文法點（tense、articles、word-order…），用一致的英文術語，\n\
+           這些標籤會累積成後續的文法練習。\n\
+         - **判斷學習者不懂哪些字**：翻錯、漏譯、或用了明顯繞路的說法，\n\
+           都代表他不會那個字。把那些{target_lang}單字列在 unknown_words，\n\
+           系統會自動排進他的複習。\n\
+         - 沒有作答的題目，題目裡的關鍵字就是他不會的字。\n\
+         - unknown_words 只放單字原形，不要放片語或整句。\n\n\
+         # 輸出格式\n\
+         {{\n\
+         \x20 \"score\": 0 到 100 的整數,\n\
+         \x20 \"items\": [{{\"index\": 1, \"correct\": true, \"reference\": \"參考答案\", \
+         \"comment\": \"用{native_lang}說明，答對就寫得簡短\"}}],\n\
+         \x20 \"corrections\": [{{\"original\": \"原句\", \"corrected\": \"修正後\", \
+         \"grammar_point\": \"tense\", \"severity\": \"minor\", \
+         \"explanation\": \"用{native_lang}說明\"}}],\n\
+         \x20 \"unknown_words\": [\"他不會的{target_lang}單字\"]\n\
+         }}"
+    );
+
+    ChatRequest {
+        system: Some(system),
+        messages: vec![Message::user(prompt)],
+        json_only: true,
+    }
+}
+
+/// 批改閱讀測驗，並從答錯的題目往回推斷不懂的字。
+pub fn reading_feedback(
+    target_lang: &str,
+    native_lang: &str,
+    passage: &str,
+    questions: &[(String, String, String)],
+) -> ChatRequest {
+    let system = format!("你是一位{target_lang}閱讀理解老師。你只輸出 JSON。");
+
+    let body: String = questions
+        .iter()
+        .enumerate()
+        .map(|(i, (question, answer, correct))| {
+            let answer = if answer.trim().is_empty() {
+                "（沒有作答）"
+            } else {
+                answer.trim()
+            };
+            format!(
+                "{}. {question}\n   學習者選了：{answer}\n   正確答案：{correct}\n",
+                i + 1
+            )
+        })
+        .collect();
+
+    let prompt = format!(
+        "# 文章\n{passage}\n\n# 作答\n{body}\n\
+         # 批改要求\n\
+         - 用{native_lang}解釋每一題為什麼是那個答案；答錯的要指出他可能誤解了哪裡。\n\
+         - **判斷他不懂哪些字**：從答錯的題目往回看，那一段裡有哪些字\n\
+           是他看不懂才會選錯的？列在 unknown_words，系統會排進複習。\n\
+         - 只放文章裡真的出現過的單字原形。\n\n\
+         # 輸出格式\n\
+         {{\n\
+         \x20 \"score\": 0 到 100 的整數,\n\
+         \x20 \"items\": [{{\"index\": 1, \"correct\": true, \
+         \"comment\": \"用{native_lang}說明\"}}],\n\
+         \x20 \"unknown_words\": [\"他看不懂的單字\"]\n\
+         }}"
+    );
+
+    ChatRequest {
+        system: Some(system),
+        messages: vec![Message::user(prompt)],
+        json_only: true,
+    }
+}
+
 /// 翻譯出題：從母語翻成目標語，刻意使用到期複習的單字。
 pub fn translation_task(
     target_lang: &str,
@@ -428,6 +538,51 @@ mod tests {
         let text = &req.messages[0].content;
         assert!(text.contains("borrow"));
         assert!(text.contains("出 3 個"));
+    }
+
+    /// 批改的重點不只是分數，而是找出「他其實不會這個字」。
+    #[test]
+    fn translation_feedback_asks_for_unknown_words() {
+        let items = vec![
+            (
+                "我昨天去了公園".to_string(),
+                "I go to park yesterday".to_string(),
+            ),
+            ("他很勤奮".to_string(), String::new()),
+        ];
+        let req = translation_feedback("English", "繁體中文", true, &items);
+        let text = &req.messages[0].content;
+
+        assert!(text.contains("I go to park yesterday"), "要帶上實際作答");
+        assert!(text.contains("（沒有作答）"), "空白作答要標示出來");
+        assert!(text.contains("unknown_words"), "沒有要求列出不懂的字");
+        assert!(text.contains("grammar_point"), "沒有要求標註文法點");
+        assert!(text.contains("繁體中文 → English"), "要說明翻譯方向");
+        assert!(req.json_only);
+    }
+
+    #[test]
+    fn translation_feedback_states_the_other_direction() {
+        let items = vec![("The weather is nice".to_string(), "天氣很好".to_string())];
+        let req = translation_feedback("English", "繁體中文", false, &items);
+        assert!(req.messages[0].content.contains("English → 繁體中文"));
+    }
+
+    /// 閱讀測驗要從答錯的題目往回推斷哪些字看不懂。
+    #[test]
+    fn reading_feedback_traces_mistakes_back_to_words() {
+        let questions = vec![(
+            "Why did she leave?".to_string(),
+            "A".to_string(),
+            "C".to_string(),
+        )];
+        let req = reading_feedback("English", "繁體中文", "She left because...", &questions);
+        let text = &req.messages[0].content;
+
+        assert!(text.contains("She left because..."));
+        assert!(text.contains("正確答案：C"));
+        assert!(text.contains("unknown_words"));
+        assert!(text.contains("只放文章裡真的出現過的單字原形"));
     }
 
     #[test]
