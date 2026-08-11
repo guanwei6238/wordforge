@@ -7,16 +7,25 @@
 //! - [`Provider::Anthropic`]：填自己的 Anthropic API key
 //! - [`Provider::OpenAiCompatible`]：OpenAI 或任何相容端點（含各種代理）
 //! - [`Provider::Ollama`]：本機模型，完全離線、零成本
+//! - [`cli`]：直接呼叫本機的 `claude` / `codex` CLI，用既有的訂閱而不另開 API 帳單
+//!
+//! ## 不想付兩份錢
+//!
+//! 已經有 Claude 或 ChatGPT 訂閱的話，[`cli`] 讓你直接用本機的
+//! `claude -p` / `codex exec`，不必再開一份 API 帳單。代價是比較慢、
+//! 有速率限制，而且輸出比 API 髒（要從 CLI 的雜訊裡撈 JSON）。
 //!
 //! ## API key 的存放
 //!
-//! key **不會**寫進 SQLite，而是交給作業系統的 keychain
-//! （macOS Keychain / Windows Credential Manager / Linux Secret Service）。
-//! 資料庫檔案常被使用者複製到雲端硬碟，不該夾帶憑證。
+//! key 存在 app 資料目錄的獨立檔案（權限 600），**不進 SQLite**——
+//! 資料庫常被複製到雲端硬碟同步，不該夾帶憑證。
+//! 改用系統 keychain 是之後的事，見 roadmap。
 
+pub mod cli;
 pub mod client;
 pub mod prompts;
 
+pub use cli::{CliConfig, CliLlm, CliPreset};
 pub use client::{HttpLlm, LlmProvider};
 
 use serde::{Deserialize, Serialize};
@@ -188,18 +197,84 @@ pub struct ChatResponse {
 impl ChatResponse {
     /// 從回應中取出 JSON 物件。
     ///
-    /// 即使要求只輸出 JSON，模型仍可能包上 ```json 圍欄或加一句開場白，
-    /// 所以這裡取第一個 `{` 到最後一個 `}` 之間的內容再解析。
+    /// 即使要求只輸出 JSON，實際拿到的東西還是很髒：模型會包上 ```json 圍欄
+    /// 或加一句開場白，透過 CLI 執行時還會混進工具自己的輸出。
+    /// codex 的非交互模式就長這樣：
+    ///
+    /// ```text
+    /// warning: Codex's Linux sandbox uses bubblewrap...
+    /// codex
+    /// {"ok": true}
+    /// tokens used
+    /// 7,105
+    /// {"ok": true}
+    /// ```
+    ///
+    /// 「第一個 `{` 到最後一個 `}`」在這裡會抓到兩個物件加中間的雜訊。
+    /// 所以改成掃出所有頂層物件，從最後一個開始試——
+    /// 最後出現的通常才是模型的最終答案。
     pub fn json(&self) -> Result<serde_json::Value> {
-        let t = self.text.trim();
-        let start = t.find('{');
-        let end = t.rfind('}');
-        let slice = match (start, end) {
-            (Some(s), Some(e)) if e > s => &t[s..=e],
-            _ => return Err(LlmError::Decode(format!("回應中找不到 JSON 物件：{t}"))),
-        };
-        serde_json::from_str(slice).map_err(|e| LlmError::Decode(e.to_string()))
+        let text = self.text.trim();
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            return Ok(value);
+        }
+
+        for candidate in top_level_objects(text).into_iter().rev() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+                return Ok(value);
+            }
+        }
+
+        Err(LlmError::Decode(format!("回應中找不到 JSON 物件：{text}")))
     }
+}
+
+/// 找出文字裡所有「頂層」的 `{...}` 區塊。
+///
+/// 括號深度必須從 0 數起，而且要跳過字串內容——
+/// 釋義裡出現一個 `}` 就把物件切斷的話，什麼都解析不出來。
+fn top_level_objects(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && let Some(s) = start.take()
+                {
+                    found.push(&text[s..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    found
 }
 
 #[cfg(test)]
@@ -244,6 +319,72 @@ mod tests {
             output_tokens: None,
         };
         assert_eq!(r.json().unwrap()["question"], "why");
+    }
+
+    /// codex 的非交互輸出：前面有警告、中間有 token 統計、答案印兩次。
+    /// 這是實際跑出來的格式，不是想像的。
+    #[test]
+    fn extracts_the_final_object_from_cli_noise() {
+        let r = ChatResponse {
+            text: "warning: Codex's Linux sandbox uses bubblewrap...\n\
+                   codex\n\
+                   {\"ok\": true, \"n\": 7}\n\
+                   tokens used\n\
+                   7,105\n\
+                   {\"ok\": true, \"n\": 7}"
+                .into(),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert_eq!(r.json().unwrap()["n"], 7);
+    }
+
+    /// 前面印了一個不完整或無關的物件時，要取最後那個完整的。
+    #[test]
+    fn prefers_the_last_complete_object() {
+        let r = ChatResponse {
+            text: "{\"status\": \"thinking\"}\n最終答案：\n{\"score\": 90}".into(),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert_eq!(r.json().unwrap()["score"], 90);
+    }
+
+    /// 巢狀物件不能被內層的 `}` 切斷。
+    #[test]
+    fn handles_nested_objects() {
+        let r = ChatResponse {
+            text: "```json\n{\"a\": {\"b\": {\"c\": 1}}, \"d\": 2}\n```".into(),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        let v = r.json().unwrap();
+        assert_eq!(v["a"]["b"]["c"], 1);
+        assert_eq!(v["d"], 2);
+    }
+
+    /// 字串裡的大括號是資料，不是結構。
+    #[test]
+    fn braces_inside_strings_do_not_end_the_object() {
+        let r = ChatResponse {
+            text: r#"{"gloss": "用法：{名詞} + 動詞", "ok": true}"#.into(),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        let v = r.json().unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["gloss"], "用法：{名詞} + 動詞");
+    }
+
+    /// 跳脫的引號不該讓字串提早結束。
+    #[test]
+    fn escaped_quotes_are_handled() {
+        let r = ChatResponse {
+            text: r#"前言 {"quote": "他說 \"你好\" 然後離開", "n": 1} 後記"#.into(),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert_eq!(r.json().unwrap()["n"], 1);
     }
 
     #[test]
