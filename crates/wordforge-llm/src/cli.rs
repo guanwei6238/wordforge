@@ -16,6 +16,8 @@
 //! 所以這是「不想多付一份錢」的選項，不是效能最好的選項。
 
 use std::process::Stdio;
+
+use crate::shell_path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -123,6 +125,47 @@ pub struct CliAvailability {
 /// 直接執行 `--version` 而不是找 PATH：使用者可能用 alias、
 /// wrapper script 或自訂路徑，能不能跑起來才是真正的答案。
 /// 兩個指令都在 0.3 秒內回應，開設定頁時查一次不影響體感。
+/// 把「找不到直譯器」翻成使用者能動手處理的話。
+///
+/// `/usr/bin/env: 'node': No such file or directory` 加上退出碼 127
+/// 對使用者是天書，而這正好是從應用程式選單啟動時最容易撞到的錯誤。
+/// 原始訊息要留著，但前面得說清楚發生什麼事、可以怎麼辦。
+fn interpreter_hint(body: &str, program: &str) -> Option<String> {
+    let missing = ["node", "python", "python3", "deno", "bun", "ruby"]
+        .into_iter()
+        .find(|name| {
+            body.contains("env:") && body.contains(&format!("'{name}'"))
+                || body.contains(&format!("{name}: not found"))
+        })?;
+
+    Some(format!(
+        "`{program}` 是 {missing} 程式，但系統找不到 {missing}。
+
+         如果你在終端機裡跑 `{program}` 是正常的，那多半是因為 {missing} 裝在          nvm / asdf 之類的版本管理器底下——那些路徑只有互動式 shell 才會載入，         從應用程式選單啟動的程式看不到。
+
+         可以試試：從終端機啟動 App，或把 {missing} 的路徑加進 ~/.profile。
+
+         原始訊息：{body}"
+    ))
+}
+
+/// 準備一個帶著使用者完整 `PATH` 的指令。
+///
+/// 從應用程式選單啟動的 GUI 拿到的是 session 的最小 `PATH`。`claude` 與
+/// `codex` 都是 Node 程式，shebang 寫 `#!/usr/bin/env node`，而 `node`
+/// 常常裝在 nvm 的版本目錄下——那個路徑只有 `~/.bashrc` 會加。
+///
+/// 結果是指令找得到、直譯器找不到，退出碼 127：
+/// `/usr/bin/env: 'node': No such file or directory`。
+async fn command_with_user_path(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    if let Some(shell_path) = shell_path::user_path().await {
+        let current = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", shell_path::merge(&shell_path, &current));
+    }
+    cmd
+}
+
 pub async fn detect_backends() -> Vec<CliAvailability> {
     let candidates = [
         (CliPreset::ClaudeCode, "Claude Code", "claude"),
@@ -131,7 +174,8 @@ pub async fn detect_backends() -> Vec<CliAvailability> {
 
     let mut out = Vec::new();
     for (preset, label, program) in candidates {
-        let version = Command::new(program)
+        let version = command_with_user_path(program)
+            .await
             .arg("--version")
             .output()
             .await
@@ -223,7 +267,8 @@ impl LlmProvider for CliLlm {
         let args = self.build_args(req);
         let input = self.build_stdin(req);
 
-        let mut child = Command::new(&self.config.program)
+        let mut child = command_with_user_path(&self.config.program)
+            .await
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -274,14 +319,20 @@ impl LlmProvider for CliLlm {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // 錯誤通常在 stderr，但有些工具印在 stdout
+            let body = if stderr.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            let code = output.status.code().unwrap_or(-1);
+
+            if let Some(hint) = interpreter_hint(&body, &self.config.program) {
+                return Err(LlmError::Decode(hint));
+            }
             return Err(LlmError::Api {
-                status: output.status.code().unwrap_or(-1) as u16,
-                // 錯誤通常在 stderr，但有些工具印在 stdout
-                body: if stderr.trim().is_empty() {
-                    stdout
-                } else {
-                    stderr.trim().to_string()
-                },
+                status: code as u16,
+                body,
             });
         }
 
@@ -540,6 +591,51 @@ mod tests {
         let err = cli.chat(&req).await.unwrap_err().to_string();
         assert!(err.contains("請先登入"), "應該回報指令自己說的話：{err}");
         assert!(!err.contains("Broken pipe"), "{err}");
+    }
+
+    /// 從選單啟動時最容易撞到的錯誤，不能只丟一個 127 給使用者。
+    ///
+    /// 實際發生過：`codex` 在 ~/.local/bin（找得到），但它的 shebang 是
+    /// `#!/usr/bin/env node`，而 node 在 nvm 的版本目錄下（只有 ~/.bashrc
+    /// 會加）。使用者看到的是「供應商回傳錯誤（HTTP 127）」。
+    #[tokio::test]
+    async fn a_missing_interpreter_gets_an_actionable_message() {
+        let cli = CliLlm::new(CliConfig {
+            preset: CliPreset::Custom,
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo \"/usr/bin/env: 'node': No such file or directory\" >&2; exit 127".into(),
+            ],
+            system_flag: None,
+            model_flag: None,
+            model: String::new(),
+            timeout_secs: 10,
+        })
+        .unwrap();
+
+        let err = cli.chat(&req()).await.unwrap_err().to_string();
+        assert!(err.contains("找不到 node"), "{err}");
+        assert!(err.contains("nvm"), "要講出可能的原因：{err}");
+        assert!(
+            err.contains("No such file or directory"),
+            "原始訊息要留著，不然沒辦法查：{err}"
+        );
+    }
+
+    /// 一般的失敗不該被誤判成缺直譯器。
+    #[test]
+    fn ordinary_errors_are_not_mistaken_for_a_missing_interpreter() {
+        assert_eq!(interpreter_hint("rate limit exceeded", "claude"), None);
+        assert_eq!(
+            interpreter_hint("please run `claude login`", "claude"),
+            None
+        );
+        // 訊息裡剛好提到 node 但不是「找不到」也不該中
+        assert_eq!(
+            interpreter_hint("upgrading node modules, please wait", "codex"),
+            None
+        );
     }
 
     /// 卡住的指令要在時限內放棄，不能讓 UI 永遠轉圈。
