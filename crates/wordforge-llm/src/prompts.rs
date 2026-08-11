@@ -414,11 +414,21 @@ pub fn translation_task(
 /// 產生的文章沒通過本地覆蓋率驗收時，用這個追加訊息要求重寫。
 ///
 /// 帶上實際超標的詞，比單純說「太難了」有效得多。
-pub fn coverage_retry(actual_coverage: f64, target_coverage: f64, offenders: &[String]) -> Message {
+pub fn coverage_retry(
+    actual_coverage: f64,
+    target_coverage: f64,
+    offenders: &[String],
+    previous_passage: &str,
+) -> Message {
+    // 一定要把上一篇附上。這則訊息說「其餘內容盡量保留」，
+    // 但模型看不到自己上次寫了什麼——API 那邊我們沒有把它的回答加進
+    // messages，CLI 更是每次都全新的行程，完全無狀態。
+    // 少了這段，模型只能重寫一篇不相干的文章。
     Message::user(format!(
-        "這篇文章沒有通過檢核：實際已知詞覆蓋率只有 {actual:.1}%，低於要求的 {target:.1}%。\n\
+        "這篇文章沒有通過檢核：實際已知詞覆蓋率只有 {actual:.1}%，低於要求的 {target:.1}%。\n\n\
+         你上一次寫的是：\n---\n{previous_passage}\n---\n\n\
          以下這些詞學習者不認識，也不在允許的新詞白名單中：{offenders}\n\
-         請把它們換成學習者會的字，其餘內容盡量保留，並重新輸出完整 JSON。",
+         請把它們換成學習者會的字，其餘內容與情節盡量保留，並重新輸出完整 JSON。",
         actual = actual_coverage * 100.0,
         target = target_coverage * 100.0,
         offenders = offenders.join("、"),
@@ -615,11 +625,26 @@ mod tests {
         assert!(text.contains("只放文章裡真的出現過的單字原形"));
     }
 
+    /// 重試訊息要自帶上一篇文章。
+    ///
+    /// 模型看不到自己上次的回答：API 那邊我們沒把它加進 messages，
+    /// CLI 更是每次全新行程。沒附上的話，「其餘內容盡量保留」這句
+    /// 根本無從執行。
     #[test]
-    fn retry_message_names_the_offending_words() {
-        let m = coverage_retry(0.88, 0.96, &["ubiquitous".into(), "paradigm".into()]);
+    fn retry_message_carries_the_previous_attempt() {
+        let m = coverage_retry(
+            0.88,
+            0.96,
+            &["ubiquitous".into(), "paradigm".into()],
+            "The ubiquitous paradigm shifted.",
+        );
+
         assert!(m.content.contains("88.0%"));
         assert!(m.content.contains("96.0%"));
         assert!(m.content.contains("ubiquitous"));
+        assert!(
+            m.content.contains("The ubiquitous paradigm shifted."),
+            "沒有附上上一篇，模型無從「保留其餘內容」"
+        );
     }
 }

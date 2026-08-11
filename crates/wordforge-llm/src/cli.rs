@@ -199,8 +199,17 @@ impl CliLlm {
         for message in &req.messages {
             match message.role {
                 Role::User => out.push_str(&message.content),
-                // 預填的助理開頭（json_only 模式）對 CLI 沒有意義，跳過
-                Role::Assistant => continue,
+                // CLI 每次都是全新的行程，完全沒有對話狀態——
+                // 先前的往返必須寫進這一次的輸入，否則「參考上次的回答」
+                // 這種要求根本無從執行。
+                //
+                // 唯一要濾掉的是 json_only 用來預填開頭的單一 `{`：
+                // 那是 API 的技巧，對 CLI 只是雜訊。
+                Role::Assistant if message.content.trim() == "{" => continue,
+                Role::Assistant => {
+                    out.push_str("（你先前的回答）\n");
+                    out.push_str(&message.content);
+                }
             }
             out.push('\n');
         }
@@ -345,7 +354,7 @@ mod tests {
         );
     }
 
-    /// json_only 會塞一則預填的助理訊息，那是 API 的技巧，對 CLI 沒有意義。
+    /// json_only 用來預填開頭的單一 `{` 是 API 技巧，對 CLI 只是雜訊。
     #[test]
     fn assistant_priming_is_not_sent_to_a_cli() {
         let cli = CliLlm::new(CliConfig::claude_code()).unwrap();
@@ -354,6 +363,25 @@ mod tests {
 
         let stdin = cli.build_stdin(&r);
         assert_eq!(stdin.trim(), "出一題", "預填的 `{{` 不該出現在輸入裡");
+    }
+
+    /// 但真正的對話歷史一定要送進去。
+    ///
+    /// CLI 每次都是全新行程，沒有任何對話狀態。覆蓋率重試時
+    /// 「參考你上次寫的文章」如果沒被送進來，模型只能重寫一篇不相干的。
+    #[test]
+    fn real_conversation_history_reaches_the_cli() {
+        let cli = CliLlm::new(CliConfig::claude_code()).unwrap();
+        let mut r = req();
+        r.messages
+            .push(Message::assistant(r#"{"passage":"The cat sat."}"#));
+        r.messages.push(Message::user("這篇太難了，請重寫"));
+
+        let stdin = cli.build_stdin(&r);
+        assert!(stdin.contains("The cat sat."), "上次的回答不見了：{stdin}");
+        assert!(stdin.contains("這篇太難了"));
+        // 順序要對，不然看起來像是先要求重寫再給文章
+        assert!(stdin.find("The cat sat.").unwrap() < stdin.find("這篇太難了").unwrap());
     }
 
     /// 出題不需要最強的模型，而且較小的模型快得多、也比較不會撞速率限制。

@@ -124,6 +124,46 @@ pub fn reading_length(vocabulary: i64) -> usize {
     }
 }
 
+/// 情境主題池。
+///
+/// 沒有指定主題時，模型會自己挑——而它挑出來的永遠是那幾個
+/// （學校生活、天氣、旅行）。同樣的字彙樣本加同樣的主題，
+/// 出來的文章會越來越像。
+///
+/// 主題本身也是學習內容：同一個字在點餐、看醫生、談工作時的用法不同，
+/// 換情境等於多練一次。
+pub const TOPICS: &[&str] = &[
+    "日常對話：問路、點餐、購物",
+    "校園生活：課程、考試、社團",
+    "職場：面試、開會、寫信",
+    "旅行：訂房、機場、迷路",
+    "健康：看醫生、描述症狀、運動習慣",
+    "科技：手機、網路、人工智慧",
+    "環境：氣候、回收、動物保育",
+    "飲食：食譜、餐廳評論、飲食習慣",
+    "娛樂：電影、音樂、遊戲",
+    "人際關係：朋友、家庭、衝突",
+    "新聞事件：報導一則虛構但合理的地方新聞",
+    "說明文：解釋一個日常現象為什麼會發生",
+];
+
+/// 挑一個主題，避開最近用過的。
+///
+/// `recent` 是最近幾次用過的主題（新的在後）。用 `seed` 決定從哪裡開始挑，
+/// 讓同一批候選不會每次都給同一個——呼叫端傳練習次數或時間戳即可。
+pub fn pick_topic(recent: &[String], seed: u64) -> &'static str {
+    let available: Vec<&&str> = TOPICS
+        .iter()
+        .filter(|t| !recent.iter().any(|r| r == **t))
+        .collect();
+
+    // 全部都用過就重新開始，總不能沒有主題
+    if available.is_empty() {
+        return TOPICS[(seed as usize) % TOPICS.len()];
+    }
+    available[(seed as usize) % available.len()]
+}
+
 /// 一次翻譯練習出幾題。
 pub fn translation_count(vocabulary: i64) -> usize {
     if vocabulary < 500 { 3 } else { 5 }
@@ -216,6 +256,41 @@ mod tests {
         assert_eq!(reading_length(3_000), 200);
         assert_eq!(reading_length(50_000), 400, "再長就不會有人做完");
         assert!(reading_length(0) < reading_length(10_000));
+    }
+
+    /// 同樣的主題重複出現，文章會越來越像。
+    #[test]
+    fn topics_rotate_away_from_recent_ones() {
+        let recent: Vec<String> = TOPICS[..3].iter().map(|t| t.to_string()).collect();
+
+        for seed in 0..20 {
+            let picked = pick_topic(&recent, seed);
+            assert!(
+                !recent.iter().any(|r| r == picked),
+                "挑到了最近用過的主題：{picked}"
+            );
+        }
+    }
+
+    /// 不同的 seed 要挑到不同主題，否則等於沒輪換。
+    #[test]
+    fn different_seeds_give_different_topics() {
+        let picked: std::collections::HashSet<&str> = (0..TOPICS.len() as u64)
+            .map(|s| pick_topic(&[], s))
+            .collect();
+        assert!(
+            picked.len() > TOPICS.len() / 2,
+            "輪換不夠分散，只出現 {} 種",
+            picked.len()
+        );
+    }
+
+    /// 全部主題都用過之後不能卡住。
+    #[test]
+    fn exhausting_every_topic_starts_over() {
+        let all: Vec<String> = TOPICS.iter().map(|t| t.to_string()).collect();
+        let picked = pick_topic(&all, 5);
+        assert!(TOPICS.contains(&picked));
     }
 
     #[test]

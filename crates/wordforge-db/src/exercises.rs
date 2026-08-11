@@ -29,6 +29,8 @@ pub struct NewExercise<'a> {
     /// 產生用的模型，方便日後比較品質
     pub model: Option<&'a str>,
     pub material_id: Option<i64>,
+    /// 這次用的情境主題，供之後輪換時避開
+    pub topic: Option<&'a str>,
 }
 
 pub async fn create(db: &Db, ex: NewExercise<'_>, now: OffsetDateTime) -> Result<ExerciseId> {
@@ -36,8 +38,8 @@ pub async fn create(db: &Db, ex: NewExercise<'_>, now: OffsetDateTime) -> Result
 
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO exercise (profile_id, kind, material_id, payload_json,
-                               target_lemmas_json, coverage, model, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                               target_lemmas_json, coverage, model, topic, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(ex.profile_id.0)
@@ -47,6 +49,7 @@ pub async fn create(db: &Db, ex: NewExercise<'_>, now: OffsetDateTime) -> Result
     .bind(&targets)
     .bind(ex.coverage)
     .bind(ex.model)
+    .bind(ex.topic)
     .bind(ts::to_sql(now))
     .fetch_one(db.pool())
     .await?;
@@ -104,6 +107,20 @@ pub async fn recent(db: &Db, profile_id: ProfileId, limit: i64) -> Result<Vec<Ex
     .fetch_all(db.pool())
     .await?;
     Ok(rows.iter().map(row_to_record).collect())
+}
+
+/// 最近用過的情境主題，新的在後。用來輪換，避免每篇文章都在講校園生活。
+pub async fn recent_topics(db: &Db, profile_id: ProfileId, limit: i64) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT topic FROM exercise
+         WHERE profile_id = ? AND topic IS NOT NULL
+         ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(profile_id.0)
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows.into_iter().rev().collect())
 }
 
 /// 最近做過的題型，用來避免連續出同一種。
@@ -170,6 +187,7 @@ mod tests {
                 coverage: Some(0.96),
                 model: Some("test-model"),
                 material_id: None,
+                topic: Some("校園生活"),
             },
             at,
         )
@@ -295,10 +313,38 @@ mod tests {
         assert!(stored.contains("tense"), "最後一次的批改要保留下來");
     }
 
+    /// 主題要記下來才輪換得了。
+    #[tokio::test]
+    async fn recent_topics_come_back_in_chronological_order() {
+        let (db, profile) = setup().await;
+        for (i, topic) in ["校園生活", "職場", "旅行"].iter().enumerate() {
+            create(
+                &db,
+                NewExercise {
+                    profile_id: profile,
+                    kind: "reading",
+                    payload_json: "{}",
+                    target_words: &[],
+                    coverage: None,
+                    model: None,
+                    material_id: None,
+                    topic: Some(topic),
+                },
+                t0() + time::Duration::minutes(i as i64),
+            )
+            .await
+            .unwrap();
+        }
+
+        let topics = recent_topics(&db, profile, 10).await.unwrap();
+        assert_eq!(topics, vec!["校園生活", "職場", "旅行"], "舊到新");
+    }
+
     #[tokio::test]
     async fn a_fresh_profile_has_no_history() {
         let (db, profile) = setup().await;
         assert!(recent_kinds(&db, profile, 5).await.unwrap().is_empty());
         assert!(recent(&db, profile, 5).await.unwrap().is_empty());
+        assert!(recent_topics(&db, profile, 5).await.unwrap().is_empty());
     }
 }

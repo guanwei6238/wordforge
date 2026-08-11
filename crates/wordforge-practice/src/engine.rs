@@ -64,6 +64,11 @@ const COVERAGE_RETRIES: usize = 2;
 /// 沒到期的文法點就是「現在不需要練」，送過去只是浪費 token。
 const GRAMMAR_BATCH: i64 = 5;
 
+/// 記住最近幾個主題來避開。
+///
+/// 大約是主題池的一半：留一半可挑，才不會每次都在同幾個之間跳。
+const TOPIC_MEMORY: i64 = 6;
+
 pub struct PracticeEngine<'a> {
     db: &'a Db,
     llm: &'a dyn LlmProvider,
@@ -193,7 +198,7 @@ impl<'a> PracticeEngine<'a> {
             to_target: kind == ExerciseKind::TranslationToTarget,
             items,
         };
-        self.store(profile_id, kind, body, due_words, None, now)
+        self.store(profile_id, kind, body, due_words, None, None, now)
             .await
     }
 
@@ -209,6 +214,12 @@ impl<'a> PracticeEngine<'a> {
         let word_count = practice::reading_length(learner.vocabulary);
         let target_words = self.due_words(profile_id, 6, now).await?;
 
+        // 主題輪換：不指定的話模型永遠寫校園生活與天氣，
+        // 十篇讀起來像同一篇。用時間戳當 seed，同一批候選也不會每次都給同一個。
+        let recent_topics =
+            exercises::recent_topics(self.db, ProfileId(profile_id), TOPIC_MEMORY).await?;
+        let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
+
         let spec = prompts::ReadingSpec {
             target_lang: &self.target_lang,
             native_lang: &self.native_lang,
@@ -218,7 +229,7 @@ impl<'a> PracticeEngine<'a> {
             cefr: None,
             known_sample: &known_sample,
             target_words: &target_words,
-            topic: None,
+            topic: Some(topic),
             material_excerpt: None,
             question_count: 4,
         };
@@ -283,6 +294,7 @@ impl<'a> PracticeEngine<'a> {
                         body,
                         target_words,
                         Some(coverage.ratio()),
+                        Some(topic),
                         now,
                     )
                     .await;
@@ -305,6 +317,7 @@ impl<'a> PracticeEngine<'a> {
                 coverage.ratio(),
                 READING_COVERAGE,
                 &offenders,
+                &passage,
             ));
         }
 
@@ -347,6 +360,7 @@ impl<'a> PracticeEngine<'a> {
             ExerciseKind::Grammar,
             ExerciseBody::Choices { items },
             Vec::new(),
+            None,
             None,
             now,
         )
@@ -675,6 +689,7 @@ impl<'a> PracticeEngine<'a> {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn store(
         &self,
         profile_id: i64,
@@ -682,6 +697,7 @@ impl<'a> PracticeEngine<'a> {
         body: ExerciseBody,
         target_words: Vec<String>,
         coverage: Option<f64>,
+        topic: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
         let payload_json =
@@ -697,6 +713,7 @@ impl<'a> PracticeEngine<'a> {
                 coverage,
                 model: Some(self.llm.model()),
                 material_id: None,
+                topic,
             },
             now,
         )

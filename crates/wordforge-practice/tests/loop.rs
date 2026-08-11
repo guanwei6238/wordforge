@@ -708,3 +708,84 @@ async fn a_small_deck_does_not_make_the_learner_look_like_a_beginner() {
         "要抽到測驗推定他會的那些較難的字"
     );
 }
+
+/// 連續出題不該一直是同一個情境。
+///
+/// 不指定主題時模型永遠寫校園生活與天氣，十篇讀起來像同一篇。
+#[tokio::test]
+async fn consecutive_articles_use_different_topics() {
+    let (db, profile) = setup(&["the", "cat", "sat"]).await;
+    set_vocabulary(&db, profile, 3_000).await;
+    for lemma in 1..=3 {
+        put_in_deck(&db, profile, lemma).await;
+    }
+    sqlx::query("UPDATE card SET state='review', stability=40.0")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let article = r#"{"title":"T","passage":"The cat sat. The cat sat.",
+                      "questions":[],"new_words":[]}"#;
+    let llm = FakeLlm::new(&[article, article, article]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let mut topics = Vec::new();
+    for i in 0..3 {
+        engine
+            .generate(
+                profile,
+                Some(ExerciseKind::Reading),
+                t0() + Duration::hours(i),
+            )
+            .await
+            .unwrap();
+
+        // 從 prompt 裡找出這次用了哪個主題
+        let prompt = llm.last_prompt();
+        let used = wordforge_core::practice::TOPICS
+            .iter()
+            .find(|t| prompt.contains(**t))
+            .expect("prompt 裡沒有指定主題");
+        topics.push(*used);
+    }
+
+    let unique: std::collections::HashSet<&&str> = topics.iter().collect();
+    assert_eq!(unique.len(), 3, "三次應該是三個不同主題，實際：{topics:?}");
+}
+
+/// 覆蓋率不合格重寫時，模型必須看得到自己上一篇寫了什麼。
+///
+/// 重試訊息說「其餘內容盡量保留」，但 API 那邊我們沒把模型的回答
+/// 加進 messages，CLI 更是每次全新行程——沒附上的話那句話無從執行。
+#[tokio::test]
+async fn the_retry_shows_the_model_its_previous_attempt() {
+    let (db, profile) = setup(&["the", "on", "cat", "sat", "mat", "ubiquitous"]).await;
+    set_vocabulary(&db, profile, 3_000).await;
+    for lemma in 1..=5 {
+        put_in_deck(&db, profile, lemma).await;
+    }
+    sqlx::query("UPDATE card SET state='review', stability=40.0")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let llm = FakeLlm::new(&[
+        // 太難，會被打回
+        r#"{"title":"Hard","passage":"Ubiquitous ubiquitous ubiquitous.",
+            "questions":[],"new_words":[]}"#,
+        r#"{"title":"Easy","passage":"The cat sat on the mat.",
+            "questions":[],"new_words":[]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+
+    let retry = llm.last_prompt();
+    assert!(
+        retry.contains("Ubiquitous ubiquitous ubiquitous."),
+        "重試時沒把上一篇附上，模型無從「保留其餘內容」：{retry}"
+    );
+    assert!(retry.contains("ubiquitous"), "也要指名哪些詞超標");
+}
