@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
-import { addWordsByTag, deckTags, errorMessage, tagLabel, type TagSummary } from "../api";
+import {
+  addWordsByTag,
+  deckTags,
+  errorMessage,
+  getRefillTag,
+  setRefillTag,
+  tagLabel,
+  type TagSummary,
+} from "../api";
 import AudioDownload from "../components/AudioDownload";
 import PlacementTest from "../components/PlacementTest";
 
@@ -16,12 +24,15 @@ export default function Deck() {
   const [tags, setTags] = useState<TagSummary[]>([]);
   const [limit, setLimit] = useState(300);
   const [busy, setBusy] = useState<string | null>(null);
+  const [refill, setRefill] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      setTags(await deckTags());
+      const [t, r] = await Promise.all([deckTags(), getRefillTag()]);
+      setTags(t);
+      setRefill(r);
       setError(null);
     } catch (e) {
       setError(errorMessage(e));
@@ -50,11 +61,54 @@ export default function Deck() {
     }
   }
 
+  async function chooseRefill(tag: string | null) {
+    setBusy("refill");
+    setMessage(null);
+    try {
+      const added = await setRefillTag(tag);
+      setMessage(
+        tag === null
+          ? "已關閉自動補充"
+          : added > 0
+            ? `之後會自動從「${tagLabel(tag)}」補字，先補了 ${added} 個`
+            : `之後會自動從「${tagLabel(tag)}」補字`,
+      );
+      await refresh();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <div className="deck">
       <PlacementTest onFinished={refresh} />
 
       <AudioDownload />
+
+      <section className="panel">
+        <h2>自動補充</h2>
+        <p className="muted">
+          牌組裡沒學過的字少於 100 個時，自動從指定範圍補上——
+          學完了就接著給新的，不必自己回來加。
+        </p>
+        <label>
+          持續學習的範圍
+          <select
+            value={refill ?? ""}
+            onChange={(e) => chooseRefill(e.target.value || null)}
+            disabled={busy !== null}
+          >
+            <option value="">關閉（自己手動加）</option>
+            {tags.map((t) => (
+              <option key={t.tag} value={t.tag}>
+                {tagLabel(t.tag)}（還有 {(t.total - t.in_deck).toLocaleString()} 字可學）
+              </option>
+            ))}
+          </select>
+        </label>
+      </section>
 
       <section className="panel">
         <h2>依範圍加入單字</h2>

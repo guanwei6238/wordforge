@@ -351,6 +351,11 @@ pub mod cards {
         /// 跳過比這個排名更常用的字。分級測驗的結果會填在這裡，
         /// 學過幾年英文的人不必從第一個字重背。
         pub min_freq_rank: i64,
+        /// `limit` 的語意：
+        /// - `false`：把這個範圍最常用的 `limit` 個字加進來（已有的會被跳過，
+        ///   所以重複執行不會一直長）
+        /// - `true`：加入 `limit` 個**還不在牌組裡**的字（補充用）
+        pub skip_existing: bool,
     }
 
     /// 依標籤批次建卡，例如「把國中範圍的字全部加進牌組」。
@@ -374,6 +379,7 @@ pub mod cards {
             limit,
             skip_function_words,
             min_freq_rank,
+            skip_existing,
         } = opts;
         // 標籤在資料庫裡存成 " zk gk "，前後補空白比對才不會讓 zk 誤中 zkk
         let pattern = format!("% {} %", tag.trim());
@@ -396,26 +402,37 @@ pub mod cards {
         let mut added = 0u64;
         let mut tx = db.pool().begin().await?;
         for kind in kinds {
+            // 補充模式：先濾掉已經在牌組裡的字，LIMIT 才等於「真正新增幾個」
+            let not_in_deck = if skip_existing {
+                "AND NOT EXISTS (SELECT 1 FROM card c
+                                 WHERE c.lemma_id = lemma.id AND c.profile_id = ?3
+                                   AND c.kind = ?4)"
+            } else {
+                ""
+            };
             // 包一層子查詢有兩個理由：ORDER BY + LIMIT 要作用在挑選而不是插入，
             // 以及 SQLite 的 INSERT...SELECT 接 ON CONFLICT 需要語法上不含糊。
+            // 用編號參數而不是裸 `?`：`not_in_deck` 片段會插在中間，
+            // 裸問號的順序會跟著條件有沒有出現而改變。
             let res = sqlx::query(&format!(
                 "INSERT INTO card (profile_id, lemma_id, kind, state, due)
-                 SELECT ?, pick.id, ?, 'new', ?
+                 SELECT ?3, pick.id, ?4, 'new', ?5
                  FROM (
                      SELECT id FROM lemma
-                     WHERE lang = ? AND ' ' || tags || ' ' LIKE ? {exclusion}
-                       AND (freq_rank IS NULL OR freq_rank >= ?)
+                     WHERE lang = ?1 AND ' ' || tags || ' ' LIKE ?2 {exclusion}
+                       AND (freq_rank IS NULL OR freq_rank >= ?6)
+                       {not_in_deck}
                      ORDER BY freq_rank IS NULL, freq_rank, id
-                     LIMIT ?
+                     LIMIT ?7
                  ) AS pick
                  WHERE true
                  ON CONFLICT (profile_id, lemma_id, kind) DO NOTHING"
             ))
+            .bind(lang)
+            .bind(&pattern)
             .bind(profile_id.0)
             .bind(kind.as_str())
             .bind(&due)
-            .bind(lang)
-            .bind(&pattern)
             .bind(min_freq_rank)
             .bind(limit)
             .execute(&mut *tx)
@@ -609,6 +626,60 @@ pub mod cards {
             suspended,
             next_due: next_due.map(|s| s.parse_ts("card.due")).transpose()?,
         })
+    }
+
+    /// 自動補充設定：牌組見底時要從哪個範圍補、補到剩幾張。
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct AutoRefill<'a> {
+        /// 從哪個範圍補（`cet4`、`gk`…）
+        pub tag: &'a str,
+        /// 牌組裡未學的新卡少於這個數量時就補到這個數量
+        pub keep_ahead: i64,
+        /// 跳過比這更常用的字（分級測驗的結果）
+        pub min_freq_rank: i64,
+    }
+
+    /// 需要的話補充牌組，回傳實際加入的張數。
+    ///
+    /// 「學完了就自己接上新的」是這個 App 該有的行為：使用者的目標是學語言，
+    /// 不是管理牌組。每次取佇列前檢查一次，成本只有一個 COUNT。
+    ///
+    /// 補充一樣依詞頻由常用到罕見，也一樣跳過功能詞。
+    pub async fn refill_if_needed(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+        cfg: &AutoRefill<'_>,
+        now: OffsetDateTime,
+    ) -> Result<u64> {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM card
+             WHERE profile_id = ? AND suspended = 0 AND state = 'new'",
+        )
+        .bind(profile_id.0)
+        .fetch_one(db.pool())
+        .await?;
+
+        if waiting >= cfg.keep_ahead {
+            return Ok(0);
+        }
+
+        add_by_tag(
+            db,
+            profile_id,
+            AddByTag {
+                lang,
+                tag: cfg.tag,
+                kinds: &[CardKind::Recognition],
+                // 只補差額，而且是「還不在牌組裡的」那些
+                limit: cfg.keep_ahead - waiting,
+                skip_function_words: true,
+                min_freq_rank: cfg.min_freq_rank,
+                skip_existing: true,
+            },
+            now,
+        )
+        .await
     }
 
     /// 恢復被收起來的卡，最常用的字優先。
@@ -965,6 +1036,7 @@ mod tests {
                 limit: 2,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1008,6 +1080,7 @@ mod tests {
                 limit: 10,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1028,6 +1101,7 @@ mod tests {
                 limit: 10,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1071,6 +1145,7 @@ mod tests {
                 limit: 10,
                 skip_function_words: true,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1113,6 +1188,7 @@ mod tests {
                 limit: 10,
                 skip_function_words: false,
                 min_freq_rank: 2_000,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1154,6 +1230,7 @@ mod tests {
                 limit: 10,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1192,6 +1269,7 @@ mod tests {
                 limit: 10,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1230,6 +1308,7 @@ mod tests {
                 limit: 10,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1263,6 +1342,7 @@ mod tests {
                 limit: 1,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1304,6 +1384,7 @@ mod tests {
                 limit: n,
                 skip_function_words: false,
                 min_freq_rank: 0,
+                skip_existing: false,
             },
             t0(),
         )
@@ -1453,6 +1534,105 @@ mod tests {
             .unwrap();
         assert_eq!(s.new_in_deck, 0);
         assert_eq!(s.suspended, 15);
+    }
+
+    /// 學完了就該自己接上新的，不必使用者手動去牌組頁補。
+    #[tokio::test]
+    async fn refill_tops_up_the_deck_when_it_runs_low() {
+        let (db, profile) = setup().await;
+        // 字典裡有 100 個 cet4 的字
+        for i in 1..=100 {
+            let word = format!("w{i:04}");
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', ?, ' cet4 ')",
+            )
+            .bind(&word)
+            .bind(&word)
+            .bind(i)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let cfg = cards::AutoRefill {
+            tag: "cet4",
+            keep_ahead: 20,
+            min_freq_rank: 0,
+        };
+
+        // 牌組是空的 → 補到 20 張
+        let added = cards::refill_if_needed(&db, profile, "en", &cfg, t0())
+            .await
+            .unwrap();
+        assert_eq!(added, 20);
+
+        // 還很滿 → 不動作
+        let added = cards::refill_if_needed(&db, profile, "en", &cfg, t0())
+            .await
+            .unwrap();
+        assert_eq!(added, 0, "牌組還夠的時候不該一直加");
+
+        // 學掉 15 張之後剩 5 張 → 再補回 20
+        let scheduler = Scheduler::default();
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 15, 100)
+            .await
+            .unwrap();
+        for card in &queue {
+            let (next, log) = scheduler.review(card, Rating::Easy, t0(), None);
+            cards::record_review(&db, &next, &log).await.unwrap();
+        }
+
+        let added = cards::refill_if_needed(&db, profile, "en", &cfg, t0())
+            .await
+            .unwrap();
+        assert_eq!(added, 15, "補回被學掉的那些");
+
+        let status = cards::queue_status(&db, profile, t0(), t0(), 15)
+            .await
+            .unwrap();
+        assert_eq!(status.new_in_deck, 20);
+    }
+
+    /// 補充也要尊重分級測驗的結果，別把已經會的字又塞回來。
+    #[tokio::test]
+    async fn refill_respects_the_placement_result() {
+        let (db, profile) = setup().await;
+        for i in 1..=50 {
+            let word = format!("w{i:04}");
+            sqlx::query(
+                "INSERT INTO lemma (lang, text, normalized, pos, freq_rank, tags)
+                 VALUES ('en', ?, ?, '', ?, ' cet4 ')",
+            )
+            .bind(&word)
+            .bind(&word)
+            .bind(i)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        cards::refill_if_needed(
+            &db,
+            profile,
+            "en",
+            &cards::AutoRefill {
+                tag: "cet4",
+                keep_ahead: 10,
+                min_freq_rank: 30,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let min_rank: i64 = sqlx::query_scalar(
+            "SELECT MIN(l.freq_rank) FROM card c JOIN lemma l ON l.id = c.lemma_id",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(min_rank, 30, "不該補進比起始詞頻更常用的字");
     }
 
     /// 被收起來的卡要能恢復，而且從最常用的開始。

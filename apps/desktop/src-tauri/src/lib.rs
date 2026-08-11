@@ -125,6 +125,9 @@ async fn list_due_cards(
     profile_id: i64,
     limit: i64,
 ) -> CmdResult<Vec<CardView>> {
+    // 牌組見底前先自動補上新字，使用者不必自己去牌組頁加
+    refill_deck(&state, profile_id, "en").await?;
+
     let now = OffsetDateTime::now_utc();
     let due = cards::daily_queue(
         &state.db,
@@ -313,6 +316,8 @@ async fn queue_status(
     state: tauri::State<'_, AppState>,
     profile_id: i64,
 ) -> CmdResult<QueueStatusView> {
+    refill_deck(&state, profile_id, "en").await?;
+
     let now = OffsetDateTime::now_utc();
     let s = cards::queue_status(
         &state.db,
@@ -484,6 +489,7 @@ async fn add_words_by_tag(
             skip_function_words: true,
             // 分級測驗說已經會的字就不要再排進來
             min_freq_rank: start_rank(&state.db, profile_id).await?,
+            skip_existing: false,
         },
         OffsetDateTime::now_utc(),
     )
@@ -614,6 +620,75 @@ async fn submit_placement(
         result,
         suspended_cards: suspended,
     })
+}
+
+/// 牌組裡未學的字少於這個數量時，自動補充。
+///
+/// 100 大約是一週的量：夠讓使用者不會突然沒東西學，
+/// 又不會一次塞進幾千張讓「還剩幾個字」失去意義。
+const REFILL_KEEP_AHEAD: i64 = 100;
+
+/// 讀出自動補充要用哪個範圍。沒設定就不補。
+async fn refill_tag(db: &Db, profile_id: i64) -> CmdResult<Option<String>> {
+    let tag: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(settings_json, '$.refill_tag')
+         FROM profile WHERE id = ? AND json_valid(settings_json)",
+    )
+    .bind(profile_id)
+    .fetch_optional(db.pool())
+    .await?
+    .flatten();
+    Ok(tag.filter(|t| !t.is_empty()))
+}
+
+/// 需要的話補充牌組。每次取佇列前呼叫，成本是一個 COUNT。
+async fn refill_deck(state: &AppState, profile_id: i64, lang: &str) -> CmdResult<u64> {
+    let Some(tag) = refill_tag(&state.db, profile_id).await? else {
+        return Ok(0);
+    };
+    Ok(cards::refill_if_needed(
+        &state.db,
+        ProfileId(profile_id),
+        lang,
+        &cards::AutoRefill {
+            tag: &tag,
+            keep_ahead: REFILL_KEEP_AHEAD,
+            min_freq_rank: start_rank(&state.db, profile_id).await?,
+        },
+        OffsetDateTime::now_utc(),
+    )
+    .await?)
+}
+
+/// 設定（或關閉）自動補充的範圍。
+#[tauri::command]
+async fn set_refill_tag(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    tag: Option<String>,
+) -> CmdResult<u64> {
+    sqlx::query(
+        "UPDATE profile
+         SET settings_json = json_set(
+                 CASE WHEN json_valid(settings_json) THEN settings_json ELSE '{}' END,
+                 '$.refill_tag', ?)
+         WHERE id = ?",
+    )
+    .bind(tag.as_deref().unwrap_or(""))
+    .bind(profile_id)
+    .execute(state.db.pool())
+    .await?;
+
+    // 設定完立刻補一次，使用者不用等到下次開啟
+    refill_deck(&state, profile_id, "en").await
+}
+
+#[tauri::command]
+async fn get_refill_tag(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<Option<String>> {
+    refill_tag(&state.db, profile_id).await
 }
 
 /// 讀出 profile 設定裡的起始詞頻；沒做過測驗就是 0（從頭開始）。
@@ -812,6 +887,8 @@ pub fn run() {
             queue_status,
             study_more,
             unsuspend_cards,
+            set_refill_tag,
+            get_refill_tag,
             search_words,
             word_detail,
             dictionary_stats,

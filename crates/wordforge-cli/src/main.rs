@@ -336,6 +336,7 @@ async fn main() -> Result<()> {
                     limit,
                     skip_function_words: !include_function_words,
                     min_freq_rank: from_rank,
+                    skip_existing: false,
                 },
                 OffsetDateTime::now_utc(),
             )
