@@ -174,13 +174,15 @@ pub fn writing_feedback(
         target = target_lang
     );
 
+    let points = wordforge_core::grammar_points::prompt_list();
     let prompt = format!(
         "# 題目\n{task}\n\n\
          # 學習者的作答\n{submission}\n\n\
          # 批改要求\n\
          - 逐句比對，只標出真正的錯誤或明顯不自然的表達，不要為了改而改。\n\
-         - 每個問題都要標註文法點（如 subject-verb agreement、article、tense），\n\
-           這些標籤會被用來安排後續的文法練習，請使用一致的英文術語。\n\
+         - 每個問題都要標註文法點，而且**只能從下面這份清單挑一個**：\n\
+           {points}\n\
+           清單以外的說法一律不接受。\n\
          - severity 用 major（造成誤解）或 minor（可理解但不自然）。\n\
          - 講評用{native}，鼓勵具體的優點，不要空泛稱讚。\n\n\
          # 輸出格式\n\
@@ -235,7 +237,8 @@ pub fn grammar_drill(
 
     prompt.push_str(&format!(
         "# 輸出格式\n\
-         出 {n} 題，每題聚焦一個文法點：\n\
+         出 {n} 題，每題聚焦一個文法點。\n\
+         grammar_point 只能從這份清單挑：{points}\n\
          {{\n\
          \x20 \"items\": [{{\"prompt\": \"題目（含填空）\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \
          \"answer_index\": 0, \"grammar_point\": \"tense\", \"explanation\": \"{native}說明，\
@@ -243,6 +246,7 @@ pub fn grammar_drill(
          }}",
         n = question_count,
         native = native_lang,
+        points = wordforge_core::grammar_points::prompt_list(),
     ));
 
     ChatRequest {
@@ -298,12 +302,15 @@ pub fn translation_feedback(
         )
     };
 
+    let points = wordforge_core::grammar_points::prompt_list();
     let prompt = format!(
         "# 練習方向\n{direction}\n\n{history}# 作答\n{body}\n\
          # 批改要求\n\
          - 意思對就算對，不要為了語法完美而挑剔可接受的說法。\n\
-         - 每個問題標註文法點（tense、articles、word-order…），用一致的英文術語，\n\
-           這些標籤會累積成後續的文法練習。\n\
+         - 每個問題都要標註文法點，而且**只能從下面這份清單挑一個**：\n\
+           {points}\n\
+           清單以外的說法一律不接受——這些標籤會累積成長期的弱點紀錄，\n\
+           每次換一種寫法就會被當成不同的問題。真的都不適用時就省略這個欄位。\n\
          - **判斷學習者不懂哪些字**：翻錯、漏譯、或用了明顯繞路的說法，\n\
            都代表他不會那個字。把那些{target_lang}單字列在 unknown_words，\n\
            系統會自動排進他的複習。\n\

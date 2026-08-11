@@ -508,33 +508,40 @@ impl<'a> PracticeEngine<'a> {
     ) -> Result<()> {
         let pid = ProfileId(profile_id);
 
-        // 選擇題知道每一題考什麼，對錯都能記
-        if let ExerciseBody::Choices { items }
-        | ExerciseBody::Reading {
-            questions: items, ..
-        } = body
-        {
-            for (i, item) in items.iter().enumerate() {
-                let Some(point) = item.grammar_point.as_ref().filter(|p| !p.trim().is_empty())
-                else {
-                    continue;
-                };
-                let correct = input.choices.get(i).copied().flatten() == Some(item.answer_index);
-                grammar::record(self.db, pid, point, correct, &self.scheduler, now).await?;
+        match body {
+            // 選擇題知道每一題在考什麼，對錯都能記。
+            // 這類題目的 corrections 是本地判分產生的，內容與 items 重複，
+            // 兩邊都記會讓同一次錯誤算成兩次。
+            ExerciseBody::Choices { items }
+            | ExerciseBody::Reading {
+                questions: items, ..
+            } => {
+                for (i, item) in items.iter().enumerate() {
+                    let Some(point) = item.grammar_point.as_deref().and_then(normalize_point)
+                    else {
+                        continue;
+                    };
+                    let correct =
+                        input.choices.get(i).copied().flatten() == Some(item.answer_index);
+                    grammar::record(self.db, pid, point, correct, &self.scheduler, now).await?;
+                }
             }
-        }
 
-        // 批改指出來的錯誤一律算錯。這裡沒有「答對」的資訊——
-        // 沒被指出來不代表用對了，可能只是那句話沒用到這個文法。
-        for correction in &feedback.corrections {
-            let Some(point) = correction
-                .grammar_point
-                .as_ref()
-                .filter(|p| !p.trim().is_empty())
-            else {
-                continue;
-            };
-            grammar::record(self.db, pid, point, false, &self.scheduler, now).await?;
+            // 翻譯題沒有標準答案可以比對，只能採信批改指出來的錯誤。
+            // 這裡沒有「答對」的資訊——沒被指出來不代表用對了，
+            // 可能只是那句話根本沒用到這個文法。
+            ExerciseBody::Translation { .. } => {
+                for correction in &feedback.corrections {
+                    let Some(point) = correction
+                        .grammar_point
+                        .as_deref()
+                        .and_then(normalize_point)
+                    else {
+                        continue;
+                    };
+                    grammar::record(self.db, pid, point, false, &self.scheduler, now).await?;
+                }
+            }
         }
 
         Ok(())
@@ -778,6 +785,18 @@ fn grade_choices(items: &[ChoiceItem], input: &GradeInput) -> Feedback {
         corrections,
         ..Default::default()
     }
+}
+
+/// 把模型給的文法標籤收斂到受控清單。
+///
+/// 模型即使被告知只能從清單挑，還是會偶爾寫成 `past tense` 或 `Articles`。
+/// 沒有這一步的話，同一個文法點會散成好幾個各自排程的標籤。
+fn normalize_point(raw: &str) -> Option<&'static str> {
+    let normalized = wordforge_core::grammar_points::normalize_point(raw);
+    if normalized.is_none() && !raw.trim().is_empty() {
+        tracing::debug!(raw, "認不出來的文法標籤，略過");
+    }
+    normalized
 }
 
 fn parse_kind(s: &str) -> Option<ExerciseKind> {

@@ -789,3 +789,84 @@ async fn the_retry_shows_the_model_its_previous_attempt() {
     );
     assert!(retry.contains("ubiquitous"), "也要指名哪些詞超標");
 }
+
+/// 模型對同一個文法點的各種說法，必須收斂成一筆。
+///
+/// 沒有這一步的話，`tense`、`past tense`、`Verb Tense` 會變成三個
+/// 各自排程的文法點，統計和練習都被稀釋。
+#[tokio::test]
+async fn grammar_labels_are_normalized_to_one_point() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    // 三題都在考時態，但模型每題寫成不同說法
+    let llm = FakeLlm::new(&[r#"{"items":[
+             {"prompt":"a","options":["x","y"],"answer_index":0,"grammar_point":"tense"},
+             {"prompt":"b","options":["x","y"],"answer_index":0,"grammar_point":"Past Tense"},
+             {"prompt":"c","options":["x","y"],"answer_index":0,"grammar_point":"verb_tense"}
+           ]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    // 三題全錯
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: vec![Some(1), Some(1), Some(1)],
+                marked_unknown: vec![],
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+    let points = wordforge_db::grammar::all_points(&db, ProfileId(profile))
+        .await
+        .unwrap();
+    assert_eq!(points.len(), 1, "三種寫法應該收斂成一個：{points:?}");
+    assert_eq!(points[0].point, "tense");
+    assert_eq!(points[0].error_count, 3, "三次都要算在同一個文法點上");
+}
+
+/// 認不出來的標籤寧可丟掉，不要污染統計。
+#[tokio::test]
+async fn unrecognised_grammar_labels_are_dropped() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[
+             {"prompt":"a","options":["x","y"],"answer_index":0,"grammar_point":"這句怪怪的"},
+             {"prompt":"b","options":["x","y"],"answer_index":0,"grammar_point":"articles"}
+           ]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: vec![Some(1), Some(1)],
+                marked_unknown: vec![],
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+    let points = wordforge_db::grammar::all_points(&db, ProfileId(profile))
+        .await
+        .unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].point, "articles");
+}
