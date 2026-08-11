@@ -428,6 +428,9 @@ export interface CliConfig {
   program: string;
   args: string[];
   system_flag: string | null;
+  /** 指定模型的參數名（--model / -m） */
+  model_flag: string | null;
+  /** 要用哪個模型；留空用 CLI 自己的預設 */
   model: string;
   timeout_secs: number;
 }

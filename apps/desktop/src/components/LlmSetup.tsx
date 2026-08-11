@@ -9,13 +9,28 @@ import {
   updateLlmSettings,
 } from "../api";
 
-const CLI_PRESETS: { value: CliPreset; label: string; program: string; args: string[]; systemFlag: string | null; hint: string }[] = [
+interface Preset {
+  value: CliPreset;
+  label: string;
+  program: string;
+  args: string[];
+  systemFlag: string | null;
+  modelFlag: string | null;
+  model: string;
+  models: string[];
+  hint: string;
+}
+
+const CLI_PRESETS: Preset[] = [
   {
     value: "claude_code",
     label: "Claude Code",
     program: "claude",
     args: ["-p", "--output-format", "text"],
     systemFlag: "--append-system-prompt",
+    modelFlag: "--model",
+    model: "sonnet",
+    models: ["haiku", "sonnet", "opus"],
     hint: "用你現有的 Claude 訂閱，不必另開 API 帳單",
   },
   {
@@ -24,6 +39,9 @@ const CLI_PRESETS: { value: CliPreset; label: string; program: string; args: str
     program: "codex",
     args: ["exec", "--skip-git-repo-check"],
     systemFlag: null,
+    modelFlag: "-m",
+    model: "",
+    models: [],
     hint: "用你現有的 ChatGPT 訂閱",
   },
 ];
@@ -79,6 +97,8 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
 
   if (!settings) return <p className="muted">載入中…</p>;
 
+  const currentPreset = CLI_PRESETS.find((p) => p.value === settings.cli.preset);
+
   function chooseBackend(backend: Backend) {
     void save({ ...settings!, backend });
   }
@@ -95,7 +115,8 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
         program: p.program,
         args: p.args,
         system_flag: p.systemFlag,
-        model: p.label,
+        model_flag: p.modelFlag,
+        model: p.model,
       },
     });
   }
@@ -151,6 +172,37 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
               ，prompt 從 stdin 送入。
             </p>
           )}
+
+          <label>
+            模型
+            {currentPreset && currentPreset.models.length > 0 ? (
+              <select
+                value={settings.cli.model}
+                onChange={(e) =>
+                  save({ ...settings, cli: { ...settings.cli, model: e.target.value } })
+                }
+              >
+                <option value="">（CLI 預設）</option>
+                {currentPreset.models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                value={settings.cli.model}
+                placeholder="（CLI 預設）"
+                onChange={(e) =>
+                  save({ ...settings, cli: { ...settings.cli, model: e.target.value } })
+                }
+              />
+            )}
+          </label>
+          <p className="muted hint">
+            出題與批改是「照著明確規格產生結構化輸出」，中等模型就夠用，
+            而且快得多、也比較不會撞到訂閱的速率限制。
+          </p>
 
           <p className="muted hint">
             比 API 慢（每題要啟動一個行程，可能幾十秒），而且訂閱有速率限制，

@@ -50,7 +50,12 @@ pub struct CliConfig {
     pub args: Vec<String>,
     /// 傳遞 system prompt 用的參數名。`None` 就把 system 併進 prompt 開頭。
     pub system_flag: Option<String>,
-    /// 顯示用的模型名稱
+    /// 指定模型的參數名（`--model`、`-m`）。`None` 表示這個 CLI 不支援。
+    pub model_flag: Option<String>,
+    /// 要用哪個模型。留空就用 CLI 自己的預設。
+    ///
+    /// 出題與批改不需要最強的模型：這些任務是「照著明確規格產生結構化輸出」，
+    /// 中等模型就夠，而且快得多、也比較不會撞到訂閱的速率限制。
     pub model: String,
     pub timeout_secs: u64,
 }
@@ -63,7 +68,9 @@ impl CliConfig {
             // --output-format text：不要 JSON 包裝，我們自己的 prompt 已經要求輸出 JSON
             args: vec!["-p".into(), "--output-format".into(), "text".into()],
             system_flag: Some("--append-system-prompt".into()),
-            model: "claude-code".into(),
+            model_flag: Some("--model".into()),
+            // 出題不需要最強的模型，預設用中等的那個
+            model: "sonnet".into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -76,7 +83,9 @@ impl CliConfig {
             args: vec!["exec".into(), "--skip-git-repo-check".into()],
             // codex exec 沒有獨立的 system prompt 參數
             system_flag: None,
-            model: "codex".into(),
+            model_flag: Some("-m".into()),
+            // 留空用 codex 自己的預設，模型名稱因帳號方案而異
+            model: String::new(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -90,7 +99,8 @@ impl CliConfig {
                 program: String::new(),
                 args: Vec::new(),
                 system_flag: None,
-                model: "custom".into(),
+                model_flag: None,
+                model: String::new(),
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
             },
         }
@@ -112,6 +122,14 @@ impl CliLlm {
     /// 組出完整的參數列表。
     fn build_args(&self, req: &ChatRequest) -> Vec<String> {
         let mut args = self.config.args.clone();
+
+        if let Some(flag) = &self.config.model_flag
+            && !self.config.model.trim().is_empty()
+        {
+            args.push(flag.clone());
+            args.push(self.config.model.trim().to_string());
+        }
+
         if let (Some(flag), Some(system)) = (&self.config.system_flag, &req.system) {
             args.push(flag.clone());
             args.push(system.clone());
@@ -222,7 +240,12 @@ impl LlmProvider for CliLlm {
     }
 
     fn model(&self) -> &str {
-        &self.config.model
+        // 沒指定模型時，記錄執行檔名稱總比記錄空字串有用
+        if self.config.model.trim().is_empty() {
+            &self.config.program
+        } else {
+            &self.config.model
+        }
     }
 }
 
@@ -289,6 +312,42 @@ mod tests {
         assert_eq!(stdin.trim(), "出一題", "預填的 `{{` 不該出現在輸入裡");
     }
 
+    /// 出題不需要最強的模型，而且較小的模型快得多、也比較不會撞速率限制。
+    #[test]
+    fn the_model_is_actually_passed_to_the_cli() {
+        let cli = CliLlm::new(CliConfig::claude_code()).unwrap();
+        let args = cli.build_args(&req());
+
+        let pos = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("沒有指定模型");
+        assert_eq!(args[pos + 1], "sonnet");
+        assert_eq!(cli.model(), "sonnet");
+    }
+
+    /// 留空就用 CLI 自己的預設，不要傳一個空的 --model。
+    #[test]
+    fn an_empty_model_means_the_cli_default() {
+        let mut cfg = CliConfig::claude_code();
+        cfg.model = "  ".into();
+        let cli = CliLlm::new(cfg).unwrap();
+
+        assert!(!cli.build_args(&req()).iter().any(|a| a == "--model"));
+        assert_eq!(cli.model(), "claude", "記錄用的名稱退回執行檔名");
+    }
+
+    #[test]
+    fn codex_uses_its_own_model_flag() {
+        let mut cfg = CliConfig::codex();
+        cfg.model = "gpt-5".into();
+        let cli = CliLlm::new(cfg).unwrap();
+
+        let args = cli.build_args(&req());
+        let pos = args.iter().position(|a| a == "-m").expect("沒有指定模型");
+        assert_eq!(args[pos + 1], "gpt-5");
+    }
+
     #[test]
     fn empty_program_is_rejected() {
         let mut cfg = CliConfig::claude_code();
@@ -317,6 +376,7 @@ mod tests {
             program: "cat".into(),
             args: vec![],
             system_flag: None,
+            model_flag: None,
             model: "cat".into(),
             timeout_secs: 10,
         })
@@ -342,6 +402,7 @@ mod tests {
             program: "sh".into(),
             args: vec!["-c".into(), "echo 出事了 >&2; exit 3".into()],
             system_flag: None,
+            model_flag: None,
             model: "failing".into(),
             timeout_secs: 10,
         })
@@ -359,6 +420,7 @@ mod tests {
             program: "sleep".into(),
             args: vec!["60".into()],
             system_flag: None,
+            model_flag: None,
             model: "sleepy".into(),
             timeout_secs: 1,
         })
