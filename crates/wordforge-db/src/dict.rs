@@ -638,6 +638,18 @@ pub struct SourceInfo {
     pub lemma_count: i64,
 }
 
+/// 字典裡收了哪些語言，以及各有幾個詞條。
+///
+/// 這份清單就是「你現在能學哪些語言」——設定頁的目標語言選單直接用它，
+/// 使用者不會選到一個沒有字典的語言然後看到空白畫面。
+pub async fn languages(db: &Db) -> Result<Vec<(String, i64)>> {
+    Ok(
+        sqlx::query_as("SELECT lang, COUNT(*) FROM lemma GROUP BY lang ORDER BY COUNT(*) DESC")
+            .fetch_all(db.pool())
+            .await?,
+    )
+}
+
 pub async fn stats(db: &Db) -> Result<DictStats> {
     let lemmas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lemma")
         .fetch_one(db.pool())

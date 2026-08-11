@@ -169,6 +169,31 @@ pub mod profiles {
         Ok(row.unwrap_or_else(|| ("zh-TW".into(), "en".into())))
     }
 
+    /// 改掉這個 profile 在學什麼語言。
+    ///
+    /// 空字串會被拒絕：語言代碼一旦變成空的，之後每個字典查詢都會查不到，
+    /// 而且失敗的樣子是「一片空白」而不是報錯，很難查。
+    pub async fn set_languages(
+        db: &Db,
+        profile_id: ProfileId,
+        native: &str,
+        target: &str,
+    ) -> Result<(String, String)> {
+        let native = native.trim();
+        let target = target.trim();
+        if native.is_empty() || target.is_empty() {
+            return Err(DbError::Invalid("語言代碼不能是空的".into()));
+        }
+
+        sqlx::query("UPDATE profile SET native_lang = ?, target_lang = ? WHERE id = ?")
+            .bind(native)
+            .bind(target)
+            .bind(profile_id.0)
+            .execute(db.pool())
+            .await?;
+        Ok((native.to_string(), target.to_string()))
+    }
+
     /// 今天額外加開的新卡額度。
     ///
     /// 存成 `{"extra_new": {"date": "2026-08-11", "count": 10}}`：
@@ -608,6 +633,43 @@ pub mod cards {
         .bind(profile_id.0)
         .bind(lang)
         .bind(below_rank)
+        .execute(db.pool())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// 牌組裡有幾張卡屬於別的語言。
+    ///
+    /// 換目標語言時要拿這個數字警告使用者：舊卡不會自己消失，
+    /// 不講的話他明天打開 App 會看到一堆上一個語言的字混在複習裡。
+    pub async fn count_other_languages(db: &Db, profile_id: ProfileId, lang: &str) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM card c JOIN lemma l ON l.id = c.lemma_id
+             WHERE c.profile_id = ? AND c.suspended = 0 AND l.lang <> ?",
+        )
+        .bind(profile_id.0)
+        .bind(lang)
+        .fetch_one(db.pool())
+        .await?;
+        Ok(n)
+    }
+
+    /// 把別的語言的卡片收起來。
+    ///
+    /// 用 suspend 而不是刪除：使用者可能只是暫時換去學日文，
+    /// 半年後回來時那些英文卡的複習歷史還在，不必從頭學。
+    pub async fn suspend_other_languages(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE card SET suspended = 1
+             WHERE profile_id = ? AND suspended = 0
+               AND lemma_id IN (SELECT id FROM lemma WHERE lang <> ?)",
+        )
+        .bind(profile_id.0)
+        .bind(lang)
         .execute(db.pool())
         .await?;
         Ok(res.rows_affected())
@@ -2033,6 +2095,114 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// 換語言是使用者真的會做的事，而且做完之後舊牌組不會自己消失。
+    #[tokio::test]
+    async fn switching_language_reports_the_leftover_deck() {
+        let (db, profile) = setup().await;
+        let english = add_word(&db, "apple", 500).await;
+        let japanese = lemmas::upsert(
+            &db,
+            NewLemma {
+                lang: "ja",
+                text: "林檎",
+                pos: "noun",
+                freq_rank: Some(500),
+                cefr: None,
+            },
+        )
+        .await
+        .unwrap();
+        cards::ensure(&db, profile, english, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+        cards::ensure(&db, profile, japanese, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+
+        let (native, target) = profiles::set_languages(&db, profile, "zh-TW", "ja")
+            .await
+            .unwrap();
+        assert_eq!((native.as_str(), target.as_str()), ("zh-TW", "ja"));
+        assert_eq!(
+            profiles::languages(&db, profile).await.unwrap(),
+            ("zh-TW".to_string(), "ja".to_string()),
+            "改完要真的存進去"
+        );
+
+        assert_eq!(
+            cards::count_other_languages(&db, profile, "ja")
+                .await
+                .unwrap(),
+            1,
+            "那張英文卡還在牌組裡，必須講出來"
+        );
+
+        assert_eq!(
+            cards::suspend_other_languages(&db, profile, "ja")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            cards::count_other_languages(&db, profile, "ja")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // 收起來不是刪除：換回英文時那張卡還在
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM card WHERE profile_id = ? AND suspended = 1")
+                .bind(profile.0)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(still_there, 1);
+    }
+
+    /// 空的語言代碼會讓之後每個字典查詢都靜靜地查不到東西。
+    #[tokio::test]
+    async fn an_empty_language_code_is_rejected() {
+        let (db, profile) = setup().await;
+        assert!(
+            profiles::set_languages(&db, profile, "zh-TW", "   ")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            profiles::languages(&db, profile).await.unwrap().1,
+            "en",
+            "被拒絕的話原本的設定不能被改掉"
+        );
+    }
+
+    /// 設定頁的目標語言選單就是這份清單。
+    #[tokio::test]
+    async fn dictionary_languages_are_listed_by_size() {
+        let (db, _) = setup().await;
+        add_word(&db, "apple", 1).await;
+        add_word(&db, "banana", 2).await;
+        lemmas::upsert(
+            &db,
+            NewLemma {
+                lang: "ja",
+                text: "林檎",
+                pos: "noun",
+                freq_rank: Some(1),
+                cefr: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let langs = crate::dict::languages(&db).await.unwrap();
+        assert_eq!(
+            langs,
+            vec![("en".to_string(), 2), ("ja".to_string(), 1)],
+            "詞條多的排前面，使用者最可能要的排第一個"
         );
     }
 }

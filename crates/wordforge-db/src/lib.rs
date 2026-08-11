@@ -29,6 +29,9 @@ pub enum DbError {
 
     #[error("找不到 {entity} (id = {id})")]
     NotFound { entity: &'static str, id: i64 },
+
+    #[error("{0}")]
+    Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

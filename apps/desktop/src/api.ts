@@ -90,6 +90,38 @@ export async function targetLang(profileId = DEFAULT_PROFILE_ID): Promise<string
   return (await currentLanguages(profileId)).target;
 }
 
+export interface LanguageChange {
+  languages: ProfileLanguages;
+  /** 屬於其他語言、還沒被收起來的卡片數 */
+  other_language_cards: number;
+}
+
+/** 換正在學的語言。舊牌組不會自動處理，回傳值會說還有幾張別的語言的卡。 */
+export async function setProfileLanguages(
+  native: string,
+  target: string,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<LanguageChange> {
+  const changed: LanguageChange = await invoke("set_profile_languages", {
+    profileId,
+    native,
+    target,
+  });
+  // 快取的是舊語言，不清掉的話畫面會有一半還在講上一個語言
+  languagesCache = Promise.resolve(changed.languages);
+  return changed;
+}
+
+/** 把別的語言的卡片收起來（不是刪除，之後換回來還在）。回傳收了幾張。 */
+export function suspendOtherLanguageCards(profileId = DEFAULT_PROFILE_ID): Promise<number> {
+  return invoke("suspend_other_language_cards", { profileId });
+}
+
+/** 匯入了哪些語言的字典：[語言代碼, 詞條數] */
+export function dictionaryLanguages(): Promise<[string, number][]> {
+  return invoke("dictionary_languages");
+}
+
 /** 語言代碼的中文名稱。沒收錄的代碼原樣顯示，總比顯示不出來好。 */
 const LANGUAGE_NAMES: Record<string, string> = {
   en: "英文",

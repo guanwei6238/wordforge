@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { errorMessage, getStudySettings, type StudySettings, updateStudySettings } from "../api";
+import LanguageSettings from "../components/LanguageSettings";
 import LlmSetup from "../components/LlmSetup";
 
 /** 目標留存率的選項。數字背後的意義比數字本身重要，所以每個都附說明。 */
@@ -53,6 +54,8 @@ export default function Settings() {
 
   return (
     <div className="settings">
+      <LanguageSettings />
+
       <section className="panel">
         <h2>每日份量</h2>
 

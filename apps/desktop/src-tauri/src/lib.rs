@@ -720,6 +720,52 @@ async fn profile_languages(
     Ok(ProfileLanguages { native, target })
 }
 
+/// 換語言之後的狀況：新的語言設定，加上還有幾張別的語言的卡混在牌組裡。
+#[derive(Debug, Serialize)]
+pub struct LanguageChange {
+    pub languages: ProfileLanguages,
+    /// 屬於其他語言、還沒被收起來的卡片數
+    pub other_language_cards: i64,
+}
+
+/// 改掉正在學的語言。
+///
+/// 不會自動處理舊牌組——那是使用者的資料，該由他決定要不要收起來。
+/// 但一定要把數量回報出去，否則他明天會看到一堆上個語言的字。
+#[tauri::command]
+async fn set_profile_languages(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    native: String,
+    target: String,
+) -> CmdResult<LanguageChange> {
+    let (native, target) =
+        profiles::set_languages(&state.db, ProfileId(profile_id), &native, &target).await?;
+    let other_language_cards =
+        cards::count_other_languages(&state.db, ProfileId(profile_id), &target).await?;
+    Ok(LanguageChange {
+        languages: ProfileLanguages { native, target },
+        other_language_cards,
+    })
+}
+
+/// 把別的語言的卡片收起來，回傳收了幾張。
+#[tauri::command]
+async fn suspend_other_language_cards(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<u64> {
+    let target = target_lang(&state.db, profile_id).await?;
+    Ok(cards::suspend_other_languages(&state.db, ProfileId(profile_id), &target).await?)
+}
+
+/// 匯入了哪些語言的字典。設定頁的目標語言選單用它，
+/// 使用者才不會選到一個沒有字典的語言。
+#[tauri::command]
+async fn dictionary_languages(state: tauri::State<'_, AppState>) -> CmdResult<Vec<(String, i64)>> {
+    Ok(wordforge_db::dict::languages(&state.db).await?)
+}
+
 /// 讀出自動補充要用哪個範圍。沒設定就不補。
 async fn refill_tag(db: &Db, profile_id: i64) -> CmdResult<Option<String>> {
     let tag: Option<String> = sqlx::query_scalar(
@@ -1160,6 +1206,9 @@ pub fn run() {
             get_study_settings,
             update_study_settings,
             profile_languages,
+            set_profile_languages,
+            suspend_other_language_cards,
+            dictionary_languages,
             detect_ai_backends,
             get_llm_settings,
             update_llm_settings,
