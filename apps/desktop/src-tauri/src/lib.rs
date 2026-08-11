@@ -291,7 +291,7 @@ async fn add_word(
     word: String,
 ) -> CmdResult<i64> {
     let now = OffsetDateTime::now_utc();
-    let lemma_id = match lemmas::find_by_form(&state.db, &lang, &word).await? {
+    let lemma_id = match lemmas::base_form(&state.db, &lang, &word).await? {
         Some(id) => id,
         None => {
             lemmas::upsert(
@@ -766,6 +766,74 @@ async fn dictionary_languages(state: tauri::State<'_, AppState>) -> CmdResult<Ve
     Ok(wordforge_db::dict::languages(&state.db).await?)
 }
 
+// ------------------------------------------------------------------ 教材
+
+/// 匯入一份教材。
+///
+/// 語言用 profile 的目標語言，不讓前端傳——教材跟正在學的語言不一致的話，
+/// 詞表會整份對不上，而那個失敗看起來像「匯入成功但沒有效果」。
+#[tauri::command]
+async fn import_material(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    path: String,
+    title: Option<String>,
+    license_note: Option<String>,
+) -> CmdResult<wordforge_import::material::MaterialImport> {
+    let lang = target_lang(&state.db, profile_id).await?;
+    Ok(wordforge_import::material::import_material(
+        &state.db,
+        ProfileId(profile_id),
+        std::path::Path::new(&path),
+        &wordforge_import::material::MaterialOptions {
+            title: title.as_deref(),
+            lang: &lang,
+            license_note: license_note.as_deref(),
+            format: None,
+        },
+        OffsetDateTime::now_utc(),
+    )
+    .await?)
+}
+
+#[tauri::command]
+async fn list_materials(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<Vec<wordforge_db::material::Material>> {
+    Ok(wordforge_db::material::list(&state.db, ProfileId(profile_id)).await?)
+}
+
+#[tauri::command]
+async fn delete_material(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    material_id: i64,
+) -> CmdResult<bool> {
+    Ok(wordforge_db::material::delete(
+        &state.db,
+        ProfileId(profile_id),
+        wordforge_db::material::MaterialId(material_id),
+    )
+    .await?)
+}
+
+/// 這本教材的字我會了幾成。回傳 (總詞數, 已掌握)。
+#[tauri::command]
+async fn material_coverage(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    material_id: i64,
+) -> CmdResult<(i64, i64)> {
+    Ok(wordforge_db::material::coverage(
+        &state.db,
+        ProfileId(profile_id),
+        wordforge_db::material::MaterialId(material_id),
+        KNOWN_STABILITY_DAYS,
+    )
+    .await?)
+}
+
 /// 讀出自動補充要用哪個範圍。沒設定就不補。
 async fn refill_tag(db: &Db, profile_id: i64) -> CmdResult<Option<String>> {
     let tag: Option<String> = sqlx::query_scalar(
@@ -972,6 +1040,8 @@ async fn generate_exercise(
     state: tauri::State<'_, AppState>,
     profile_id: i64,
     kind: Option<String>,
+    // 指定教材時，模型只能從那本書取材
+    material_id: Option<i64>,
 ) -> CmdResult<ExerciseView> {
     let settings = LlmSettings::load(&settings_dir(&app)?);
     let llm = settings
@@ -983,7 +1053,9 @@ async fn generate_exercise(
         Some(k) => Some(parse_exercise_kind(k)?),
     };
 
-    let engine = PracticeEngine::for_profile(&state.db, llm.as_ref(), profile_id).await?;
+    let engine = PracticeEngine::for_profile(&state.db, llm.as_ref(), profile_id)
+        .await?
+        .with_material(material_id);
     Ok(engine
         .generate(profile_id, kind, OffsetDateTime::now_utc())
         .await?)
@@ -1209,6 +1281,10 @@ pub fn run() {
             set_profile_languages,
             suspend_other_language_cards,
             dictionary_languages,
+            import_material,
+            list_materials,
+            delete_material,
+            material_coverage,
             detect_ai_backends,
             get_llm_settings,
             update_llm_settings,

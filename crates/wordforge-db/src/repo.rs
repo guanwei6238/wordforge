@@ -353,6 +353,47 @@ pub mod lemmas {
         Ok(ids.into_iter().map(LemmaId).collect())
     }
 
+    /// 這個表面形應該歸到哪一個字底下——也就是要建卡的那個。
+    ///
+    /// 挑家族裡詞頻排名最前面的。理由是詞頻表統計的是原形：
+    /// 任何一份詞頻表裡 `run` 都遠比 `ran` 常見，`study` 都遠比
+    /// `studied` 常見。實測 ECDICT + Wiktionary 的資料：
+    ///
+    /// ```text
+    /// ran -> run       studied -> study    children -> child
+    /// better -> good   saw -> see          went -> go
+    /// ```
+    ///
+    /// 已知的限制：同形異義詞會被併到比較常見的那個意思。
+    /// `left`（左）會歸到 `leave`，`saw`（鋸子）會歸到 `see`。
+    /// 要分開得看上下文，那需要真正的詞性標注。併錯的代價是
+    /// 一張卡標到鄰近的意思；不併的代價是同一個字散成好幾張卡，
+    /// 每張各自排程。前者比較容易發現也比較容易修。
+    pub async fn base_form(db: &Db, lang: &str, form: &str) -> Result<Option<LemmaId>> {
+        let normalized = wordforge_core::text::normalize(form);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM (
+                 SELECT id, freq_rank FROM lemma
+                 WHERE lang = ?1 AND normalized = ?2
+                 UNION
+                 SELECT l.id, l.freq_rank FROM lemma l
+                   JOIN surface_form s ON s.lemma_id = l.id
+                 WHERE s.lang = ?1 AND s.normalized = ?2
+             )
+             ORDER BY freq_rank IS NULL, freq_rank, id
+             LIMIT 1",
+        )
+        .bind(lang)
+        .bind(&normalized)
+        .fetch_optional(db.pool())
+        .await?;
+
+        Ok(id.map(LemmaId))
+    }
+
     pub async fn find_by_form(db: &Db, lang: &str, form: &str) -> Result<Option<LemmaId>> {
         let normalized = wordforge_core::text::normalize(form);
         let id: Option<i64> = sqlx::query_scalar(
@@ -2309,5 +2350,60 @@ mod tests {
         let family = lemmas::family(&db, "en", "die").await.unwrap();
         assert!(family.contains(&english));
         assert!(!family.contains(&german), "德文的 die 不該算進英文");
+    }
+
+    /// 從文章裡撿到的生字要建在原形上，不是建在變化形上。
+    ///
+    /// 這條測試存在的理由：`find_by_form` 挑 id 最小的，而變化形自己
+    /// 也是詞條，所以答錯 `studied` 會建出一張 `studied` 的卡，
+    /// 跟既有的 `study` 各自排程，變成同一個字要背兩次。
+    #[tokio::test]
+    async fn an_inflection_gets_a_card_on_its_base_form() {
+        let (db, _) = setup().await;
+        // 原形詞頻高，變化形詞頻低——每一份詞頻表都是這樣
+        let study = add_word(&db, "study", 240).await;
+        let studied = add_word(&db, "studied", 15_971).await;
+        lemmas::add_surface_form(&db, "en", "studied", study, "past")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lemmas::base_form(&db, "en", "studied").await.unwrap(),
+            Some(study),
+            "應該歸到 study"
+        );
+        assert_ne!(
+            lemmas::base_form(&db, "en", "studied").await.unwrap(),
+            Some(studied)
+        );
+
+        // 原形查自己還是自己
+        assert_eq!(
+            lemmas::base_form(&db, "en", "study").await.unwrap(),
+            Some(study)
+        );
+    }
+
+    /// 沒有詞頻資料時也要給答案，不能回 None。
+    #[tokio::test]
+    async fn base_form_falls_back_when_there_is_no_frequency_data() {
+        let (db, _) = setup().await;
+        let lemma = lemmas::upsert(
+            &db,
+            NewLemma {
+                lang: "en",
+                text: "zzz",
+                pos: "noun",
+                freq_rank: None,
+                cefr: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lemmas::base_form(&db, "en", "ZZZ.").await.unwrap(),
+            Some(lemma)
+        );
+        assert_eq!(lemmas::base_form(&db, "en", "  ").await.unwrap(), None);
     }
 }

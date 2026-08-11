@@ -401,6 +401,7 @@ pub fn reading_feedback(
 pub fn translation_task(
     target_lang: &str,
     native_lang: &str,
+    material_excerpt: Option<&str>,
     due_words: &[String],
     count: usize,
 ) -> ChatRequest {
@@ -409,21 +410,33 @@ pub fn translation_task(
         target = target_lang
     );
 
-    let prompt = format!(
+    let mut prompt = format!(
         "# 出題要求\n\
          請出 {count} 個{native}句子，讓學習者翻譯成{target}。\n\
          每個句子要自然、日常，並且**必須**用到下列其中一個今天該複習的單字\n\
-         （學習者翻譯時就等於複習了這個字）：\n{words}\n\n\
-         # 輸出格式\n\
-         {{\n\
-         \x20 \"items\": [{{\"source\": \"{native}句子\", \"target_word\": \"必須用到的字\", \
-         \"reference\": \"參考翻譯\", \"acceptable_variants\": [\"其他可接受的說法\"]}}]\n\
-         }}",
+         （學習者翻譯時就等於複習了這個字）：\n{words}\n\n",
         count = count,
         native = native_lang,
         target = target_lang,
         words = due_words.join("、"),
     );
+
+    if let Some(excerpt) = material_excerpt {
+        prompt.push_str(&format!(
+            "# 指定教材\n\
+             句子的情境、用字與句型**只能**取材自以下內容，\n\
+             不要引入教材以外的說法：\n---\n{excerpt}\n---\n\n"
+        ));
+    }
+
+    prompt.push_str(&format!(
+        "# 輸出格式\n\
+         {{\n\
+         \x20 \"items\": [{{\"source\": \"{native}句子\", \"target_word\": \"必須用到的字\", \
+         \"reference\": \"參考翻譯\", \"acceptable_variants\": [\"其他可接受的說法\"]}}]\n\
+         }}",
+        native = native_lang,
+    ));
 
     ChatRequest {
         system: Some(system),
@@ -524,6 +537,26 @@ mod tests {
         assert!(req.messages[0].content.contains("這次只做複習"));
     }
 
+    /// 翻譯題也要吃教材，不然「只考課本」只有閱讀成立。
+    #[test]
+    fn translation_can_be_confined_to_a_material() {
+        let due = vec!["weather".to_string()];
+        let req = translation_task(
+            "English",
+            "繁體中文",
+            Some("Lesson 3: At the market."),
+            &due,
+            3,
+        );
+        let text = req.messages[0].content.clone();
+        assert!(text.contains("At the market."));
+        assert!(text.contains("只能"), "沒有講清楚是硬限制：{text}");
+
+        // 沒指定教材時整段不該出現，否則模型會看到一個空的「指定教材」
+        let free = translation_task("English", "繁體中文", None, &due, 3);
+        assert!(!free.messages[0].content.contains("指定教材"));
+    }
+
     /// 指定教材時必須明確限制範圍，否則 AI 會自由發揮到課本以外。
     #[test]
     fn material_excerpt_constrains_the_model() {
@@ -579,7 +612,7 @@ mod tests {
     #[test]
     fn translation_task_reuses_due_words() {
         let due = vec!["borrow".to_string(), "return".to_string()];
-        let req = translation_task("English", "繁體中文", &due, 3);
+        let req = translation_task("English", "繁體中文", None, &due, 3);
         let text = &req.messages[0].content;
         assert!(text.contains("borrow"));
         assert!(text.contains("出 3 個"));

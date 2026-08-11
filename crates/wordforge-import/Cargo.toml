@@ -14,12 +14,15 @@ wordforge-db = { workspace = true }
 wordforge-dict = { workspace = true }
 
 futures = { workspace = true }
+pdf-extract = { workspace = true }
+quick-xml = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -9,6 +9,8 @@ import {
   generateExercise,
   gradeExercise,
   languageName,
+  listMaterials,
+  type Material,
   practiceStatus,
   type PracticeStatus,
   type ProfileLanguages,
@@ -35,6 +37,9 @@ export default function Practice() {
   // 題型名稱要說得出「日文翻中文」，不能寫死英文
   const [langs, setLangs] = useState<ProfileLanguages>({ native: "zh-TW", target: "en" });
   const labels = exerciseLabels(langs);
+  // 指定教材後，模型只能從那本書取材
+  const [materials, setMaterials] = useState<Material[]>([]);
+  const [materialId, setMaterialId] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -47,6 +52,9 @@ export default function Practice() {
   useEffect(() => {
     void refresh();
     void currentLanguages().then(setLangs).catch(() => {});
+    void listMaterials()
+      .then(setMaterials)
+      .catch(() => {});
   }, [refresh]);
 
   async function start() {
@@ -55,7 +63,7 @@ export default function Practice() {
     setFeedback(null);
     setMarked([]);
     try {
-      const ex = await generateExercise(kind);
+      const ex = await generateExercise(kind, materialId);
       setExercise(ex);
       setAnswers(ex.body.kind === "translation" ? ex.body.items.map(() => "") : []);
       setChoices(
@@ -142,6 +150,23 @@ export default function Practice() {
                 ))}
               </select>
             </label>
+            {materials.length > 0 && (
+              <label>
+                取材範圍
+                <select
+                  value={materialId ?? ""}
+                  onChange={(e) => setMaterialId(e.target.value ? Number(e.target.value) : null)}
+                  disabled={busy !== null}
+                >
+                  <option value="">自由出題</option>
+                  {materials.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      只從《{m.title}》出題
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <button className="primary" onClick={start} disabled={busy !== null}>
               {busy === "generating" ? "出題中…" : exercise ? "換一題" : "開始練習"}
             </button>
@@ -344,6 +369,23 @@ export default function Practice() {
           )}
 
           <div className="row">
+            {materials.length > 0 && (
+              <label>
+                取材範圍
+                <select
+                  value={materialId ?? ""}
+                  onChange={(e) => setMaterialId(e.target.value ? Number(e.target.value) : null)}
+                  disabled={busy !== null}
+                >
+                  <option value="">自由出題</option>
+                  {materials.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      只從《{m.title}》出題
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <button className="primary" onClick={start} disabled={busy !== null}>
               下一題
             </button>

@@ -21,6 +21,9 @@ const APP_IDENTIFIER: &str = "org.wordforge.app";
 /// App 首次啟動時建立的預設 profile。CLI 目前只操作這一個。
 const DEFAULT_PROFILE: i64 = 1;
 
+/// 「算是會了」的 stability 門檻（天）。與桌面 App 一致。
+const KNOWN_STABILITY_DAYS: f64 = 21.0;
+
 /// 標籤的中文說明，只用於 CLI 輸出。
 const TAG_NAMES: [(&str, &str); 9] = [
     ("zk", "國中會考"),
@@ -65,6 +68,37 @@ enum Command {
     /// 管理牌組
     #[command(subcommand)]
     Deck(DeckCmd),
+    /// 管理自訂教材（課本、文章、字幕）
+    #[command(subcommand)]
+    Material(MaterialCmd),
+}
+
+#[derive(Subcommand)]
+enum MaterialCmd {
+    /// 匯入一份教材
+    ///
+    /// 支援 .txt / .md / .epub / .pdf / .srt / .vtt / .html。
+    /// PDF 只讀得到文字層，掃描的書要先做 OCR。
+    Add {
+        /// 檔案路徑
+        path: std::path::PathBuf,
+        /// 教材的語言。要跟你正在學的語言一致，否則詞表整份對不上。
+        #[arg(long)]
+        lang: String,
+        /// 顯示在清單上的名稱。省略就用檔名。
+        #[arg(long)]
+        title: Option<String>,
+        /// 給自己看的授權備註，例如「自己買的，不外流」
+        #[arg(long)]
+        license_note: Option<String>,
+    },
+    /// 列出已匯入的教材
+    List,
+    /// 刪除一份教材（連同切塊與詞表）
+    Remove {
+        /// 教材 id，用 `material list` 查
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -284,6 +318,77 @@ async fn main() -> Result<()> {
                     tags
                 );
             }
+        }
+
+        Command::Material(MaterialCmd::Add {
+            path,
+            lang,
+            title,
+            license_note,
+        }) => {
+            // GUI 匯入幾百 MB 的 PDF 並不合適，跟字典匯入是同一個理由
+            let result = wordforge_import::material::import_material(
+                &db,
+                ProfileId(DEFAULT_PROFILE),
+                &path,
+                &wordforge_import::material::MaterialOptions {
+                    title: title.as_deref(),
+                    lang: &lang,
+                    license_note: license_note.as_deref(),
+                    format: None,
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+
+            println!(
+                "匯入完成：{} 字元、{} 段、{} 個詞（id = {}）",
+                result.chars, result.chunks, result.vocab, result.material_id
+            );
+            if result.unmatched_tokens > 0 {
+                println!(
+                    "  有 {} 個詞元在字典裡查不到。數字很大的話，\n                     　檢查一下 --lang 是不是跟匯入的字典對得上。",
+                    result.unmatched_tokens
+                );
+            }
+        }
+
+        Command::Material(MaterialCmd::List) => {
+            let all = wordforge_db::material::list(&db, ProfileId(DEFAULT_PROFILE)).await?;
+            if all.is_empty() {
+                println!("還沒有匯入任何教材。");
+            }
+            for m in all {
+                let (total, known) = wordforge_db::material::coverage(
+                    &db,
+                    ProfileId(DEFAULT_PROFILE),
+                    wordforge_db::material::MaterialId(m.id),
+                    KNOWN_STABILITY_DAYS,
+                )
+                .await?;
+                let pct = if total > 0 { known * 100 / total } else { 0 };
+                println!(
+                    "  [{}] {:<28} {:<9} {:<6} {:>5} 段　{:>6} 詞　已掌握 {}%",
+                    m.id, m.title, m.kind, m.lang, m.chunk_count, m.vocab_count, pct
+                );
+            }
+        }
+
+        Command::Material(MaterialCmd::Remove { id }) => {
+            let gone = wordforge_db::material::delete(
+                &db,
+                ProfileId(DEFAULT_PROFILE),
+                wordforge_db::material::MaterialId(id),
+            )
+            .await?;
+            println!(
+                "{}",
+                if gone {
+                    "已刪除"
+                } else {
+                    "找不到這份教材"
+                }
+            );
         }
 
         Command::Deck(DeckCmd::Tags { lang }) => {

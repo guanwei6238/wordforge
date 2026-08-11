@@ -14,6 +14,7 @@
 //! 放在兩者之間。
 
 pub mod audio;
+pub mod material;
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -42,6 +43,9 @@ pub enum ImportError {
 
     #[error("資料庫操作失敗：{0}")]
     Sqlx(#[from] sqlx::Error),
+
+    #[error("{0}")]
+    Parse(String),
 }
 
 pub type Result<T> = std::result::Result<T, ImportError>;

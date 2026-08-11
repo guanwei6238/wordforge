@@ -7,6 +7,7 @@ use wordforge_db::Db;
 use wordforge_db::dict;
 use wordforge_db::exercises::{self, ExerciseId, NewExercise};
 use wordforge_db::grammar;
+use wordforge_db::material::{self, MaterialId};
 use wordforge_db::repo::{cards, lemmas};
 use wordforge_llm::{LlmProvider, prompts};
 
@@ -83,6 +84,12 @@ pub struct PracticeEngine<'a> {
     pub target_lang: String,
     /// 母語代碼，用來決定用什麼語言解釋
     pub native_lang: String,
+    /// 只從這份教材出題。`None` 就是自由出題。
+    ///
+    /// 這是跟閱讀測驗相反的模式：閱讀測驗照程度當場生一篇，
+    /// 這個把模型綁死在使用者的課本上。考試只考課本，
+    /// 模型講到課本以外的東西就是干擾。
+    pub material_id: Option<MaterialId>,
 }
 
 impl<'a> PracticeEngine<'a> {
@@ -93,6 +100,7 @@ impl<'a> PracticeEngine<'a> {
             scheduler: wordforge_core::srs::Scheduler::default(),
             target_lang: "en".into(),
             native_lang: "zh-TW".into(),
+            material_id: None,
         }
     }
 
@@ -114,7 +122,25 @@ impl<'a> PracticeEngine<'a> {
             scheduler: wordforge_core::srs::Scheduler::default(),
             target_lang: target,
             native_lang: native,
+            material_id: None,
         })
+    }
+
+    /// 出題只能取材自這份教材。
+    pub fn with_material(mut self, material_id: Option<i64>) -> Self {
+        self.material_id = material_id.map(MaterialId);
+        self
+    }
+
+    /// 挑一段教材給模型看。
+    ///
+    /// 沒設教材就回 `None`，prompt 裡那一段整個消失——不會變成
+    /// 「請參考以下教材：（空）」那種讓模型困惑的東西。
+    async fn material_excerpt(&self, target_words: &[String], seed: u64) -> Result<Option<String>> {
+        let Some(id) = self.material_id else {
+            return Ok(None);
+        };
+        Ok(material::pick_chunk(self.db, id, target_words, seed).await?)
     }
 
     /// 給模型看的語言名稱。代碼對人類不友善，寫進 prompt 也不自然。
@@ -201,8 +227,16 @@ impl<'a> PracticeEngine<'a> {
         let due_words = self.due_words(profile_id, 8, now).await?;
         let count = practice::translation_count(learner.vocabulary);
 
-        let req =
-            prompts::translation_task(self.target_name(), self.native_name(), &due_words, count);
+        let excerpt = self
+            .material_excerpt(&due_words, now.unix_timestamp() as u64)
+            .await?;
+        let req = prompts::translation_task(
+            self.target_name(),
+            self.native_name(),
+            excerpt.as_deref(),
+            &due_words,
+            count,
+        );
         let value = self.ask_json(&req).await?;
 
         let raw_items = value
@@ -257,6 +291,12 @@ impl<'a> PracticeEngine<'a> {
             exercises::recent_topics(self.db, ProfileId(profile_id), TOPIC_MEMORY).await?;
         let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
 
+        // 指定教材時，取材範圍由課本決定，主題輪換就不該再插手
+        let excerpt = self
+            .material_excerpt(&target_words, now.unix_timestamp() as u64)
+            .await?;
+        let topic = if excerpt.is_some() { "" } else { topic };
+
         let spec = prompts::ReadingSpec {
             target_lang: self.target_name(),
             native_lang: self.native_name(),
@@ -266,8 +306,8 @@ impl<'a> PracticeEngine<'a> {
             cefr: None,
             known_sample: &known_sample,
             target_words: &target_words,
-            topic: Some(topic),
-            material_excerpt: None,
+            topic: (!topic.is_empty()).then_some(topic),
+            material_excerpt: excerpt.as_deref(),
             question_count: 4,
         };
 
@@ -368,13 +408,16 @@ impl<'a> PracticeEngine<'a> {
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
         let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
+        let excerpt = self
+            .material_excerpt(&learner.weak_grammar, now.unix_timestamp() as u64)
+            .await?;
         let req = prompts::grammar_drill(
             self.target_name(),
             self.native_name(),
             &learner.weak_grammar,
             &known_sample,
-            5,
-            None,
+            GRAMMAR_BATCH as usize,
+            excerpt.as_deref(),
         );
         let value = self.ask_json(&req).await?;
 
@@ -696,8 +739,9 @@ impl<'a> PracticeEngine<'a> {
             if normalized.is_empty() {
                 continue;
             }
-            let Some(lemma_id) =
-                lemmas::find_by_form(self.db, &self.target_lang, &normalized).await?
+            // 建在原形上：答錯 `studied` 該去複習 `study`，
+            // 不是多開一張 `studied` 的卡跟既有的 `study` 各自排程
+            let Some(lemma_id) = lemmas::base_form(self.db, &self.target_lang, &normalized).await?
             else {
                 tracing::debug!(word, "字典裡查不到，不建卡");
                 continue;

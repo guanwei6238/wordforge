@@ -8,11 +8,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
-use wordforge_core::model::ProfileId;
+use wordforge_core::model::{LemmaId, ProfileId};
 use wordforge_core::practice::ExerciseKind;
 use wordforge_db::Db;
 use wordforge_db::dict::{EntryWrite, NewSense, NewSource};
-use wordforge_db::repo::{cards, profiles};
+use wordforge_db::repo::{NewLemma, cards, lemmas, profiles};
 use wordforge_llm::{ChatRequest, ChatResponse, LlmProvider};
 use wordforge_practice::{GradeInput, PracticeEngine};
 
@@ -1051,4 +1051,142 @@ async fn phrases_are_detected_in_a_language_without_spaces() {
         "日文沒有空格，n-gram 要用空字串接回去才查得到：{:?}",
         feedback.glossary
     );
+}
+
+/// 生字要建在原形上，不然同一個字會散成好幾張卡各自排程。
+#[tokio::test]
+async fn an_inflection_from_grading_lands_on_the_base_form() {
+    let (db, profile) = setup(&["study", "park"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 2).await;
+
+    // 變化形自己也是詞條，而且拼字排在原形前面——這是當初出錯的形狀
+    let studied = lemmas::upsert(
+        &db,
+        NewLemma {
+            lang: "en",
+            text: "studied",
+            pos: "",
+            freq_rank: Some(15_971),
+            cefr: None,
+        },
+    )
+    .await
+    .unwrap();
+    lemmas::add_surface_form(&db, "en", "studied", LemmaId(1), "past")
+        .await
+        .unwrap();
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"我去了公園","target_word":"park","reference":"I went to the park"}]}"#,
+        r#"{"score":50,"items":[{"index":1,"correct":false}],
+            "corrections":[],"unknown_words":["studied"]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+        .await
+        .unwrap();
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["I go to park".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    let on_base: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM card WHERE profile_id = ? AND lemma_id = ?")
+            .bind(profile)
+            .bind(1_i64)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let on_inflection: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM card WHERE profile_id = ? AND lemma_id = ?")
+            .bind(profile)
+            .bind(studied.0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+    assert_eq!(on_base, 1, "卡片該建在 study 上");
+    assert_eq!(on_inflection, 0, "不該多開一張 studied 的卡");
+}
+
+/// 指定教材之後，模型看到的 prompt 裡必須真的有課本原文。
+///
+/// 這是「只考課本」整個功能的驗收點：資料表、切塊、檢索都做對了，
+/// 但只要 engine 忘了把 excerpt 傳下去，使用者看到的還是自由發揮的題目。
+#[tokio::test]
+async fn a_chosen_material_constrains_what_the_model_sees() {
+    let (db, profile) = setup(&["park", "reluctant"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 2).await;
+
+    let material = wordforge_db::material::create(
+        &db,
+        ProfileId(profile),
+        wordforge_db::material::NewMaterial {
+            title: "第三課",
+            kind: "text",
+            lang: "en",
+            source_path: None,
+            license_note: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+    wordforge_db::material::add_chunks(
+        &db,
+        material,
+        &["Amy was reluctant to buy the fish at the market.".into()],
+    )
+    .await
+    .unwrap();
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"艾米不願意買魚","target_word":"reluctant",
+                      "reference":"Amy was reluctant to buy the fish"}]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm).with_material(Some(material.0));
+    engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        prompt.contains("Amy was reluctant to buy the fish at the market."),
+        "課本原文沒有進 prompt：{prompt}"
+    );
+    assert!(prompt.contains("指定教材"), "沒有講清楚這是硬限制");
+}
+
+/// 沒指定教材時 prompt 裡不該出現空的教材段落。
+#[tokio::test]
+async fn no_material_means_no_material_section() {
+    let (db, profile) = setup(&["park"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 1).await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"我去公園","target_word":"park","reference":"I go to the park"}]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+        .await
+        .unwrap();
+
+    assert!(!llm.last_prompt().contains("指定教材"));
 }
