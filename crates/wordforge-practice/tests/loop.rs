@@ -944,3 +944,111 @@ async fn the_profile_language_drives_prompts_and_lookups() {
     .unwrap();
     assert_eq!(added, 1, "日文的生字沒有被排進複習");
 }
+
+/// 閱讀解析的生字與片語由本地字典查，不是模型寫的。
+///
+/// 這條分開測是因為它是整份解析裡唯一「不可能出錯」的部分：
+/// 模型可能亂講，但字典查得到就是查得到。
+#[tokio::test]
+async fn the_reading_glossary_comes_from_the_dictionary_not_the_model() {
+    let (db, profile) = setup(&["search for", "diligent", "the", "key"]).await;
+    set_vocabulary(&db, profile, 2_000).await;
+
+    // 牌組裡沒有已掌握的字，覆蓋率必定判定太難而重試；
+    // 這條測試要驗的是解析，所以讓三次嘗試都回同一篇，最後一次會被接受
+    let passage = r#"{"title":"T","passage":"She had to search for the diligent key.",
+            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let llm = FakeLlm::new(&[
+        passage,
+        passage,
+        passage,
+        r#"{"score":0,"items":[{"index":1,"correct":false}],"unknown_words":[]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: vec![Some(1)],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    let phrase = feedback
+        .glossary
+        .iter()
+        .find(|g| g.is_phrase)
+        .expect("字典裡有 search for 這個條目，解析就該列出來");
+    assert_eq!(phrase.text, "search for");
+
+    assert!(
+        feedback.glossary.iter().any(|g| g.text == "diligent"),
+        "沒學過的字要附釋義：{:?}",
+        feedback.glossary
+    );
+    assert!(
+        !feedback.glossary.iter().any(|g| g.text == "the"),
+        "虛詞不該出現在解析裡：{:?}",
+        feedback.glossary
+    );
+    // 模型完全沒提供 glossary，這些全是本地查出來的
+    assert!(!feedback.glossary.is_empty());
+}
+
+/// 片語偵測不能只對有空格的語言成立。
+#[tokio::test]
+async fn phrases_are_detected_in_a_language_without_spaces() {
+    let (db, profile) = setup_lang("ja", &["気にする", "勤勉"]).await;
+    set_vocabulary(&db, profile, 2_000).await;
+
+    let passage = r#"{"title":"T","passage":"勤勉な人は気にする。",
+            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let llm = FakeLlm::new(&[
+        passage,
+        passage,
+        passage,
+        r#"{"score":0,"items":[{"index":1,"correct":false}],"unknown_words":[]}"#,
+    ]);
+
+    let engine = PracticeEngine::for_profile(&db, &llm, profile)
+        .await
+        .unwrap();
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: vec![Some(1)],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        feedback
+            .glossary
+            .iter()
+            .any(|g| g.text == "気にする" && g.is_phrase),
+        "日文沒有空格，n-gram 要用空字串接回去才查得到：{:?}",
+        feedback.glossary
+    );
+}

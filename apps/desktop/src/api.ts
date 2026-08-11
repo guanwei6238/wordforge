@@ -669,6 +669,17 @@ export interface Correction {
   explanation: string | null;
 }
 
+/** 閱讀解析的一條字詞說明。由本地字典查出，不是模型寫的。 */
+export interface GlossaryNote {
+  text: string;
+  gloss: string | null;
+  translation: string | null;
+  /** 多詞片語，單看每個字查不出這個意思 */
+  is_phrase: boolean;
+  /** 不在你的已知詞裡，也就是 90% 法則裡那不足 10% */
+  is_unknown: boolean;
+}
+
 export interface Feedback {
   score: number | null;
   items: ItemResult[];
@@ -677,6 +688,8 @@ export interface Feedback {
   unknown_words: string[];
   /** 實際加進牌組的（字典查得到、還沒學過的） */
   added_to_deck: string[];
+  /** 文章裡的生字與片語，本地字典查的 */
+  glossary: GlossaryNote[];
 }
 
 export interface GradeInput {

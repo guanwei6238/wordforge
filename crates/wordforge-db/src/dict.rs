@@ -638,6 +638,76 @@ pub struct SourceInfo {
     pub lemma_count: i64,
 }
 
+/// 解析用的字條：一個詞或片語，加上它的釋義。
+///
+/// 這裡刻意不標「是不是片語」——中日文的片語沒有空格，從字串猜不出來。
+/// 呼叫端知道自己是拿單字還是 n-gram 來查的，由它去標。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GlossEntry {
+    /// 比對用的鍵值，跟傳進來的 term 相同
+    pub term: String,
+    /// 字典裡的原始拼寫
+    pub text: String,
+    /// 目標語言的定義（Wiktionary）
+    pub gloss: Option<String>,
+    /// 母語翻譯（ECDICT），有的話 UI 優先顯示這個
+    pub translation: Option<String>,
+}
+
+/// 一次查一批詞的釋義。
+///
+/// 閱讀解析要標出「這篇文章裡你不會的字」與「這裡有片語」，一篇 300 字的
+/// 文章會產生近千個候選（單字 + 2..4 詞的 n-gram）。一個一個查是上千次
+/// round-trip，所以這裡用 `IN (...)` 一次撈完。
+///
+/// 比對用 `normalized` 而不是 `text`：文章裡是 `Searched For`，
+/// 字典裡是 `search for`。
+pub async fn glossary(db: &Db, lang: &str, terms: &[String]) -> Result<Vec<GlossEntry>> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // SQLite 的參數上限是 32766，分批查才不會在長文章上炸掉
+    const CHUNK: usize = 900;
+    let mut out = Vec::new();
+
+    for chunk in terms.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // 同一個詞可能有多個詞性各自一列，取有翻譯的那一列優先，
+        // 否則使用者會看到隨機一個詞性的空釋義
+        let sql = format!(
+            "SELECT l.normalized,
+                    MIN(l.text),
+                    (SELECT s.gloss FROM sense s WHERE s.lemma_id = l.id
+                      ORDER BY s.sort_order LIMIT 1),
+                    (SELECT s.translation FROM sense s WHERE s.lemma_id = l.id
+                      AND s.translation IS NOT NULL ORDER BY s.sort_order LIMIT 1)
+             FROM lemma l
+             WHERE l.lang = ? AND l.normalized IN ({placeholders})
+             GROUP BY l.normalized"
+        );
+
+        let mut q =
+            sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(&sql).bind(lang);
+        for term in chunk {
+            q = q.bind(term);
+        }
+
+        for (term, text, gloss, translation) in q.fetch_all(db.pool()).await? {
+            out.push(GlossEntry {
+                term,
+                text,
+                gloss,
+                translation,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
 /// 字典裡收了哪些語言，以及各有幾個詞條。
 ///
 /// 這份清單就是「你現在能學哪些語言」——設定頁的目標語言選單直接用它，

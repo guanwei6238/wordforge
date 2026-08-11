@@ -753,3 +753,43 @@ button.link {
   font-size: 1rem;
   color: var(--accent);
 }
+
+/* ------------------------------------------------------- 閱讀解析 */
+
+.glossary h3 {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem;
+}
+
+.glossary h3 .muted {
+  font-weight: 400;
+  font-size: 0.8rem;
+}
+
+.glossary dl {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+/* 詞在左、釋義在右；釋義可能很長，所以不用固定欄寬 */
+.gloss-row {
+  display: grid;
+  grid-template-columns: minmax(6rem, 12rem) 1fr;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+  align-items: baseline;
+}
+
+.gloss-row dt {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.gloss-row dd {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}

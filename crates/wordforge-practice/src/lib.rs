@@ -21,4 +21,4 @@ pub mod engine;
 pub mod payload;
 
 pub use engine::{PracticeEngine, PracticeError, Result};
-pub use payload::{ExerciseView, Feedback, GradeInput};
+pub use payload::{ExerciseView, Feedback, GlossaryNote, GradeInput};

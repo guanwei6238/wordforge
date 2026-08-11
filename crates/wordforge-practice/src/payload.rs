@@ -120,6 +120,22 @@ pub struct Correction {
     pub explanation: Option<String>,
 }
 
+/// 閱讀解析裡的一條字詞說明。
+///
+/// 這些**不是模型產生的**，是拿文章去查你自己匯入的字典得到的。
+/// 這件事對多語言很重要：模型對小語種的解釋品質沒有保證，
+/// 但字典是使用者自己選的，查得到就是查得到。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GlossaryNote {
+    pub text: String,
+    pub gloss: Option<String>,
+    pub translation: Option<String>,
+    /// 多詞片語。單看每個字查不出這個意思，所以要單獨列。
+    pub is_phrase: bool,
+    /// 這個字不在你的已知詞裡——也就是 90% 法則裡那不足 10% 的部分
+    pub is_unknown: bool,
+}
+
 /// 批改結果。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Feedback {
@@ -138,6 +154,9 @@ pub struct Feedback {
     /// 已經在牌組裡的也不會重複加。UI 要顯示的是這一份。
     #[serde(default)]
     pub added_to_deck: Vec<String>,
+    /// 文章裡的生字與片語，由本地字典查出來，不是模型寫的。
+    #[serde(default)]
+    pub glossary: Vec<GlossaryNote>,
 }
 
 #[cfg(test)]

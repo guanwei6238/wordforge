@@ -305,6 +305,30 @@ export default function Practice() {
             </ul>
           )}
 
+          {feedback.glossary?.length > 0 && (
+            <div className="glossary">
+              <h3>
+                文章解析
+                <span className="muted"> · 來自你匯入的字典，不是 AI 寫的</span>
+              </h3>
+              <dl>
+                {feedback.glossary.map((g, i) => (
+                  <div key={i} className="gloss-row">
+                    <dt>
+                      {g.text}
+                      {g.is_phrase && (
+                        <span className="tag" title="片語：單看每個字查不出這個意思">
+                          片語
+                        </span>
+                      )}
+                    </dt>
+                    <dd>{g.translation ?? g.gloss ?? <span className="muted">查無釋義</span>}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+
           {feedback.added_to_deck.length > 0 ? (
             <p className="ok">
               已把 {feedback.added_to_deck.length} 個你不熟的字排進複習：

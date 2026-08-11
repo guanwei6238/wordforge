@@ -4,6 +4,7 @@ use time::OffsetDateTime;
 use wordforge_core::model::{CardKind, LemmaId, ProfileId};
 use wordforge_core::practice::{self, ExerciseKind, LearnerProfile};
 use wordforge_db::Db;
+use wordforge_db::dict;
 use wordforge_db::exercises::{self, ExerciseId, NewExercise};
 use wordforge_db::grammar;
 use wordforge_db::repo::{cards, lemmas};
@@ -67,6 +68,10 @@ const GRAMMAR_BATCH: i64 = 5;
 /// 記住最近幾個主題來避開。
 ///
 /// 大約是主題池的一半：留一半可挑，才不會每次都在同幾個之間跳。
+/// 片語最多看幾個詞。四個詞已經涵蓋 `in spite of`、`take care of` 這類，
+/// 再長的多半是句子而不是詞條。
+const MAX_PHRASE_LEN: usize = 4;
+
 const TOPIC_MEMORY: i64 = 6;
 
 pub struct PracticeEngine<'a> {
@@ -426,7 +431,10 @@ impl<'a> PracticeEngine<'a> {
             }
             ExerciseBody::Reading {
                 passage, questions, ..
-            } => self.grade_reading(passage, questions, input).await?,
+            } => {
+                self.grade_reading(profile_id, passage, questions, input)
+                    .await?
+            }
             ExerciseBody::Choices { items } => grade_choices(items, input),
         };
 
@@ -494,6 +502,7 @@ impl<'a> PracticeEngine<'a> {
 
     async fn grade_reading(
         &self,
+        profile_id: i64,
         passage: &str,
         questions: &[ChoiceItem],
         input: &GradeInput,
@@ -523,7 +532,86 @@ impl<'a> PracticeEngine<'a> {
         // 分數可以在本地算，不必相信模型的算術
         let local = grade_choices(questions, input);
         feedback.score = local.score;
+
+        // 解析裡的生字與片語由本地字典查，不佔 token 也不用等模型
+        let known =
+            cards::known_lemma_ids(self.db, ProfileId(profile_id), KNOWN_STABILITY_DAYS).await?;
+        feedback.glossary = self.build_glossary(passage, &known).await?;
         Ok(feedback)
+    }
+
+    /// 從文章本身算出解析：哪些字你不會、哪裡有片語。
+    ///
+    /// 全部本地做，一次 LLM 都不呼叫。理由有三個：
+    ///
+    /// 1. **比模型準**。「他不會這個字」是拿文章去比對牌組算出來的，
+    ///    不是模型猜的。90% 法則裡那不足 10%，這裡列的就是它本人。
+    /// 2. **語言無關**。模型對小語種的解釋品質沒有保證，但字典是
+    ///    使用者自己匯入的——查得到就是查得到。
+    /// 3. **免費且即時**。不佔 token，也不用等 CLI 冷啟動。
+    async fn build_glossary(
+        &self,
+        passage: &str,
+        known: &std::collections::HashSet<LemmaId>,
+    ) -> Result<Vec<GlossaryNote>> {
+        let tokens = wordforge_core::text::tokenize(passage);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 單字：只留「不在已知集合裡」的。已經會的字不需要解釋。
+        let mut unknown_words: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for token in &tokens {
+            if !seen.insert(token.clone()) {
+                continue;
+            }
+            if wordforge_core::wordlist::is_function_word(&self.target_lang, token) {
+                continue;
+            }
+            let id = lemmas::find_by_form(self.db, &self.target_lang, token).await?;
+            match id {
+                Some(id) if known.contains(&id) => {}
+                _ => unknown_words.push(token.clone()),
+            }
+        }
+
+        // 片語：字典裡真的有這個多詞條目才算。整組都是虛詞的排掉
+        // （`to be`、`there is` 這種在字典裡也查得到，但列出來只是雜訊）。
+        let candidates: Vec<String> =
+            wordforge_core::text::ngrams(&tokens, &self.target_lang, MAX_PHRASE_LEN)
+                .into_iter()
+                .filter(|p| {
+                    !p.split_whitespace()
+                        .all(|w| wordforge_core::wordlist::is_function_word(&self.target_lang, w))
+                })
+                .collect();
+
+        let phrases = dict::glossary(self.db, &self.target_lang, &candidates).await?;
+        let words = dict::glossary(self.db, &self.target_lang, &unknown_words).await?;
+
+        let mut notes: Vec<GlossaryNote> = Vec::new();
+        for e in phrases {
+            notes.push(GlossaryNote {
+                text: e.text,
+                gloss: e.gloss,
+                translation: e.translation,
+                is_phrase: true,
+                is_unknown: true,
+            });
+        }
+        for e in words {
+            notes.push(GlossaryNote {
+                text: e.text,
+                gloss: e.gloss,
+                translation: e.translation,
+                is_phrase: false,
+                is_unknown: true,
+            });
+        }
+        // 片語排前面：那才是查單字查不到的東西
+        notes.sort_by(|a, b| b.is_phrase.cmp(&a.is_phrase).then(a.text.cmp(&b.text)));
+        Ok(notes)
     }
 
     /// 把模型給的文法標籤收斂到該語言的受控清單。
