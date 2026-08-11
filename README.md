@@ -145,12 +145,32 @@ curl -LO https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv
 
 ## 專案狀態
 
-🚧 **v0.3 開發中** — 匯入字典、查字典、FSRS 背單字、分級測驗、真人發音都能用了。
-AI 出題（翻譯 / 閱讀 / 文法）已接上：依詞彙量選題型，**批改後會把你不會的字
-自動排進複習**。路線圖見 [`docs/roadmap.md`](docs/roadmap.md)，歡迎在 Issues 討論。
+**v1.0.1** — 匯入字典、查字典、FSRS 背單字、分級測驗、真人發音、AI 出題
+（翻譯 / 閱讀 / 文法）、自訂教材都能用了。批改後會把你不會的字**自動排進複習**。
+路線圖見 [`docs/roadmap.md`](docs/roadmap.md)，歡迎在 Issues 討論。
 
-第一次使用：到「匯入」頁載入一份 [kaikki.org](https://kaikki.org/) 的 Wiktionary JSONL
-或你自己的 CSV 單字表，就可以開始查字典與背單字。
+第一次使用請看[使用手冊](docs/manual.md)。簡單說：先匯入一份字典
+（App 開啟後會有引導），然後就可以開始背單字。
+
+### ⚠️ 這份程式碼沒有經過任何人審查
+
+只有作者一個人寫、一個人看過，**沒有第二雙眼睛**。測試有 300 多項、
+CI 也是綠的，但測試只能驗到作者想得到要驗的東西。
+
+一個真實的例子：v1.0.0 所有測試都過、CI 全綠，但裝起來從應用程式選單一開，
+AI 後端就偵測不到——因為沒有任何一項測試是「用 GUI 那種最小 PATH 啟動」的。
+那個 bug 要真的裝起來用才會浮出來。
+
+所以：
+
+- **請預期會遇到 bug**，尤其是在作者沒有的環境上（別的發行版、macOS、Windows）
+- 遇到了請開 [Issue](https://github.com/guanwei6238/wordforge/issues)，
+  貼上錯誤訊息與你的環境
+- **直接發 PR 修掉更好**，不必先問。小修正不需要事前討論，
+  改動比較大的話開個 Issue 聊一下方向比較不會白做工
+- 沒把握修對也沒關係，附上重現步驟的 PR 一樣有價值
+
+要動手的話讀 [CONTRIBUTING.md](CONTRIBUTING.md)：怎麼跑測試、怎麼下 commit 訊息都寫在那。
 
 ## 文件
 
@@ -164,7 +184,10 @@ AI 出題（翻譯 / 閱讀 / 文法）已接上：依詞彙量選題型，**批
 
 ## 貢獻
 
-歡迎 PR，請先讀 [CONTRIBUTING.md](CONTRIBUTING.md)。
+**歡迎 PR，尤其是修 bug 的。** 這份程式碼沒有經過任何人審查（見上面的
+[專案狀態](#專案狀態)），所以你發現的問題很可能是真的問題，不是你用錯。
+
+請先讀 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 授權
 
