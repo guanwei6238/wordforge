@@ -36,9 +36,18 @@ const KNOWN_STABILITY_DAYS: f64 = 21.0;
 
 /// 出題時給模型看的已知詞樣本數。
 ///
-/// 不能把幾千個字全塞進 prompt——那會吃掉整個 context，
-/// 而且模型並不需要完整清單才知道該用什麼難度的字。
+/// **不能把幾千個字全塞進 prompt**：一萬個字大約是 15,000 token，
+/// 每出一題就燒掉這麼多，而且模型並不需要完整清單——
+/// 它要的是「這個人的用字大概到什麼難度」。
+///
+/// 真正保證難度的是產生之後的本地覆蓋率驗收，不是這份樣本。
 const KNOWN_SAMPLE: i64 = 60;
+
+/// 樣本要涵蓋幾個難度層。
+///
+/// 只給最常用的字沒有意義：模型會看到 the / be / and，
+/// 完全判斷不出這個人的程度上緣在哪，於是文章不是太簡單就是太難。
+const SAMPLE_BANDS: i64 = 4;
 
 /// 閱讀理解的目標覆蓋率。生詞控制在 4% 左右。
 const READING_COVERAGE: f64 = 0.96;
@@ -196,7 +205,7 @@ impl<'a> PracticeEngine<'a> {
     ) -> Result<ExerciseView> {
         let known =
             cards::known_lemma_ids(self.db, ProfileId(profile_id), KNOWN_STABILITY_DAYS).await?;
-        let known_sample = self.known_sample(profile_id).await?;
+        let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
         let word_count = practice::reading_length(learner.vocabulary);
         let target_words = self.due_words(profile_id, 6, now).await?;
 
@@ -308,7 +317,7 @@ impl<'a> PracticeEngine<'a> {
         learner: &LearnerProfile,
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
-        let known_sample = self.known_sample(profile_id).await?;
+        let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
         let req = prompts::grammar_drill(
             &self.target_lang,
             &self.native_lang,
@@ -584,17 +593,63 @@ impl<'a> PracticeEngine<'a> {
     }
 
     /// 已知詞的抽樣，讓模型感受用字範圍。
-    async fn known_sample(&self, profile_id: i64) -> Result<Vec<String>> {
+    ///
+    /// 兩個要點：
+    ///
+    /// 1. **分層**。只給最常用的字，模型看到的是 the / be / and，
+    ///    判斷不出程度上緣在哪。要涵蓋從最基礎到接近上限的各個難度。
+    /// 2. **不能只看卡片**。在這個 App 裡複習過的字可能只有幾十個，
+    ///    但分級測驗說他會五千個——只送那幾十個會讓模型嚴重低估程度。
+    ///    所以把「詞頻在估計詞彙量以內」的字也納入抽樣池。
+    async fn known_sample(&self, profile_id: i64, vocabulary: i64) -> Result<Vec<String>> {
+        let per_band = (KNOWN_SAMPLE / SAMPLE_BANDS).max(1);
+        let upper = vocabulary.max(1);
+
+        // 分層的邊界依估計詞彙量等比切開，程度低的人不會全部落在同一層
+        let b1 = (upper / 8).max(1);
+        let b2 = (upper / 4).max(b1 + 1);
+        let b3 = (upper / 2).max(b2 + 1);
+
         let words: Vec<String> = sqlx::query_scalar(
-            "SELECT l.text FROM card c JOIN lemma l ON l.id = c.lemma_id
-             WHERE c.profile_id = ? AND c.state = 'review'
-             ORDER BY l.freq_rank IS NULL, l.freq_rank LIMIT ?",
+            "WITH pool AS (
+                 -- 確定會的：已經進入長期複習的卡片
+                 SELECT l.text AS text, l.freq_rank AS freq_rank
+                 FROM card c JOIN lemma l ON l.id = c.lemma_id
+                 WHERE c.profile_id = ?1 AND c.state = 'review'
+                   AND l.freq_rank IS NOT NULL
+                 UNION
+                 -- 推定會的：詞頻落在估計詞彙量以內的字。
+                 -- 排除大寫開頭與過短的詞，那些多半是專有名詞與縮寫。
+                 SELECT text, freq_rank FROM lemma
+                 WHERE lang = 'en' AND freq_rank IS NOT NULL AND freq_rank <= ?2
+                   AND text = lower(text) AND length(text) >= 3
+                   AND text NOT LIKE '% %'
+             ),
+             banded AS (
+                 SELECT text, freq_rank,
+                     CASE WHEN freq_rank <= ?3 THEN 0
+                          WHEN freq_rank <= ?4 THEN 1
+                          WHEN freq_rank <= ?5 THEN 2
+                          ELSE 3 END AS band
+                 FROM pool
+             ),
+             picked AS (
+                 SELECT text, freq_rank, band,
+                        ROW_NUMBER() OVER (PARTITION BY band ORDER BY RANDOM()) AS rn
+                 FROM banded
+             )
+             SELECT text FROM picked WHERE rn <= ?6 ORDER BY freq_rank",
         )
         .bind(profile_id)
-        .bind(KNOWN_SAMPLE)
+        .bind(upper)
+        .bind(b1)
+        .bind(b2)
+        .bind(b3)
+        .bind(per_band)
         .fetch_all(self.db.pool())
         .await
         .map_err(wordforge_db::DbError::from)?;
+
         Ok(words)
     }
 

@@ -548,3 +548,163 @@ async fn corrections_accumulate_into_weak_points() {
     assert!(learner.weak_grammar.contains(&"tense".to_string()));
     assert!(learner.weak_grammar.contains(&"articles".to_string()));
 }
+
+/// 送給模型的詞彙資訊必須有上限，而且要涵蓋各個難度。
+///
+/// 這是整個設計的成本關鍵：把一萬個已知詞塞進 prompt 大約 15,000 token，
+/// 每出一題就燒一次。真正保證難度的是本地覆蓋率驗收，不是這份樣本。
+#[tokio::test]
+async fn the_vocabulary_sample_is_bounded_and_spans_difficulties() {
+    let db = Db::open_in_memory().await.unwrap();
+    let profile = profiles::create(&db, "我", "zh-TW", "en", t0())
+        .await
+        .unwrap();
+
+    // 一本兩千字的字典，詞頻 1..2000
+    let source = wordforge_db::dict::upsert_source(
+        &db,
+        NewSource {
+            slug: "test",
+            name: "測試字典",
+            license: None,
+            attribution: None,
+            homepage: None,
+            version: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    for rank in 1..=2_000 {
+        let word = format!("word{rank:05}");
+        wordforge_db::dict::write_entry(
+            &mut conn,
+            source,
+            &EntryWrite {
+                lang: "en",
+                headword: &word,
+                pos: "",
+                freq_rank: Some(rank),
+                senses: vec![NewSense {
+                    gloss: "意思",
+                    gloss_lang: "zh-CN",
+                    translation: Some("意思"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+    set_vocabulary(&db, profile.0, 2_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[{"prompt":"x","options":["a","b"],"answer_index":0}]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(profile.0, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    // prompt 裡出現的樣本詞
+    let prompt = llm.last_prompt();
+    let sampled: Vec<i64> = (1..=2_000)
+        .filter(|r| prompt.contains(&format!("word{r:05}")))
+        .collect();
+
+    assert!(
+        !sampled.is_empty() && sampled.len() <= 60,
+        "樣本數要有上限，實際 {} 個",
+        sampled.len()
+    );
+
+    // 涵蓋各難度：不能全部擠在最常用的那一段
+    let hardest = sampled.iter().max().copied().unwrap();
+    let easiest = sampled.iter().min().copied().unwrap();
+    assert!(easiest <= 250, "要有基礎詞，最簡單的是第 {easiest} 名");
+    assert!(
+        hardest > 1_000,
+        "要有接近程度上緣的字，否則模型判斷不出難度；最難的只到第 {hardest} 名"
+    );
+}
+
+/// 卡片很少但測驗說程度不錯時，樣本不能只有那幾張卡。
+///
+/// 實際情況：在 App 裡複習過的只有 21 個字，分級測驗卻估出 5200 字。
+/// 只送那 21 個最常用的字，模型會以為這是初學者。
+#[tokio::test]
+async fn a_small_deck_does_not_make_the_learner_look_like_a_beginner() {
+    let db = Db::open_in_memory().await.unwrap();
+    let profile = profiles::create(&db, "我", "zh-TW", "en", t0())
+        .await
+        .unwrap();
+
+    let source = wordforge_db::dict::upsert_source(
+        &db,
+        NewSource {
+            slug: "test",
+            name: "測試字典",
+            license: None,
+            attribution: None,
+            homepage: None,
+            version: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    for rank in 1..=1_000 {
+        let word = format!("word{rank:05}");
+        wordforge_db::dict::write_entry(
+            &mut conn,
+            source,
+            &EntryWrite {
+                lang: "en",
+                headword: &word,
+                pos: "",
+                freq_rank: Some(rank),
+                senses: vec![NewSense {
+                    gloss: "意思",
+                    gloss_lang: "zh-CN",
+                    translation: Some("意思"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+
+    // 牌組裡只有三個最常用的字，但測驗說會 1000 個
+    for lemma in 1..=3 {
+        put_in_deck(&db, profile.0, lemma).await;
+    }
+    set_vocabulary(&db, profile.0, 1_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[{"prompt":"x","options":["a","b"],"answer_index":0}]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(profile.0, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    let sampled: Vec<i64> = (1..=1_000)
+        .filter(|r| prompt.contains(&format!("word{r:05}")))
+        .collect();
+
+    assert!(
+        sampled.len() > 10,
+        "樣本不該被牌組大小限制住，實際只有 {} 個",
+        sampled.len()
+    );
+    assert!(
+        sampled.iter().any(|r| *r > 500),
+        "要抽到測驗推定他會的那些較難的字"
+    );
+}
