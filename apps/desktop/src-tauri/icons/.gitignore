@@ -1,6 +1,15 @@
-# `npx tauri icon` 產生的多尺寸檔案不進版控，
-# 但 icon.png 是編譯期就要讀到的來源檔，必須保留。
-*.png
-!icon.png
-*.ico
-*.icns
+# 這個目錄的檔案**全部**要進版控，包括 `npx tauri icon` 產生的衍生檔。
+#
+# 理由：`generate_context!` 在編譯期就要讀到 tauri.conf.json 列出的每一個
+# 圖示檔。少一個，clone 下來的第一個 cargo check 就會 panic：
+#
+#     error: proc macro panicked
+#       --> src/lib.rs:1312:14
+#          .run(tauri::generate_context!())
+#
+# 全部加起來不到 300 KB，換掉「clone 完就能建置」很划算。
+#
+# 行動平台的目錄不留——桌面版還沒做到 v1.0，留著只是把 repo 撐大。
+# 要做的時候重跑 `npx tauri icon` 就會生出來。
+android/
+ios/
