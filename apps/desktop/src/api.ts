@@ -450,6 +450,19 @@ export interface LlmSettings {
   api: ApiSettings;
 }
 
+export interface CliAvailability {
+  preset: CliPreset;
+  label: string;
+  program: string;
+  installed: boolean;
+  version: string | null;
+}
+
+/** 偵測這台機器上裝了哪些 AI CLI */
+export function detectAiBackends(): Promise<CliAvailability[]> {
+  return invoke("detect_ai_backends");
+}
+
 export function getLlmSettings(): Promise<LlmSettings> {
   return invoke("get_llm_settings");
 }

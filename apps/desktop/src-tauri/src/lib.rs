@@ -770,6 +770,14 @@ fn settings_dir(app: &AppHandle) -> CmdResult<PathBuf> {
     Ok(app.path().app_data_dir()?)
 }
 
+/// 這台機器上裝了哪些 AI CLI。
+///
+/// 設定頁一開就查，使用者不必自己猜「我到底有沒有裝」。
+#[tauri::command]
+async fn detect_ai_backends() -> Vec<wordforge_llm::CliAvailability> {
+    wordforge_llm::detect_backends().await
+}
+
 #[tauri::command]
 fn get_llm_settings(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(LlmSettings::load(&settings_dir(&app)?).redacted())
@@ -1115,6 +1123,7 @@ pub fn run() {
             get_refill_tag,
             get_study_settings,
             update_study_settings,
+            detect_ai_backends,
             get_llm_settings,
             update_llm_settings,
             test_llm,

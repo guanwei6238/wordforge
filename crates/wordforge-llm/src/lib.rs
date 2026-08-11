@@ -25,7 +25,7 @@ pub mod cli;
 pub mod client;
 pub mod prompts;
 
-pub use cli::{CliConfig, CliLlm, CliPreset};
+pub use cli::{CliAvailability, CliConfig, CliLlm, CliPreset, detect_backends};
 pub use client::{HttpLlm, LlmProvider};
 
 use serde::{Deserialize, Serialize};

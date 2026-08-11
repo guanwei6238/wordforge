@@ -107,6 +107,50 @@ impl CliConfig {
     }
 }
 
+/// 一個 CLI 後端在這台機器上的狀況。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliAvailability {
+    pub preset: CliPreset,
+    pub label: String,
+    pub program: String,
+    pub installed: bool,
+    /// 裝了的話是哪一版，讓使用者確認自己看的是同一個東西
+    pub version: Option<String>,
+}
+
+/// 這台機器上有哪些 CLI 可以用。
+///
+/// 直接執行 `--version` 而不是找 PATH：使用者可能用 alias、
+/// wrapper script 或自訂路徑，能不能跑起來才是真正的答案。
+/// 兩個指令都在 0.3 秒內回應，開設定頁時查一次不影響體感。
+pub async fn detect_backends() -> Vec<CliAvailability> {
+    let candidates = [
+        (CliPreset::ClaudeCode, "Claude Code", "claude"),
+        (CliPreset::Codex, "OpenAI Codex", "codex"),
+    ];
+
+    let mut out = Vec::new();
+    for (preset, label, program) in candidates {
+        let version = Command::new(program)
+            .arg("--version")
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        out.push(CliAvailability {
+            preset,
+            label: label.to_string(),
+            program: program.to_string(),
+            installed: version.is_some(),
+            version,
+        });
+    }
+    out
+}
+
 pub struct CliLlm {
     config: CliConfig,
 }
@@ -346,6 +390,22 @@ mod tests {
         let args = cli.build_args(&req());
         let pos = args.iter().position(|a| a == "-m").expect("沒有指定模型");
         assert_eq!(args[pos + 1], "gpt-5");
+    }
+
+    /// 偵測要看「跑不跑得起來」而不是「PATH 裡有沒有」——
+    /// 使用者可能用 alias、wrapper script 或自訂路徑。
+    #[tokio::test]
+    async fn detection_reports_every_known_backend() {
+        let found = detect_backends().await;
+
+        assert_eq!(found.len(), 2, "兩個後端都要回報，沒裝的也要");
+        assert!(found.iter().any(|b| b.preset == CliPreset::ClaudeCode));
+        assert!(found.iter().any(|b| b.preset == CliPreset::Codex));
+
+        // 裝了的一定要帶版本，沒裝的一定不能帶
+        for b in &found {
+            assert_eq!(b.installed, b.version.is_some(), "{}", b.program);
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  type Backend,
+  type CliAvailability,
   type CliPreset,
+  detectAiBackends,
   errorMessage,
   getLlmSettings,
   type LlmSettings,
@@ -9,58 +10,62 @@ import {
   updateLlmSettings,
 } from "../api";
 
-interface Preset {
-  value: CliPreset;
-  label: string;
-  program: string;
-  args: string[];
-  systemFlag: string | null;
-  modelFlag: string | null;
-  model: string;
-  models: string[];
-  hint: string;
-}
-
-const CLI_PRESETS: Preset[] = [
-  {
-    value: "claude_code",
-    label: "Claude Code",
-    program: "claude",
+/** 每個 CLI 怎麼呼叫。這些都是實測過的參數。 */
+const CLI_SPECS: Record<
+  string,
+  { args: string[]; systemFlag: string | null; modelFlag: string | null; model: string; models: string[] }
+> = {
+  claude_code: {
     args: ["-p", "--output-format", "text"],
     systemFlag: "--append-system-prompt",
     modelFlag: "--model",
     model: "sonnet",
     models: ["haiku", "sonnet", "opus"],
-    hint: "用你現有的 Claude 訂閱，不必另開 API 帳單",
   },
-  {
-    value: "codex",
-    label: "OpenAI Codex",
-    program: "codex",
+  codex: {
+    // 資料目錄不是 git repo，不加這個會直接拒絕執行
     args: ["exec", "--skip-git-repo-check"],
     systemFlag: null,
     modelFlag: "-m",
     model: "",
     models: [],
-    hint: "用你現有的 ChatGPT 訂閱",
   },
-];
+};
+
+/**
+ * 目前的設定對應到下拉選單的哪一個值。
+ *
+ * CLI 與 API 攤平在同一層，所以要把「後端種類 + 細節」壓成一個字串。
+ */
+function choiceId(settings: LlmSettings): string {
+  if (settings.backend === "cli") return `cli:${settings.cli.preset}`;
+  if (settings.backend === "api") {
+    if (settings.api.provider === "anthropic") return "api:anthropic";
+    if (settings.api.provider === "ollama") return "api:ollama";
+    return "api:openai";
+  }
+  return "none";
+}
 
 /**
  * AI 後端設定。
  *
- * 三條路：用本機已登入的 CLI（訂閱）、填 API key、或接本機 Ollama。
- * 第一條通常最划算——已經付過的錢不該再付一次。
+ * 選項刻意攤平成一層：原本要先選「本機 CLI」才會冒出 claude / codex，
+ * 使用者根本不知道那裡有東西。順便直接偵測機器上裝了什麼，
+ * 沒裝的標示出來而不是讓人選了才失敗。
  */
 export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
   const [settings, setSettings] = useState<LlmSettings | null>(null);
+  const [detected, setDetected] = useState<CliAvailability[]>([]);
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setSettings(await getLlmSettings());
+      const [s, d] = await Promise.all([getLlmSettings(), detectAiBackends()]);
+      setSettings(s);
+      setDetected(d);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -97,26 +102,53 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
 
   if (!settings) return <p className="muted">載入中…</p>;
 
-  const currentPreset = CLI_PRESETS.find((p) => p.value === settings.cli.preset);
+  const current = settings;
+  const spec = CLI_SPECS[current.cli.preset];
 
-  function chooseBackend(backend: Backend) {
-    void save({ ...settings!, backend });
-  }
+  function choose(id: string) {
+    if (id === "none") {
+      void save({ ...current, backend: "none" });
+      return;
+    }
 
-  function choosePreset(preset: CliPreset) {
-    const p = CLI_PRESETS.find((c) => c.value === preset);
-    if (!p) return;
+    if (id.startsWith("cli:")) {
+      const preset = id.slice(4) as CliPreset;
+      const s = CLI_SPECS[preset];
+      const found = detected.find((d) => d.preset === preset);
+      void save({
+        ...current,
+        backend: "cli",
+        cli: {
+          ...current.cli,
+          preset,
+          program: found?.program ?? preset,
+          args: s?.args ?? [],
+          system_flag: s?.systemFlag ?? null,
+          model_flag: s?.modelFlag ?? null,
+          model: s?.model ?? "",
+        },
+      });
+      return;
+    }
+
+    const provider =
+      id === "api:anthropic"
+        ? ("anthropic" as const)
+        : id === "api:ollama"
+          ? ("ollama" as const)
+          : ("open_ai_compatible" as const);
     void save({
-      ...settings!,
-      backend: "cli",
-      cli: {
-        ...settings!.cli,
-        preset,
-        program: p.program,
-        args: p.args,
-        system_flag: p.systemFlag,
-        model_flag: p.modelFlag,
-        model: p.model,
+      ...current,
+      backend: "api",
+      api: {
+        ...current.api,
+        provider,
+        model:
+          provider === "anthropic"
+            ? "claude-sonnet-5"
+            : provider === "ollama"
+              ? "qwen3:8b"
+              : "gpt-5",
       },
     });
   }
@@ -130,60 +162,40 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
 
       <label>
         使用
-        <select value={settings.backend} onChange={(e) => chooseBackend(e.target.value as Backend)}>
+        <select value={choiceId(current)} onChange={(e) => choose(e.target.value)}>
           <option value="none">不使用（只背單字）</option>
-          <option value="cli">本機 CLI（用既有訂閱）</option>
-          <option value="api">API 金鑰 / Ollama</option>
+          <optgroup label="本機 CLI — 用你已經付的訂閱">
+            {detected.map((d) => (
+              <option key={d.preset} value={`cli:${d.preset}`} disabled={!d.installed}>
+                {d.label}
+                {d.installed ? `　✓ ${d.version ?? "已安裝"}` : "　（未安裝）"}
+              </option>
+            ))}
+          </optgroup>
+          <optgroup label="API">
+            <option value="api:anthropic">Anthropic API 金鑰</option>
+            <option value="api:openai">OpenAI 相容端點</option>
+            <option value="api:ollama">Ollama（本機，完全離線）</option>
+          </optgroup>
         </select>
       </label>
 
-      {settings.backend === "cli" && (
+      {current.backend === "cli" && (
         <>
-          <label>
-            指令
-            <select
-              value={settings.cli.preset}
-              onChange={(e) => choosePreset(e.target.value as CliPreset)}
-            >
-              {CLI_PRESETS.map((p) => (
-                <option key={p.value} value={p.value}>
-                  {p.label}
-                </option>
-              ))}
-              <option value="custom">自訂</option>
-            </select>
-          </label>
-
-          {settings.cli.preset === "custom" ? (
-            <label>
-              執行檔
-              <input
-                value={settings.cli.program}
-                onChange={(e) =>
-                  save({ ...settings, cli: { ...settings.cli, program: e.target.value } })
-                }
-                placeholder="claude"
-              />
-            </label>
-          ) : (
-            <p className="muted hint">
-              {CLI_PRESETS.find((p) => p.value === settings.cli.preset)?.hint}
-              。執行 <code>{[settings.cli.program, ...settings.cli.args].join(" ")}</code>
-              ，prompt 從 stdin 送入。
-            </p>
-          )}
+          <p className="muted hint">
+            執行 <code>{[current.cli.program, ...current.cli.args].join(" ")}</code>
+            ，prompt 從 stdin 送入。
+          </p>
 
           <label>
             模型
-            {currentPreset && currentPreset.models.length > 0 ? (
+            {spec && spec.models.length > 0 ? (
               <select
-                value={settings.cli.model}
-                onChange={(e) =>
-                  save({ ...settings, cli: { ...settings.cli, model: e.target.value } })
-                }
+                value={current.cli.model}
+                onChange={(e) => save({ ...current, cli: { ...current.cli, model: e.target.value } })}
               >
                 <option value="">（CLI 預設）</option>
-                {currentPreset.models.map((m) => (
+                {spec.models.map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -191,11 +203,9 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
               </select>
             ) : (
               <input
-                value={settings.cli.model}
+                value={current.cli.model}
                 placeholder="（CLI 預設）"
-                onChange={(e) =>
-                  save({ ...settings, cli: { ...settings.cli, model: e.target.value } })
-                }
+                onChange={(e) => save({ ...current, cli: { ...current.cli, model: e.target.value } })}
               />
             )}
           </label>
@@ -203,51 +213,49 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
             出題與批改是「照著明確規格產生結構化輸出」，中等模型就夠用，
             而且快得多、也比較不會撞到訂閱的速率限制。
           </p>
-
           <p className="muted hint">
-            比 API 慢（每題要啟動一個行程，可能幾十秒），而且訂閱有速率限制，
+            比 API 慢（每題要啟動一個行程，可能幾十秒），訂閱也有速率限制，
             連續出很多題會撞到。
           </p>
         </>
       )}
 
-      {settings.backend === "api" && (
+      {current.backend === "api" && (
         <>
-          <label>
-            供應商
-            <select
-              value={settings.api.provider}
-              onChange={(e) =>
-                save({
-                  ...settings,
-                  api: { ...settings.api, provider: e.target.value as never },
-                })
-              }
-            >
-              <option value="anthropic">Anthropic</option>
-              <option value="open_ai_compatible">OpenAI 相容</option>
-              <option value="ollama">Ollama（本機）</option>
-            </select>
-          </label>
-
           <label>
             模型
             <input
-              value={settings.api.model}
-              onChange={(e) => save({ ...settings, api: { ...settings.api, model: e.target.value } })}
+              value={current.api.model}
+              onChange={(e) => save({ ...current, api: { ...current.api, model: e.target.value } })}
             />
           </label>
 
-          {settings.api.provider !== "ollama" && (
+          {current.api.provider === "open_ai_compatible" && (
+            <label>
+              端點
+              <input
+                value={current.api.base_url ?? ""}
+                placeholder="https://api.openai.com/v1"
+                onChange={(e) =>
+                  save({
+                    ...current,
+                    api: { ...current.api, base_url: e.target.value || null },
+                  })
+                }
+              />
+            </label>
+          )}
+
+          {current.api.provider !== "ollama" && (
             <>
               <label>
                 API 金鑰
                 <input
                   type="password"
-                  value={settings.api.api_key}
-                  placeholder={settings.api.has_api_key ? "（已設定，留空不變更）" : "sk-…"}
+                  value={current.api.api_key}
+                  placeholder={current.api.has_api_key ? "（已設定，留空不變更）" : "sk-…"}
                   onChange={(e) =>
-                    save({ ...settings, api: { ...settings.api, api_key: e.target.value } })
+                    save({ ...current, api: { ...current.api, api_key: e.target.value } })
                   }
                 />
               </label>
@@ -260,7 +268,7 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
         </>
       )}
 
-      {settings.backend !== "none" && (
+      {current.backend !== "none" && (
         <div className="row">
           <button onClick={runTest} disabled={testing}>
             {testing ? "測試中…" : "測試連線"}
