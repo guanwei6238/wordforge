@@ -49,6 +49,9 @@ pub struct NewExample<'a> {
 pub struct NewPronunciation<'a> {
     pub accent: Option<&'a str>,
     pub ipa: Option<&'a str>,
+    /// 真人錄音的來源網址。匯入時只記網址，實際下載是另一個步驟。
+    pub audio_url: Option<&'a str>,
+    /// 已下載的本機檔案，相對於 app 資料目錄
     pub audio_path: Option<&'a str>,
     pub audio_license: Option<&'a str>,
     pub is_synthetic: bool,
@@ -185,14 +188,15 @@ pub async fn write_entry(
 
     for pron in &entry.pronunciations {
         sqlx::query(
-            "INSERT INTO pronunciation (lemma_id, source_id, accent, ipa, audio_path,
-                                        audio_license, is_synthetic)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO pronunciation (lemma_id, source_id, accent, ipa, audio_url,
+                                        audio_path, audio_license, is_synthetic)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(lemma_id)
         .bind(source.0)
         .bind(pron.accent)
         .bind(pron.ipa)
+        .bind(pron.audio_url)
         .bind(pron.audio_path)
         .bind(pron.audio_license)
         .bind(pron.is_synthetic as i64)
@@ -397,6 +401,8 @@ pub struct PronunciationView {
     pub accent: Option<String>,
     pub ipa: Option<String>,
     pub audio_path: Option<String>,
+    /// 有網址但沒有 `audio_path`，代表這個字有真人錄音、只是還沒下載
+    pub has_audio_url: bool,
     pub is_synthetic: bool,
 }
 
@@ -490,7 +496,7 @@ pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<Wo
     }
 
     let pronunciations = sqlx::query(&format!(
-        "SELECT DISTINCT accent, ipa, audio_path, is_synthetic
+        "SELECT DISTINCT accent, ipa, audio_path, audio_url, is_synthetic
          FROM pronunciation WHERE lemma_id IN ({ids})"
     ))
     .fetch_all(db.pool())
@@ -500,6 +506,7 @@ pub async fn detail(db: &Db, lemma_id: i64, profile_id: i64) -> Result<Option<Wo
         accent: p.get("accent"),
         ipa: p.get("ipa"),
         audio_path: p.get("audio_path"),
+        has_audio_url: p.get::<Option<String>, _>("audio_url").is_some(),
         is_synthetic: p.get::<i64, _>("is_synthetic") != 0,
     })
     .collect();

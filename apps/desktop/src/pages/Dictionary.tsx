@@ -118,7 +118,7 @@ export default function Dictionary() {
               <h2>{selected.text}</h2>
               <SpeakButton
                 text={selected.text}
-                audioPath={selected.pronunciations[0]?.audio_path}
+                audioPath={selected.pronunciations.find((p) => p.audio_path)?.audio_path}
               />
               {selected.pos && <span className="tag">{selected.pos}</span>}
               {selected.freq_rank != null && (

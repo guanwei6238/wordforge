@@ -25,7 +25,8 @@ wordforge-llm = { workspace = true }
 wordforge-tts = { workspace = true }
 
 sqlx = { workspace = true }
-tauri = { version = "2", features = [] }
+# protocol-asset：讓 WebView 能播放下載到 app 資料目錄的發音音檔
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 

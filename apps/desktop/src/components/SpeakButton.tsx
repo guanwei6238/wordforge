@@ -1,19 +1,19 @@
 import { useState } from "react";
-import { speak } from "../api";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { audioFilePath, errorMessage, speak } from "../api";
 
 interface Props {
   text: string;
   lang?: string;
-  /** 有真人錄音時的相對路徑。目前尚未實作播放，先用來標示音源。 */
+  /** 已下載的真人錄音檔名（相對於 app 的 audio 目錄） */
   audioPath?: string | null;
 }
 
 /**
  * 發音按鈕。
  *
- * 目前一律走系統語音合成——真人錄音要先做下載器與快取，
- * 那是獨立的一段工作。合成音對「這個字大概怎麼唸」夠用，
- * 但對細部發音不夠，所以之後真人音檔會蓋過它。
+ * 優先播放真人錄音，沒有才退回系統語音合成。合成音判斷「大概怎麼唸」夠用，
+ * 但重音與連音只有真人錄音聽得出來，所以順序不能反過來。
  */
 export default function SpeakButton({ text, lang = "en", audioPath }: Props) {
   const [busy, setBusy] = useState(false);
@@ -23,10 +23,18 @@ export default function SpeakButton({ text, lang = "en", audioPath }: Props) {
     setBusy(true);
     setFailed(null);
     try {
-      await speak(text, lang);
+      if (audioPath) {
+        const src = convertFileSrc(await audioFilePath(audioPath));
+        const audio = new Audio(src);
+        // 播放失敗（檔案損毀、格式不支援）就退回合成音，總比沒聲音好
+        await audio.play().catch(async () => {
+          await speak(text, lang);
+        });
+      } else {
+        await speak(text, lang);
+      }
     } catch (e) {
-      // 沒安裝語音引擎是最常見的原因，錯誤訊息本身已經寫了怎麼裝
-      setFailed(typeof e === "object" && e && "message" in e ? String(e.message) : String(e));
+      setFailed(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -38,10 +46,10 @@ export default function SpeakButton({ text, lang = "en", audioPath }: Props) {
         className="speak"
         onClick={play}
         disabled={busy}
-        title={audioPath ? "播放發音" : "以系統語音合成朗讀"}
+        title={audioPath ? "播放真人錄音" : "以系統語音合成朗讀（尚未下載真人錄音）"}
         aria-label={`朗讀 ${text}`}
       >
-        {busy ? "🔈" : "🔊"}
+        {busy ? "🔈" : audioPath ? "🔊" : "🗣"}
       </button>
       {failed && <span className="error speak-error">{failed}</span>}
     </>

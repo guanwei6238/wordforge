@@ -13,6 +13,8 @@ wordforge-core = { workspace = true }
 wordforge-db = { workspace = true }
 wordforge-dict = { workspace = true }
 
+futures = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }

@@ -414,6 +414,50 @@ fn speech_available() -> bool {
     wordforge_tts::is_available()
 }
 
+/// 音檔存放目錄：app 資料目錄下的 `audio/`。
+fn audio_dir(app: &AppHandle) -> CmdResult<PathBuf> {
+    Ok(app.path().app_data_dir()?.join("audio"))
+}
+
+/// 牌組裡有多少字有真人錄音、已經下載幾個。
+#[tauri::command]
+async fn audio_status(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdResult<(i64, i64)> {
+    Ok(wordforge_import::audio::audio_status(&state.db, profile_id).await?)
+}
+
+/// 幫牌組裡的字下載真人發音。
+///
+/// 只抓牌組裡、有網址、還沒下載的那些——完整音檔集有好幾 GB，
+/// 但實際會聽到的只有這幾百個字。
+#[tauri::command]
+async fn download_audio(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    limit: i64,
+) -> CmdResult<wordforge_import::audio::AudioProgress> {
+    let dir = audio_dir(&app)?;
+    let emitter = app.clone();
+    Ok(
+        wordforge_import::audio::download_for_deck(&state.db, profile_id, &dir, limit, move |p| {
+            if let Err(e) = emitter.emit("audio://progress", p) {
+                tracing::warn!(error = %e, "音檔進度事件送不出去");
+            }
+        })
+        .await?,
+    )
+}
+
+/// 把資料庫存的相對檔名換成前端能播放的絕對路徑。
+#[tauri::command]
+fn audio_file_path(app: AppHandle, name: String) -> CmdResult<String> {
+    // 檔名一律由下載器用 id 組成，這裡再擋一次路徑穿越
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(CommandError::new("音檔名稱不合法"));
+    }
+    Ok(audio_dir(&app)?.join(name).to_string_lossy().into_owned())
+}
+
 // ---------------------------------------------------------------- 分級測驗
 
 /// 每個詞頻層抽幾題。七層共 35 題，大約三分鐘。
@@ -679,6 +723,9 @@ pub fn run() {
             speech_available,
             placement_items,
             submit_placement,
+            audio_status,
+            download_audio,
+            audio_file_path,
             start_import,
             cancel_import,
             import_running,

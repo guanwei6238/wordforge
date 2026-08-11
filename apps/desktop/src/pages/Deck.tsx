@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { addWordsByTag, deckTags, errorMessage, tagLabel, type TagSummary } from "../api";
+import AudioDownload from "../components/AudioDownload";
 import PlacementTest from "../components/PlacementTest";
 
 /** 一次加入的張數選項。500 字大約是兩三週的量。 */
@@ -52,6 +53,8 @@ export default function Deck() {
   return (
     <div className="deck">
       <PlacementTest onFinished={refresh} />
+
+      <AudioDownload />
 
       <section className="panel">
         <h2>依範圍加入單字</h2>

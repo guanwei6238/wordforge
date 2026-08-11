@@ -115,6 +115,8 @@ export interface PronunciationView {
   accent: string | null;
   ipa: string | null;
   audio_path: string | null;
+  /** 有錄音網址但還沒下載 */
+  has_audio_url: boolean;
   is_synthetic: boolean;
 }
 
@@ -193,6 +195,32 @@ export function speak(text: string, lang = "en"): Promise<void> {
 export function speechAvailable(): Promise<boolean> {
   return invoke("speech_available");
 }
+
+export interface AudioProgress {
+  total: number;
+  downloaded: number;
+  failed: number;
+  skipped: number;
+}
+
+/** [有錄音的字數, 已下載的字數] */
+export function audioStatus(profileId = DEFAULT_PROFILE_ID): Promise<[number, number]> {
+  return invoke("audio_status", { profileId });
+}
+
+export function downloadAudio(
+  limit = 500,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<AudioProgress> {
+  return invoke("download_audio", { profileId, limit });
+}
+
+/** 把資料庫存的相對檔名換成 WebView 能讀的絕對路徑 */
+export function audioFilePath(name: string): Promise<string> {
+  return invoke("audio_file_path", { name });
+}
+
+export const AUDIO_PROGRESS_EVENT = "audio://progress";
 
 /* ---------------------------------------------------------------- 分級測驗 */
 

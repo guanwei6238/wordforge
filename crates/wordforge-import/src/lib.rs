@@ -13,6 +13,8 @@
 //! `wordforge-dict` 只負責解析、`wordforge-db` 只負責 SQL，這些流程控制
 //! 放在兩者之間。
 
+pub mod audio;
+
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -142,7 +144,9 @@ fn to_write<'a>(entry: &'a DictEntry) -> EntryWrite<'a> {
             .map(|p| NewPronunciation {
                 accent: p.accent.as_deref(),
                 ipa: p.ipa.as_deref(),
-                // 音檔是否下載由使用者另外決定，這裡只記 IPA 與授權
+                // 只記網址，實際下載是獨立的步驟——完整音檔集有好幾 GB，
+                // 但使用者真正需要的只有牌組裡那幾百個字
+                audio_url: p.audio_url.as_deref(),
                 audio_path: None,
                 audio_license: p.audio_license.as_deref(),
                 is_synthetic: false,

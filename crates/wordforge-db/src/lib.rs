@@ -128,6 +128,74 @@ mod tests {
         }
     }
 
+    /// 每個會觸發 CASCADE / SET NULL 的外鍵，子表欄位都必須有索引。
+    ///
+    /// 沒有索引時，刪除父表一列就要把子表整張掃過一次。這在開發期完全看不出來
+    /// （子表是空的），但重新匯入一份大字典時會讓程式看起來像當掉——
+    /// 實際發生過：七分鐘讀掉 604 GB、資料庫一筆都沒寫進去。
+    #[tokio::test]
+    async fn every_cascading_foreign_key_is_indexed() {
+        use sqlx::Row;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let pool = db.pool();
+
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> '_sqlx_migrations'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+
+        let mut missing = Vec::new();
+        for table in &tables {
+            let fks = sqlx::query(&format!("PRAGMA foreign_key_list('{table}')"))
+                .fetch_all(pool)
+                .await
+                .unwrap();
+
+            for fk in fks {
+                let on_delete: String = fk.get("on_delete");
+                // NO ACTION / RESTRICT 不會去掃子表，不需要索引
+                if !matches!(on_delete.as_str(), "CASCADE" | "SET NULL") {
+                    continue;
+                }
+                let column: String = fk.get("from");
+
+                // 只要有任何索引以這個欄位開頭就夠了（含 UNIQUE 產生的自動索引）
+                let indexes = sqlx::query(&format!("PRAGMA index_list('{table}')"))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
+                let mut covered = false;
+                for idx in indexes {
+                    let name: String = idx.get("name");
+                    let first: Option<String> = sqlx::query_scalar(&format!(
+                        "SELECT name FROM pragma_index_info('{name}') WHERE seqno = 0"
+                    ))
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap()
+                    .flatten();
+                    if first.as_deref() == Some(column.as_str()) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if !covered {
+                    missing.push(format!("{table}.{column} (ON DELETE {on_delete})"));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "這些外鍵欄位沒有索引，刪除父列時會全表掃描：\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
     #[tokio::test]
     async fn foreign_keys_are_enforced() {
         let db = Db::open_in_memory().await.unwrap();
