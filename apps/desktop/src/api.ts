@@ -79,6 +79,34 @@ export function studyStats(profileId = DEFAULT_PROFILE_ID): Promise<StudyStats> 
   return invoke("study_stats", { profileId });
 }
 
+export interface QueueStatus {
+  /** 現在到期的複習卡 */
+  due_reviews: number;
+  /** 今天還能引入幾張新卡 */
+  new_today: number;
+  /** 牌組裡還有幾張沒學過（不受每日上限限制） */
+  new_in_deck: number;
+  /** 被分級測驗收起來的卡 */
+  suspended: number;
+  /** 下一張卡到期時間（RFC 3339） */
+  next_due: string | null;
+  new_per_day: number;
+}
+
+export function queueStatus(profileId = DEFAULT_PROFILE_ID): Promise<QueueStatus> {
+  return invoke("queue_status", { profileId });
+}
+
+/** 超出每日上限再多學幾個新字 */
+export function studyMore(extra: number, profileId = DEFAULT_PROFILE_ID): Promise<CardView[]> {
+  return invoke("study_more", { profileId, extra });
+}
+
+/** 恢復被收起來的卡，最常用的字優先 */
+export function unsuspendCards(count: number, profileId = DEFAULT_PROFILE_ID): Promise<number> {
+  return invoke("unsuspend_cards", { profileId, count });
+}
+
 /* ------------------------------------------------------------------ 查字典 */
 
 export interface SearchHit {

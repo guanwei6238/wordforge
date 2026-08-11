@@ -287,7 +287,8 @@ async fn main() -> Result<()> {
         }
 
         Command::Deck(DeckCmd::Tags { lang }) => {
-            let summary = repo::cards::tag_summary(&db, ProfileId(DEFAULT_PROFILE), &lang).await?;
+            let summary =
+                repo::cards::tag_summary(&db, ProfileId(DEFAULT_PROFILE), &lang, 0).await?;
             if summary.is_empty() {
                 println!("字典裡沒有任何標籤。ECDICT 才有考試範圍標籤。");
             }

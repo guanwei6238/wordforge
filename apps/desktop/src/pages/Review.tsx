@@ -7,9 +7,12 @@ import {
   RATING,
   type Rating,
   reviewCard,
+  type QueueStatus,
+  queueStatus,
   type StudyStats,
   studyStats,
 } from "../api";
+import QueueEmpty from "../components/QueueEmpty";
 import SpeakButton from "../components/SpeakButton";
 
 /**
@@ -21,6 +24,7 @@ import SpeakButton from "../components/SpeakButton";
 export default function Review() {
   const [queue, setQueue] = useState<CardView[]>([]);
   const [stats, setStats] = useState<StudyStats | null>(null);
+  const [status, setStatus] = useState<QueueStatus | null>(null);
   const [revealed, setRevealed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -29,9 +33,10 @@ export default function Review() {
 
   const refresh = useCallback(async () => {
     try {
-      const [cards, s] = await Promise.all([listDueCards(), studyStats()]);
+      const [cards, s, q] = await Promise.all([listDueCards(), studyStats(), queueStatus()]);
       setQueue(cards);
       setStats(s);
+      setStatus(q);
       setError(null);
     } catch (e) {
       setError(errorMessage(e));
@@ -148,15 +153,9 @@ export default function Review() {
             </button>
           )}
         </section>
-      ) : (
-        <section className="done">
-          <p>今天的份做完了 🎉</p>
-          <p className="muted">
-            每天固定引入少量新字才記得住。明天再回來，
-            或到「牌組」頁把更多範圍排進來。
-          </p>
-        </section>
-      )}
+      ) : status ? (
+        <QueueEmpty status={status} onResume={refresh} />
+      ) : null}
 
       <form className="add-word" onSubmit={onAddWord}>
         <input

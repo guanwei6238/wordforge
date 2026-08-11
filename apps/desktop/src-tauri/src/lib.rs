@@ -136,8 +136,16 @@ async fn list_due_cards(
     )
     .await?;
 
-    let mut views = Vec::with_capacity(due.len());
-    for card in due {
+    to_card_views(&state.db, due).await
+}
+
+/// 把卡片補上顯示所需的字義與發音。
+async fn to_card_views(
+    db: &Db,
+    cards: Vec<wordforge_core::model::Card>,
+) -> CmdResult<Vec<CardView>> {
+    let mut views = Vec::with_capacity(cards.len());
+    for card in cards {
         // 一張卡一次查詢；卡數上限是使用者設定的每日量（數十到數百），可接受。
         // 若日後成為瓶頸，改成一次 JOIN 撈回來即可。
         // 發音要跨「同一個字的所有詞條」找：卡片指向 ECDICT 建的 lemma，
@@ -159,7 +167,7 @@ async fn list_due_cards(
                  FROM lemma l WHERE l.id = ?1",
             )
             .bind(card.lemma_id.0)
-            .fetch_optional(state.db.pool())
+            .fetch_optional(db.pool())
             .await?;
 
         let (word, gloss, translation, ipa, audio_path) =
@@ -287,6 +295,83 @@ async fn study_stats(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdR
     })
 }
 
+/// 佇列狀態。「沒有卡片可做」有好幾種原因，UI 要分得出來。
+#[derive(Debug, Serialize)]
+pub struct QueueStatusView {
+    pub due_reviews: i64,
+    pub new_today: i64,
+    pub new_in_deck: i64,
+    pub suspended: i64,
+    /// 下一張卡到期的時間（RFC 3339），沒有就是 null
+    pub next_due: Option<String>,
+    /// 每日新卡上限，讓 UI 說得出「今天的 15 張已經學完」
+    pub new_per_day: i64,
+}
+
+#[tauri::command]
+async fn queue_status(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<QueueStatusView> {
+    let now = OffsetDateTime::now_utc();
+    let s = cards::queue_status(
+        &state.db,
+        ProfileId(profile_id),
+        now,
+        day_start(now),
+        NEW_CARDS_PER_DAY,
+    )
+    .await?;
+
+    Ok(QueueStatusView {
+        due_reviews: s.due_reviews,
+        new_today: s.new_today,
+        new_in_deck: s.new_in_deck,
+        suspended: s.suspended,
+        next_due: s.next_due.and_then(|d| {
+            d.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        }),
+        new_per_day: NEW_CARDS_PER_DAY,
+    })
+}
+
+/// 超出每日上限再多學幾個新字。
+///
+/// 每日上限是為了讓學習可持續，但今天特別有空的時候不該被擋住——
+/// 這是使用者自己的選擇，不是系統該替他決定的事。
+#[tauri::command]
+async fn study_more(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    extra: i64,
+) -> CmdResult<Vec<CardView>> {
+    let now = OffsetDateTime::now_utc();
+    let introduced =
+        cards::new_cards_introduced_today(&state.db, ProfileId(profile_id), day_start(now)).await?;
+
+    let cards = cards::daily_queue(
+        &state.db,
+        ProfileId(profile_id),
+        now,
+        day_start(now),
+        introduced + extra.max(0),
+        MAX_REVIEWS_PER_DAY,
+    )
+    .await?;
+    to_card_views(&state.db, cards).await
+}
+
+/// 恢復被分級測驗收起來的卡。
+#[tauri::command]
+async fn unsuspend_cards(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    count: i64,
+) -> CmdResult<u64> {
+    Ok(cards::unsuspend(&state.db, ProfileId(profile_id), count).await?)
+}
+
 // ---------------------------------------------------------------- 查字典
 
 #[tauri::command]
@@ -365,7 +450,9 @@ async fn deck_tags(
     profile_id: i64,
     lang: String,
 ) -> CmdResult<Vec<TagSummary>> {
-    let rows = cards::tag_summary(&state.db, ProfileId(profile_id), &lang).await?;
+    // 扣掉分級測驗判定「已經會了」的字，顯示的數字才是真正能加的
+    let min_rank = start_rank(&state.db, profile_id).await?;
+    let rows = cards::tag_summary(&state.db, ProfileId(profile_id), &lang, min_rank).await?;
     Ok(rows
         .into_iter()
         .map(|(tag, total, in_deck)| TagSummary {
@@ -722,6 +809,9 @@ pub fn run() {
             review_card,
             add_word,
             study_stats,
+            queue_status,
+            study_more,
+            unsuspend_cards,
             search_words,
             word_detail,
             dictionary_stats,

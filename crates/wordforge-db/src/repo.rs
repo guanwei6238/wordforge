@@ -540,6 +540,99 @@ pub mod cards {
         Ok(queue)
     }
 
+    /// 佇列的完整狀態。
+    ///
+    /// 「沒有卡片可做」有好幾種原因，UI 必須分得出來，否則使用者只會看到
+    /// 「今天的份做完了」而不知道其實整個牌組被收起來了。
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct QueueStatus {
+        /// 現在到期的複習卡
+        pub due_reviews: i64,
+        /// 今天還能引入幾張新卡（受每日上限限制）
+        pub new_today: i64,
+        /// 牌組裡還有幾張沒學過的新卡（不受每日上限限制，不含被收起的）
+        pub new_in_deck: i64,
+        /// 被收起來的卡（多半來自分級測驗判定「太簡單」）
+        pub suspended: i64,
+        /// 之後還有卡片要複習時，最近的一張是什麼時候
+        pub next_due: Option<OffsetDateTime>,
+    }
+
+    pub async fn queue_status(
+        db: &Db,
+        profile_id: ProfileId,
+        now: OffsetDateTime,
+        day_start: OffsetDateTime,
+        new_per_day: i64,
+    ) -> Result<QueueStatus> {
+        let now_sql = ts::to_sql(now);
+
+        let due_reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM card
+             WHERE profile_id = ? AND suspended = 0 AND state <> 'new' AND due <= ?",
+        )
+        .bind(profile_id.0)
+        .bind(&now_sql)
+        .fetch_one(db.pool())
+        .await?;
+
+        let new_in_deck: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM card
+             WHERE profile_id = ? AND suspended = 0 AND state = 'new'",
+        )
+        .bind(profile_id.0)
+        .fetch_one(db.pool())
+        .await?;
+
+        let suspended: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM card WHERE profile_id = ? AND suspended = 1")
+                .bind(profile_id.0)
+                .fetch_one(db.pool())
+                .await?;
+
+        let introduced = new_cards_introduced_today(db, profile_id, day_start).await?;
+        let new_today = (new_per_day - introduced).max(0).min(new_in_deck);
+
+        let next_due: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(due) FROM card
+             WHERE profile_id = ? AND suspended = 0 AND state <> 'new' AND due > ?",
+        )
+        .bind(profile_id.0)
+        .bind(&now_sql)
+        .fetch_one(db.pool())
+        .await?;
+
+        Ok(QueueStatus {
+            due_reviews,
+            new_today,
+            new_in_deck,
+            suspended,
+            next_due: next_due.map(|s| s.parse_ts("card.due")).transpose()?,
+        })
+    }
+
+    /// 恢復被收起來的卡，最常用的字優先。
+    ///
+    /// 分級測驗的判斷可能不準，或者使用者就是想把那些字也複習一遍。
+    /// 卡片當初只是暫停沒有刪除，所以恢復後進度完好。
+    pub async fn unsuspend(db: &Db, profile_id: ProfileId, count: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE card SET suspended = 0
+             WHERE id IN (
+                 SELECT c.id FROM card c
+                   JOIN lemma l ON l.id = c.lemma_id
+                 WHERE c.profile_id = ? AND c.suspended = 1
+                 ORDER BY l.freq_rank IS NULL, l.freq_rank, c.id
+                 LIMIT ?
+             )",
+        )
+        .bind(profile_id.0)
+        .bind(count)
+        .execute(db.pool())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// 今天的待辦數量：到期複習幾張、還能引入幾張新卡。
     pub async fn daily_counts(
         db: &Db,
@@ -572,10 +665,14 @@ pub mod cards {
     }
 
     /// 每個標籤有幾個字、其中幾個已經在牌組裡。
+    ///
+    /// `min_freq_rank` 是分級測驗給的起點：比這更常用的字不列入計算，
+    /// 否則牌組頁顯示「國中 1603 字」但實際只能加 870 個，數字對不起來。
     pub async fn tag_summary(
         db: &Db,
         profile_id: ProfileId,
         lang: &str,
+        min_freq_rank: i64,
     ) -> Result<Vec<(String, i64, i64)>> {
         // 標籤是空白分隔的字串，SQLite 沒有 split，所以在 Rust 端展開。
         // 標籤種類只有十幾種，詞條數才是大的那一邊，撈回來的資料量不大。
@@ -586,10 +683,12 @@ pub mod cards {
                                 WHERE c.lemma_id = l.id AND c.profile_id = ?)) AS in_deck
              FROM lemma l
              WHERE l.lang = ? AND l.tags <> ''
+               AND (l.freq_rank IS NULL OR l.freq_rank >= ?)
              GROUP BY l.tags",
         )
         .bind(profile_id.0)
         .bind(lang)
+        .bind(min_freq_rank)
         .fetch_all(db.pool())
         .await?;
 
@@ -1170,7 +1269,7 @@ mod tests {
         .await
         .unwrap();
 
-        let summary = cards::tag_summary(&db, profile, "en").await.unwrap();
+        let summary = cards::tag_summary(&db, profile, "en", 0).await.unwrap();
         let zk = summary.iter().find(|(t, ..)| t == "zk").unwrap();
         let gk = summary.iter().find(|(t, ..)| t == "gk").unwrap();
 
@@ -1309,6 +1408,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_today, 3);
+    }
+
+    /// 佇列空掉的原因必須分得出來。
+    ///
+    /// 實際踩過：分級測驗把整個牌組收起來之後，UI 只說「今天的份做完了」，
+    /// 使用者以為是自己學完了，其實是 296 張卡全被暫停。
+    #[tokio::test]
+    async fn queue_status_tells_apart_the_reasons_for_an_empty_queue() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 30).await;
+
+        // 一、什麼都還沒做：有新卡可學
+        let s = cards::queue_status(&db, profile, t0(), t0(), 15)
+            .await
+            .unwrap();
+        assert_eq!(s.new_today, 15);
+        assert_eq!(s.new_in_deck, 30);
+        assert_eq!(s.suspended, 0);
+        assert_eq!(s.next_due, None);
+
+        // 二、今天的額度用完，但牌組裡還有字 → 這才是「做完了」
+        let scheduler = Scheduler::default();
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 15, 200)
+            .await
+            .unwrap();
+        for card in &queue {
+            let (next, log) = scheduler.review(card, Rating::Easy, t0(), None);
+            cards::record_review(&db, &next, &log).await.unwrap();
+        }
+        let s = cards::queue_status(&db, profile, t0(), t0(), 15)
+            .await
+            .unwrap();
+        assert_eq!(s.new_today, 0, "今天的額度用完了");
+        assert_eq!(s.new_in_deck, 15, "但牌組裡還有 15 個字在排隊");
+        assert!(s.next_due.is_some(), "已學的卡有下次到期時間");
+
+        // 三、剩下的新卡全被收起來 → 不是「做完了」，是沒東西可做
+        cards::suspend_easy_new_cards(&db, profile, "en", 100_000)
+            .await
+            .unwrap();
+        let s = cards::queue_status(&db, profile, t0(), t0(), 15)
+            .await
+            .unwrap();
+        assert_eq!(s.new_in_deck, 0);
+        assert_eq!(s.suspended, 15);
+    }
+
+    /// 被收起來的卡要能恢復，而且從最常用的開始。
+    #[tokio::test]
+    async fn unsuspend_brings_back_the_most_useful_words_first() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 20).await;
+        cards::suspend_easy_new_cards(&db, profile, "en", 100_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            cards::queue_status(&db, profile, t0(), t0(), 15)
+                .await
+                .unwrap()
+                .suspended,
+            20
+        );
+
+        let restored = cards::unsuspend(&db, profile, 5).await.unwrap();
+        assert_eq!(restored, 5);
+
+        // 恢復的應該是詞頻 1~5（seed 依序給 freq_rank 1..n）
+        let words: Vec<String> = sqlx::query_scalar(
+            "SELECT l.text FROM card c JOIN lemma l ON l.id = c.lemma_id
+             WHERE c.suspended = 0 ORDER BY l.freq_rank",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(words, vec!["w0001", "w0002", "w0003", "w0004", "w0005"]);
+
+        // 恢復後就能正常排進佇列
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 15, 200)
+            .await
+            .unwrap();
+        assert_eq!(queue.len(), 5);
+    }
+
+    /// 超出每日上限繼續學：今天已引入的數量要算進去，不能重頭來過。
+    #[tokio::test]
+    async fn studying_more_extends_todays_quota() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 50).await;
+        let scheduler = Scheduler::default();
+
+        let first = cards::daily_queue(&db, profile, t0(), t0(), 15, 200)
+            .await
+            .unwrap();
+        for card in &first {
+            let (next, log) = scheduler.review(card, Rating::Easy, t0(), None);
+            cards::record_review(&db, &next, &log).await.unwrap();
+        }
+
+        let introduced = cards::new_cards_introduced_today(&db, profile, t0())
+            .await
+            .unwrap();
+        assert_eq!(introduced, 15);
+
+        // 「再學 10 個」＝ 上限提高到 15 + 10
+        let more = cards::daily_queue(&db, profile, t0(), t0(), introduced + 10, 200)
+            .await
+            .unwrap();
+        let new_ones = more.iter().filter(|c| c.state == CardState::New).count();
+        assert_eq!(new_ones, 10, "應該剛好多給 10 張，不是重新給 25 張");
     }
 
     #[tokio::test]
