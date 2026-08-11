@@ -37,6 +37,21 @@ fn day_start(now: OffsetDateTime) -> OffsetDateTime {
     now.replace_time(time::Time::MIDNIGHT)
 }
 
+/// 今天的日期字串，用來判斷「額外額度」是不是今天給的。
+fn today_key(now: OffsetDateTime) -> String {
+    now.date().to_string()
+}
+
+/// 今天實際可以引入幾張新卡 = 每日上限 + 使用者今天自己加開的額度。
+///
+/// 這個額度必須存起來，不能只存在某一次回應裡：
+/// 取佇列、送出評分、算統計是三個獨立的查詢，
+/// 只要有一個還用預設上限，「再學 10 個」就會在下一次重新整理時消失。
+async fn todays_new_limit(db: &Db, profile_id: i64, now: OffsetDateTime) -> CmdResult<i64> {
+    let extra = profiles::extra_new_today(db, ProfileId(profile_id), &today_key(now)).await?;
+    Ok(NEW_CARDS_PER_DAY + extra)
+}
+
 pub struct AppState {
     db: Db,
     scheduler: Arc<Scheduler>,
@@ -134,7 +149,7 @@ async fn list_due_cards(
         ProfileId(profile_id),
         now,
         day_start(now),
-        NEW_CARDS_PER_DAY,
+        todays_new_limit(&state.db, profile_id, now).await?,
         limit.min(MAX_REVIEWS_PER_DAY),
     )
     .await?;
@@ -207,7 +222,7 @@ async fn review_card(
         ProfileId(profile_id),
         now,
         day_start(now),
-        NEW_CARDS_PER_DAY,
+        todays_new_limit(&state.db, profile_id, now).await?,
         MAX_REVIEWS_PER_DAY,
     )
     .await?;
@@ -269,7 +284,7 @@ async fn study_stats(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdR
         ProfileId(profile_id),
         now,
         day_start(now),
-        NEW_CARDS_PER_DAY,
+        todays_new_limit(&state.db, profile_id, now).await?,
     )
     .await?;
     let known: std::collections::HashSet<LemmaId> =
@@ -319,12 +334,13 @@ async fn queue_status(
     refill_deck(&state, profile_id, "en").await?;
 
     let now = OffsetDateTime::now_utc();
+    let new_per_day = todays_new_limit(&state.db, profile_id, now).await?;
     let s = cards::queue_status(
         &state.db,
         ProfileId(profile_id),
         now,
         day_start(now),
-        NEW_CARDS_PER_DAY,
+        new_per_day,
     )
     .await?;
 
@@ -337,7 +353,7 @@ async fn queue_status(
             d.format(&time::format_description::well_known::Rfc3339)
                 .ok()
         }),
-        new_per_day: NEW_CARDS_PER_DAY,
+        new_per_day,
     })
 }
 
@@ -352,15 +368,20 @@ async fn study_more(
     extra: i64,
 ) -> CmdResult<Vec<CardView>> {
     let now = OffsetDateTime::now_utc();
-    let introduced =
-        cards::new_cards_introduced_today(&state.db, ProfileId(profile_id), day_start(now)).await?;
+    let extra = extra.clamp(0, 500);
+
+    // 累加到今天的額度上並存起來。前端接著會重新取佇列，
+    // 那個查詢也讀同一個設定，兩邊才會一致。
+    let total_extra =
+        profiles::add_extra_new_today(&state.db, ProfileId(profile_id), &today_key(now), extra)
+            .await?;
 
     let cards = cards::daily_queue(
         &state.db,
         ProfileId(profile_id),
         now,
         day_start(now),
-        introduced + extra.max(0),
+        NEW_CARDS_PER_DAY + total_extra,
         MAX_REVIEWS_PER_DAY,
     )
     .await?;

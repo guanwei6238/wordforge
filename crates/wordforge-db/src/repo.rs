@@ -73,6 +73,50 @@ pub mod profiles {
         Ok(ProfileId(id))
     }
 
+    /// 今天額外加開的新卡額度。
+    ///
+    /// 存成 `{"extra_new": {"date": "2026-08-11", "count": 10}}`：
+    /// 帶著日期才能在隔天自動失效。只存數字的話，今天多學 30 個，
+    /// 之後每天都會變成 45 張。
+    pub async fn extra_new_today(db: &Db, profile_id: ProfileId, today: &str) -> Result<i64> {
+        let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT json_extract(settings_json, '$.extra_new.date'),
+                    CAST(json_extract(settings_json, '$.extra_new.count') AS INTEGER)
+             FROM profile WHERE id = ? AND json_valid(settings_json)",
+        )
+        .bind(profile_id.0)
+        .fetch_optional(db.pool())
+        .await?;
+
+        Ok(match row {
+            Some((Some(date), Some(count))) if date == today => count.max(0),
+            _ => 0,
+        })
+    }
+
+    /// 加開額度，回傳今天累計加開了多少。
+    pub async fn add_extra_new_today(
+        db: &Db,
+        profile_id: ProfileId,
+        today: &str,
+        extra: i64,
+    ) -> Result<i64> {
+        let total = extra_new_today(db, profile_id, today).await? + extra.max(0);
+        sqlx::query(
+            "UPDATE profile
+             SET settings_json = json_set(
+                     CASE WHEN json_valid(settings_json) THEN settings_json ELSE '{}' END,
+                     '$.extra_new', json_object('date', ?, 'count', ?))
+             WHERE id = ?",
+        )
+        .bind(today)
+        .bind(total)
+        .bind(profile_id.0)
+        .execute(db.pool())
+        .await?;
+        Ok(total)
+    }
+
     pub async fn list(db: &Db) -> Result<Vec<(ProfileId, String)>> {
         let rows = sqlx::query("SELECT id, name FROM profile ORDER BY id")
             .fetch_all(db.pool())
@@ -1489,6 +1533,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_today, 3);
+    }
+
+    /// 「再學 10 個」必須留得住，而且隔天要自動回到預設。
+    ///
+    /// 實際踩過：額度只存在單次回應裡，前端接著重新取佇列時又回到每日上限 15，
+    /// 而今天已經學滿 15 張，於是按了「再學 10 個」只跳出一張到期的舊卡。
+    #[tokio::test]
+    async fn extra_quota_persists_today_and_resets_tomorrow() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 100).await;
+
+        assert_eq!(
+            profiles::extra_new_today(&db, profile, "2026-08-11")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // 加開兩次，要累加而不是覆蓋
+        profiles::add_extra_new_today(&db, profile, "2026-08-11", 10)
+            .await
+            .unwrap();
+        let total = profiles::add_extra_new_today(&db, profile, "2026-08-11", 30)
+            .await
+            .unwrap();
+        assert_eq!(total, 40);
+
+        // 再讀一次還在（不是只存在於某一次回應裡）
+        assert_eq!(
+            profiles::extra_new_today(&db, profile, "2026-08-11")
+                .await
+                .unwrap(),
+            40
+        );
+
+        // 隔天自動失效，否則今天多學 30 個會讓之後每天都是 45 張
+        assert_eq!(
+            profiles::extra_new_today(&db, profile, "2026-08-12")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // 額度確實反映在佇列上
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 15 + 40, 200)
+            .await
+            .unwrap();
+        assert_eq!(queue.len(), 55);
+    }
+
+    /// 設定檔壞掉或還沒有任何設定時，不能讓整個佇列查詢失敗。
+    #[tokio::test]
+    async fn broken_settings_fall_back_to_no_extra_quota() {
+        let (db, profile) = setup().await;
+        sqlx::query("UPDATE profile SET settings_json = 'not json' WHERE id = ?")
+            .bind(profile.0)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            profiles::extra_new_today(&db, profile, "2026-08-11")
+                .await
+                .unwrap(),
+            0
+        );
+        // 寫入時會把壞掉的內容換成合法 JSON
+        assert_eq!(
+            profiles::add_extra_new_today(&db, profile, "2026-08-11", 5)
+                .await
+                .unwrap(),
+            5
+        );
     }
 
     /// 佇列空掉的原因必須分得出來。
