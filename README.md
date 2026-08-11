@@ -28,8 +28,10 @@ Wordforge 把它們接成一條線：
 ### 設計原則
 
 1. **離線優先**：字典、單字庫、複習排程、發音全部在本機 SQLite + 本地檔案。沒有網路也能背單字。
-2. **LLM 可插拔**：AI 功能需要模型，你可以填自己的 API key（Anthropic / OpenAI 相容端點），
-   或接本機 [Ollama](https://ollama.com) 完全離線。**沒有 LLM 時 App 仍然可用**，只是少了生成類功能。
+2. **LLM 可插拔**：AI 功能需要模型，有四種接法——直接用本機已登入的
+   `claude -p` / `codex exec`（**不必為同一個模型再開一份 API 帳單**）、
+   填自己的 API key、或接本機 [Ollama](https://ollama.com) 完全離線。
+   **沒有 LLM 時 App 仍然可用**，只是少了生成類功能。
 3. **不綁架資料**：所有資料都在一個 SQLite 檔案裡，可匯出成 Anki `.apkg` / CSV，隨時搬走。
 4. **尊重授權**：專案本身不散布任何有版權的字典內容，詳見下方說明。
 
@@ -143,8 +145,9 @@ curl -LO https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv
 
 ## 專案狀態
 
-🚧 **v0.2 開發中** — 已經可以匯入字典、查字典、用 FSRS 背單字。
-AI 出題（v0.3）尚未接上。路線圖見 [`docs/roadmap.md`](docs/roadmap.md)，歡迎在 Issues 討論。
+🚧 **v0.3 開發中** — 匯入字典、查字典、FSRS 背單字、分級測驗、真人發音都能用了。
+AI 出題（翻譯 / 閱讀 / 文法）已接上：依詞彙量選題型，**批改後會把你不會的字
+自動排進複習**。路線圖見 [`docs/roadmap.md`](docs/roadmap.md)，歡迎在 Issues 討論。
 
 第一次使用：到「匯入」頁載入一份 [kaikki.org](https://kaikki.org/) 的 Wiktionary JSONL
 或你自己的 CSV 單字表，就可以開始查字典與背單字。

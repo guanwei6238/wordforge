@@ -417,3 +417,158 @@ export const IMPORT_EVENTS = {
   done: "import://done",
   error: "import://error",
 } as const;
+
+/* ------------------------------------------------------------------ AI 練習 */
+
+export type Backend = "none" | "cli" | "api";
+export type CliPreset = "claude_code" | "codex" | "custom";
+
+export interface CliConfig {
+  preset: CliPreset;
+  program: string;
+  args: string[];
+  system_flag: string | null;
+  model: string;
+  timeout_secs: number;
+}
+
+export interface ApiSettings {
+  provider: "anthropic" | "open_ai_compatible" | "ollama";
+  model: string;
+  base_url: string | null;
+  /** 讀出來永遠是空字串；要保留現有的 key 就別動它 */
+  api_key: string;
+  has_api_key?: boolean;
+}
+
+export interface LlmSettings {
+  backend: Backend;
+  cli: CliConfig;
+  api: ApiSettings;
+}
+
+export function getLlmSettings(): Promise<LlmSettings> {
+  return invoke("get_llm_settings");
+}
+
+export function updateLlmSettings(settings: LlmSettings): Promise<LlmSettings> {
+  return invoke("update_llm_settings", { settings });
+}
+
+/** 送一個極短的 prompt 確認後端真的能用 */
+export function testLlm(): Promise<string> {
+  return invoke("test_llm");
+}
+
+export type ExerciseKind =
+  | "translation_to_target"
+  | "translation_to_native"
+  | "cloze"
+  | "reading"
+  | "grammar";
+
+export const EXERCISE_LABELS: Record<ExerciseKind, string> = {
+  translation_to_native: "英翻中",
+  translation_to_target: "中翻英",
+  cloze: "克漏字",
+  grammar: "文法練習",
+  reading: "閱讀測驗",
+};
+
+export interface PracticeStatus {
+  llm_ready: boolean;
+  vocabulary: number;
+  weak_grammar: string[];
+  recommended: ExerciseKind;
+  /** [題型, 需要的最低詞彙量] */
+  requirements: [ExerciseKind, number][];
+}
+
+export interface TranslationItem {
+  source: string;
+  target_word: string | null;
+  reference: string | null;
+}
+
+export interface ChoiceItem {
+  question: string;
+  options: string[];
+  answer_index: number;
+  explanation: string | null;
+  grammar_point: string | null;
+}
+
+export interface NewWordHint {
+  word: string;
+  gloss: string | null;
+}
+
+export type ExerciseBody =
+  | { kind: "translation"; to_target: boolean; items: TranslationItem[] }
+  | {
+      kind: "reading";
+      title: string;
+      passage: string;
+      new_words: NewWordHint[];
+      questions: ChoiceItem[];
+    }
+  | { kind: "choices"; items: ChoiceItem[] };
+
+export interface ExerciseView {
+  exercise_id: number;
+  kind: ExerciseKind;
+  body: ExerciseBody;
+  target_words: string[];
+  coverage: number | null;
+}
+
+export interface ItemResult {
+  index: number;
+  correct: boolean;
+  reference: string | null;
+  comment: string | null;
+}
+
+export interface Correction {
+  original: string;
+  corrected: string;
+  grammar_point: string | null;
+  severity: string | null;
+  explanation: string | null;
+}
+
+export interface Feedback {
+  score: number | null;
+  items: ItemResult[];
+  corrections: Correction[];
+  /** LLM 判斷你不懂的字 */
+  unknown_words: string[];
+  /** 實際加進牌組的（字典查得到、還沒學過的） */
+  added_to_deck: string[];
+}
+
+export interface GradeInput {
+  exercise_id: number;
+  answers: string[];
+  choices: (number | null)[];
+  /** 你自己點「這個字我不會」 */
+  marked_unknown: string[];
+}
+
+export function practiceStatus(profileId = DEFAULT_PROFILE_ID): Promise<PracticeStatus> {
+  return invoke("practice_status", { profileId });
+}
+
+export function generateExercise(
+  kind: ExerciseKind | "auto" = "auto",
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<ExerciseView> {
+  return invoke("generate_exercise", { profileId, kind });
+}
+
+export function gradeExercise(
+  input: GradeInput,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<Feedback> {
+  return invoke("grade_exercise", { profileId, input });
+}

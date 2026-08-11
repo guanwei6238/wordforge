@@ -621,3 +621,120 @@ button.link {
   margin: 0;
   padding-left: 0.1rem;
 }
+
+/* ---------------------------------------------------------------- AI 練習 */
+
+.practice {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.exercise .question,
+.questions li {
+  margin-bottom: 1.25rem;
+}
+
+.prompt {
+  margin: 0 0 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.exercise .question input {
+  width: 100%;
+  font: inherit;
+  padding: 0.5rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* 文章要好讀：行高放寬、字級略大 */
+.passage {
+  font-size: 1.05rem;
+  line-height: 1.9;
+  margin: 0.5rem 0 1rem;
+}
+
+/* 點任何一個字都能標記「我不會」 */
+.word {
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+.word:hover {
+  background: var(--border);
+}
+
+.word.marked {
+  background: var(--accent);
+  color: var(--surface);
+}
+
+.new-words {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+}
+
+.questions {
+  padding-left: 1.2rem;
+}
+
+.options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.option.right {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.corrections {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.corrections .wrong {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.corrections .right {
+  color: var(--accent);
+}
+
+.corrections p {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+}
+
+.score {
+  font-size: 1rem;
+  color: var(--accent);
+}

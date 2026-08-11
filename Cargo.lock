@@ -6091,6 +6091,7 @@ dependencies = [
  "wordforge-dict",
  "wordforge-import",
  "wordforge-llm",
+ "wordforge-practice",
  "wordforge-tts",
 ]
 

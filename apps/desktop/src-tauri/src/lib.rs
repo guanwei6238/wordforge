@@ -3,6 +3,8 @@
 //! 這一層刻意只做三件事：組裝依賴、轉換型別、把錯誤變成前端看得懂的字串。
 //! 任何演算法都不該寫在這裡。
 
+mod llm_settings;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +20,9 @@ use wordforge_db::dict::PlacementItem;
 use wordforge_db::dict::{DictStats, SearchHit, WordDetail};
 use wordforge_db::repo::{cards, lemmas, profiles};
 use wordforge_import::{FreqFormat, ImportOptions, ImportProgress, ProgressSink};
+use wordforge_practice::{ExerciseView, Feedback, GradeInput, PracticeEngine};
+
+use llm_settings::LlmSettings;
 
 /// 「算是會了」的 stability 門檻（天）。撐得過三週不複習才計入詞彙量。
 const KNOWN_STABILITY_DAYS: f64 = 21.0;
@@ -117,6 +122,7 @@ from_error!(
     wordforge_db::DbError,
     wordforge_dict::DictError,
     wordforge_import::ImportError,
+    wordforge_practice::PracticeError,
     wordforge_llm::LlmError,
     sqlx::Error,
     std::io::Error,
@@ -757,6 +763,172 @@ async fn start_rank(db: &Db, profile_id: i64) -> CmdResult<i64> {
     Ok(rank.unwrap_or(0))
 }
 
+// ---------------------------------------------------------------- AI 練習
+
+/// LLM 設定檔放在 app 資料目錄，不進資料庫。
+fn settings_dir(app: &AppHandle) -> CmdResult<PathBuf> {
+    Ok(app.path().app_data_dir()?)
+}
+
+#[tauri::command]
+fn get_llm_settings(app: AppHandle) -> CmdResult<serde_json::Value> {
+    Ok(LlmSettings::load(&settings_dir(&app)?).redacted())
+}
+
+/// 儲存 LLM 設定。
+///
+/// `api_key` 留空代表「不要動現有的」——前端拿到的是遮罩過的值，
+/// 直接存回來會把真正的 key 洗掉。
+#[tauri::command]
+fn update_llm_settings(app: AppHandle, mut settings: LlmSettings) -> CmdResult<serde_json::Value> {
+    let dir = settings_dir(&app)?;
+    let existing = LlmSettings::load(&dir);
+
+    if let Some(api) = settings.api.as_mut()
+        && api.api_key.is_empty()
+        && let Some(old) = existing.api.as_ref()
+    {
+        api.api_key = old.api_key.clone();
+    }
+
+    settings.save(&dir)?;
+    Ok(settings.redacted())
+}
+
+/// 送一個極短的 prompt 確認後端真的能用。
+///
+/// 設定錯了要在這裡發現，而不是等使用者做完一整題才失敗。
+#[tauri::command]
+async fn test_llm(app: AppHandle) -> CmdResult<String> {
+    let settings = LlmSettings::load(&settings_dir(&app)?);
+    let Some(llm) = settings.build()? else {
+        return Err(CommandError::new("還沒有設定 AI 後端"));
+    };
+
+    let req = wordforge_llm::ChatRequest {
+        system: Some("你只輸出 JSON，不輸出任何其他文字。".into()),
+        messages: vec![wordforge_llm::Message::user(
+            r#"只輸出這個 JSON：{"ok": true}"#,
+        )],
+        json_only: true,
+    };
+
+    let resp = llm.chat(&req).await?;
+    let value = resp
+        .json()
+        .map_err(|e| CommandError::new(format!("後端有回應，但格式看不懂：{e}")))?;
+
+    if value.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(format!("連線正常（{}）", llm.model()))
+    } else {
+        Err(CommandError::new(format!(
+            "後端回了東西但內容不對：{value}"
+        )))
+    }
+}
+
+/// 目前能不能出題，以及會出什麼樣的題。
+#[derive(Debug, Serialize)]
+pub struct PracticeStatus {
+    pub llm_ready: bool,
+    pub vocabulary: i64,
+    pub weak_grammar: Vec<String>,
+    /// 依現在的程度，系統會出哪種題
+    pub recommended: String,
+    /// 每種題型需要的最低詞彙量，讓 UI 說得出「再多學 N 個字就能做閱讀測驗」
+    pub requirements: Vec<(String, i64)>,
+}
+
+#[tauri::command]
+async fn practice_status(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<PracticeStatus> {
+    use wordforge_core::practice::ExerciseKind::*;
+
+    let settings = LlmSettings::load(&settings_dir(&app)?);
+    let llm_ready = settings.build().map(|p| p.is_some()).unwrap_or(false);
+
+    // 沒有 LLM 也要能顯示程度，讓使用者知道設定完會拿到什麼
+    let dummy = wordforge_llm::CliLlm::new(wordforge_llm::CliConfig::claude_code())
+        .map_err(|e| CommandError::new(e.to_string()))?;
+    let engine = PracticeEngine::new(&state.db, &dummy);
+    let learner = engine.learner_profile(profile_id).await?;
+
+    Ok(PracticeStatus {
+        llm_ready,
+        vocabulary: learner.vocabulary,
+        weak_grammar: learner.weak_grammar.clone(),
+        recommended: wordforge_core::practice::recommend_kind(&learner)
+            .as_str()
+            .to_string(),
+        requirements: [
+            TranslationToNative,
+            TranslationToTarget,
+            Cloze,
+            Grammar,
+            Reading,
+        ]
+        .into_iter()
+        .map(|k| (k.as_str().to_string(), k.min_vocabulary()))
+        .collect(),
+    })
+}
+
+#[tauri::command]
+async fn generate_exercise(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    kind: Option<String>,
+) -> CmdResult<ExerciseView> {
+    let settings = LlmSettings::load(&settings_dir(&app)?);
+    let llm = settings
+        .build()?
+        .ok_or_else(|| CommandError::new("還沒有設定 AI 後端，請先到設定頁選一個"))?;
+
+    let kind = match kind.as_deref() {
+        None | Some("") | Some("auto") => None,
+        Some(k) => Some(parse_exercise_kind(k)?),
+    };
+
+    let engine = PracticeEngine::new(&state.db, llm.as_ref());
+    Ok(engine
+        .generate(profile_id, kind, OffsetDateTime::now_utc())
+        .await?)
+}
+
+#[tauri::command]
+async fn grade_exercise(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    input: GradeInput,
+) -> CmdResult<Feedback> {
+    let settings = LlmSettings::load(&settings_dir(&app)?);
+    let llm = settings
+        .build()?
+        .ok_or_else(|| CommandError::new("還沒有設定 AI 後端"))?;
+
+    let engine = PracticeEngine::new(&state.db, llm.as_ref());
+    Ok(engine
+        .grade(profile_id, &input, OffsetDateTime::now_utc())
+        .await?)
+}
+
+fn parse_exercise_kind(s: &str) -> CmdResult<wordforge_core::practice::ExerciseKind> {
+    use wordforge_core::practice::ExerciseKind::*;
+    Ok(match s {
+        "translation_to_target" => TranslationToTarget,
+        "translation_to_native" => TranslationToNative,
+        "cloze" => Cloze,
+        "reading" => Reading,
+        "grammar" => Grammar,
+        other => return Err(CommandError::new(format!("未知的題型：{other}"))),
+    })
+}
+
 // ---------------------------------------------------------------- 匯入
 
 /// 匯入的檔案格式。
@@ -943,6 +1115,12 @@ pub fn run() {
             get_refill_tag,
             get_study_settings,
             update_study_settings,
+            get_llm_settings,
+            update_llm_settings,
+            test_llm,
+            practice_status,
+            generate_exercise,
+            grade_exercise,
             search_words,
             word_detail,
             dictionary_stats,

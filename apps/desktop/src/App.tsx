@@ -2,12 +2,14 @@ import { useState } from "react";
 import Deck from "./pages/Deck";
 import Dictionary from "./pages/Dictionary";
 import Import from "./pages/Import";
+import Practice from "./pages/Practice";
 import Review from "./pages/Review";
 import Settings from "./pages/Settings";
 
 const TABS = [
   { id: "review", label: "複習" },
   { id: "dictionary", label: "字典" },
+  { id: "practice", label: "練習" },
   { id: "deck", label: "牌組" },
   { id: "import", label: "匯入" },
   { id: "settings", label: "設定" },
@@ -38,6 +40,7 @@ export default function App() {
       <main className="page">
         {tab === "review" && <Review />}
         {tab === "dictionary" && <Dictionary />}
+        {tab === "practice" && <Practice />}
         {tab === "deck" && <Deck />}
         {tab === "import" && <Import />}
         {tab === "settings" && <Settings />}
