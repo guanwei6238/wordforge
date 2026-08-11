@@ -5,6 +5,7 @@ import Import from "./pages/Import";
 import Practice from "./pages/Practice";
 import Review from "./pages/Review";
 import Settings from "./pages/Settings";
+import Welcome from "./components/Welcome";
 
 const TABS = [
   { id: "review", label: "複習" },
@@ -38,7 +39,13 @@ export default function App() {
       </header>
 
       <main className="page">
-        {tab === "review" && <Review />}
+        {/* 資料庫一個詞條都沒有時，複習頁換成引導——那是預設落點，
+            也是新使用者唯一會看到的地方 */}
+        {tab === "review" && (
+          <Welcome onGoImport={() => setTab("import")}>
+            <Review />
+          </Welcome>
+        )}
         {tab === "dictionary" && <Dictionary />}
         {tab === "practice" && <Practice />}
         {tab === "deck" && <Deck />}

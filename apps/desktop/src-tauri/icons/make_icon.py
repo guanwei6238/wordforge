@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""產生佔位用的應用程式圖示。
+"""畫出應用程式圖示：橘底白色的 W。
 
 Tauri 的 `generate_context!` 在編譯時就要讀到 `icons/icon.png`，
 所以 repo 裡必須有一張，不能等打包時才生。
 
-這支腳本只用標準函式庫寫 PNG，不需要 Pillow——為了一張佔位圖
-而讓所有貢獻者裝一個影像函式庫並不划算。
+這支腳本只用標準函式庫寫 PNG，不需要 Pillow——為了一張圖
+而讓所有貢獻者裝一個影像函式庫並不划算。原始檔是程式碼而不是
+二進位圖檔，改色或改字形就是改常數，git 歷史也不會塞滿圖片版本。
 
-有正式 logo 之後，改用官方工具產生各平台尺寸：
+改完之後要重跑一次官方工具，產生各平台尺寸：
 
-    cd apps/desktop && npx tauri icon path/to/logo.png
+    python3 make_icon.py icon.png
+    cd ../.. && npx tauri icon src-tauri/icons/icon.png
 
 用法：
-    python3 make_placeholder_icon.py [輸出路徑]
+    python3 make_icon.py [輸出路徑]
 """
 
 import math

@@ -101,7 +101,10 @@ export default function QueueEmpty({ status, onResume }: Props) {
       {deckEmpty && (
         <>
           <p>牌組是空的</p>
-          <p className="muted">到「牌組」頁選一個範圍加入單字，就可以開始了。</p>
+          <p className="muted">
+            到「牌組」頁選一個範圍加入單字，就可以開始了。
+            那一頁是空的話，代表字典還沒匯入——先去「匯入」頁載一份。
+          </p>
         </>
       )}
 

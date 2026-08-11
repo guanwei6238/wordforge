@@ -1,0 +1,97 @@
+name: Release
+
+# 推一個 v 開頭的 tag 就打包三個平台的安裝檔，放進一份草稿 release。
+#
+# 刻意是草稿而不是直接發布：安裝檔沒有簽章，發出去之前該自己下載跑一次，
+# 順便把 release notes 寫完。要發布時到 GitHub 上按一下即可。
+on:
+  push:
+    tags:
+      - "v*"
+  # 手動觸發用來驗證這份 workflow 本身還能跑，不必為了測試而發一個版本
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    strategy:
+      # 一個平台掛掉不要把其他平台的產物一起丟掉——那三十分鐘白跑了
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: ""
+            name: Linux
+          # macOS 分兩個架構：universal binary 會讓體積翻倍，
+          # 而下載的人知道自己用的是哪一台
+          - platform: macos-latest
+            target: --target aarch64-apple-darwin
+            name: macOS (Apple Silicon)
+          - platform: macos-latest
+            target: --target x86_64-apple-darwin
+            name: macOS (Intel)
+          - platform: windows-latest
+            target: ""
+            name: Windows
+
+    runs-on: ${{ matrix.platform }}
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安裝 Linux 系統依賴
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev \
+            patchelf libxdo-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # 交叉編譯 macOS 兩個架構需要兩個 target
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: 安裝前端依賴
+        working-directory: apps/desktop
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
+          releaseName: Wordforge ${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
+          releaseBody: |
+            ## 安裝
+
+            安裝檔**沒有簽章**（簽章憑證每年要花錢，這個專案不收費也不營運伺服器）。
+            所以第一次開啟時系統會擋：
+
+            - **macOS**：右鍵點 App 選「開啟」，或到「系統設定 → 隱私權與安全性」按「仍要開啟」
+            - **Windows**：SmartScreen 出現時點「其他資訊 → 仍要執行」
+            - **Linux**：`.AppImage` 記得 `chmod +x`
+
+            不放心的話，直接從原始碼建置也可以，步驟見 README。
+
+            ## 第一次使用
+
+            Wordforge **不內建任何字典**（好用的字典幾乎都有版權）。
+            開啟後會有引導告訴你去哪裡取得，載入一份就能開始。
+            換一份別的語言的字典，就是學那個語言。
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.target }}
