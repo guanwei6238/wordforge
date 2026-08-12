@@ -133,19 +133,13 @@ impl CliConfig {
             // codex exec 沒有獨立的 system prompt 參數
             system_flag: None,
             model_flag: Some("-m".into()),
-            // 留空用 codex 自己的 ~/.codex/config.toml。
-            //
-            // 不寫死型號是因為實測過會壞：`gpt-5.6-luna` 在 codex-cli 0.142.5
-            // 上會被拒絕（"requires a newer version of Codex"）。任何寫死的
-            // 型號都會在某個版本上炸掉，而使用者的 config.toml 一定是對的。
-            // 想指定的話設定頁的下拉選單裡有。
-            model: String::new(),
+            model: "gpt-5.6-luna".into(),
             // codex 沒有獨立的 effort 旗標，要走設定覆寫
             effort_style: EffortStyle::Config {
                 flag: "-c".into(),
                 key: "model_reasoning_effort".into(),
             },
-            effort: "medium".into(),
+            effort: "high".into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -284,7 +278,8 @@ pub fn cli_options(preset: CliPreset) -> CliOptions {
         ),
         // codex 沒有公開的模型清單。新型號需要夠新的 CLI——
         // `gpt-5.6-luna` 在 0.142.5 上會回
-        // "requires a newer version of Codex"，所以選了沒反應要先升級 codex。
+        // "requires a newer version of Codex"（0.147.0 可以），
+        // 所以選了不能用要先 `codex update`。設定頁的「試跑」會直接講。
         CliPreset::Codex => (
             &["gpt-5.6-luna", "gpt-5.5", "gpt-5"],
             &["low", "medium", "high"],

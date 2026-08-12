@@ -43,11 +43,12 @@ const CLI_SPECS: Record<
     args: ["exec", "--skip-git-repo-check"],
     systemFlag: null,
     modelFlag: "-m",
-    // 留空用 ~/.codex/config.toml；寫死型號會在舊版 codex 上被拒絕
-    model: "",
+    // 需要 codex-cli 0.147 以上；舊版會回 "requires a newer version"，
+    // 設定頁的「試跑」會直接說要跑 codex update
+    model: "gpt-5.6-luna",
     // codex 沒有獨立的 effort 旗標
     effortStyle: { kind: "config", value: { flag: "-c", key: "model_reasoning_effort" } },
-    effort: "medium",
+    effort: "high",
   },
 };
 
