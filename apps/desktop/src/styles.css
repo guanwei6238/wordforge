@@ -791,32 +791,62 @@ button.link {
   font-size: 0.8rem;
 }
 
-/* 文章要好讀：行高放寬，字級由使用者自己決定（inline style 蓋掉這個預設） */
+/* ------------------------------------------------- 練習頁的字級
+
+   字級是**一個**設定，作用在整份練習上：文章、翻譯、題目、選項。
+   只調文章的話，調到剛好看得舒服之後，右邊的題目還是原本那麼小，
+   眼睛在兩欄之間跳來跳去反而更累。
+
+   `--exercise-font` 由 Practice.tsx 設在最外層容器上，沒設時
+   退回 1rem——這樣就算哪天忘了傳，畫面也只是回到預設而不是壞掉。 */
+.practice {
+  --exercise-font: 1rem;
+}
+
+.practice .passage,
+.practice .prompt,
+.practice .option,
+.practice .full-translation p {
+  font-size: var(--exercise-font);
+}
+
+/* 解說與提示跟著縮放，但比題目小一級——它們是註腳，
+   跟題目一樣大的話會搶掉注意力。 */
+.practice .questions .muted,
+.practice .word-notes,
+.practice .new-words {
+  font-size: calc(var(--exercise-font) * 0.9);
+}
+
+/* 文章要好讀：行高放寬 */
 .passage {
-  font-size: 1.05rem;
   line-height: 1.9;
   margin: 0.5rem 0 1rem;
 }
 
-/* 點任何一個字都能標記「我不會」 */
-.word {
+/* 文章裡的每一個字都能點。
+   **不能叫 .word**：複習頁的字卡已經用了那個名字，而且它有
+   `font-size: 2.5rem; font-weight: 500`。同名等於文章裡每個字都變成
+   40px 半粗體，還把 <p> 上設的字級整個蓋掉——使用者調字級沒有反應，
+   而且看起來像整篇都加粗了。 */
+.token {
   cursor: pointer;
   border-radius: 3px;
   padding: 0 1px;
 }
 
-.word:hover {
+.token:hover {
   background: var(--border);
 }
 
-.word.marked {
+.token.marked {
   background: var(--accent);
   color: var(--surface);
 }
 
 /* 解析時點開的那個字。跟 marked 用不同的樣式：
    一個是「我不會」，一個是「我正在看它的意思」，混在一起會分不清。 */
-.word.looking {
+.token.looking {
   outline: 2px solid var(--accent);
   background: var(--bg);
 }
@@ -987,6 +1017,14 @@ button.link {
 .questions.blanks {
   list-style: none;
   padding-left: 0;
+}
+
+/* 克漏字的選項就是幾個單字或片語，一個一列的話一題就佔掉四行，
+   八格的題目要捲很久。橫排讓一格大約只佔兩行。 */
+.options.compact {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
 }
 
 .submit-row {

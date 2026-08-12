@@ -283,6 +283,53 @@ pub fn blank_numbers(passage: &str) -> Vec<usize> {
     out
 }
 
+/// 把挖空重新編號成「出現順序」，並算出題目該怎麼跟著重排。
+///
+/// ## 為什麼要這一步
+///
+/// 模型很常給出 `[2, 5, 1, 3, 4, 7, 6, 8]` 這種順序——編號本身沒有
+/// 少也沒有重複，只是**沒有照文章順序寫**。那樣讀起來是：第一個空格
+/// 標著 2、第二個標著 5，而右邊的題目卻是 1、2、3…，作答時要一直
+/// 來回找對應。
+///
+/// 這件事在本地修得掉，所以不要只在 prompt 裡拜託它——照出現順序
+/// 重新編號，題目跟著同樣的排列重排，結果一定對得上。
+///
+/// 回傳 `(改寫後的文章, 題目的新順序)`。`order[k]` 是新的第 k 格
+/// 對應**原本**的第幾題。編號超出範圍或重複的空格會被移除：
+/// 留著會變成一個永遠答不到的洞，而 `{{9}}` 直接印在文章裡更糟。
+pub fn renumber_blanks(passage: &str, item_count: usize) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(passage.len());
+    let mut order: Vec<usize> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut rest = passage;
+
+    while let Some(start) = rest.find(BLANK_OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + BLANK_OPEN.len()..];
+
+        let Some(end) = after.find(BLANK_CLOSE) else {
+            // 沒收尾的標記：原樣留著，不要吃掉後面的內容
+            out.push_str(&rest[start..]);
+            return (out, order);
+        };
+
+        match after[..end].trim().parse::<usize>() {
+            Ok(n) if (1..=item_count).contains(&n) && seen.insert(n) => {
+                out.push_str(&format!("{BLANK_OPEN}{}{BLANK_CLOSE}", order.len() + 1));
+                order.push(n - 1);
+            }
+            // 編號壞掉或重複，整個標記拿掉
+            _ => {}
+        }
+
+        rest = &after[end + BLANK_CLOSE.len()..];
+    }
+
+    out.push_str(rest);
+    (out, order)
+}
+
 // ------------------------------------------------------------------ 選項洗牌
 
 /// 偽亂數（SplitMix64）。
@@ -604,6 +651,50 @@ mod tests {
         assert_eq!(blank_numbers("a {{1}} b {{2"), vec![1]);
         assert_eq!(blank_numbers("{{}}"), Vec::<usize>::new());
         assert_eq!(blank_numbers("{{abc}} {{2}}"), vec![2], "非數字略過");
+    }
+
+    /// 這條測試存在的理由是它真的發生過：模型回了
+    /// `numbers=[2, 5, 1, 3, 4, 7, 6, 8]`——編號沒少也沒重複，就只是
+    /// 沒照文章順序寫。使用者看到的是第一個空格標著 2、第二個標著 5，
+    /// 而右邊的題目是 1、2、3…，作答時要一直來回找對應。
+    #[test]
+    fn out_of_order_blanks_are_renumbered_to_reading_order() {
+        let passage = "a {{2}} b {{5}} c {{1}} d {{3}}";
+        let (rewritten, order) = renumber_blanks(passage, 5);
+
+        assert_eq!(rewritten, "a {{1}} b {{2}} c {{3}} d {{4}}");
+        assert_eq!(
+            order,
+            vec![1, 4, 0, 2],
+            "新的第 k 格要指回原本的第幾題（0-based）"
+        );
+        assert_eq!(blank_numbers(&rewritten), vec![1, 2, 3, 4]);
+    }
+
+    /// 已經是順的就不該被動到。
+    #[test]
+    fn well_numbered_blanks_pass_through_unchanged() {
+        let passage = "I {{1}} to the {{2}} yesterday.";
+        let (rewritten, order) = renumber_blanks(passage, 2);
+        assert_eq!(rewritten, passage);
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    /// 超出題數、重複、非數字的標記留著會變成永遠答不到的洞，
+    /// 而把 `{{9}}` 直接印在文章裡更糟。
+    #[test]
+    fn unusable_blanks_are_removed_from_the_text() {
+        let (rewritten, order) = renumber_blanks("a {{9}} b {{1}} c {{1}} d {{x}} e", 2);
+        assert_eq!(rewritten, "a  b {{1}} c  d  e");
+        assert_eq!(order, vec![0]);
+    }
+
+    /// 沒收尾的標記不能吃掉後面的文章。
+    #[test]
+    fn renumbering_keeps_the_tail_after_an_unclosed_blank() {
+        let (rewritten, order) = renumber_blanks("a {{1}} b {{2 還有後面", 2);
+        assert_eq!(rewritten, "a {{1}} b {{2 還有後面");
+        assert_eq!(order, vec![0]);
     }
 
     fn options(xs: &[&str]) -> Vec<String> {

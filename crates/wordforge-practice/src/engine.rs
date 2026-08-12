@@ -578,7 +578,15 @@ impl<'a> PracticeEngine<'a> {
             CLOZE_BLANKS,
         )
         .await?;
-        for word in self.due_words(profile_id, CLOZE_BLANKS, now).await? {
+        // 補不夠時拿今天到期的，但**只拿學過的**。
+        //
+        // `due_words` 不看 reps：牌組裡剛加進去、他從來沒看過的新卡
+        // 也算「到期」。拿那種字來挖空，考的就不是「想不想得起來」，
+        // 而是「猜不猜得中」——四個選項裡他一個都沒學過。
+        for word in self
+            .studied_due_words(profile_id, CLOZE_BLANKS, now)
+            .await?
+        {
             if blanks.len() >= CLOZE_BLANKS as usize {
                 break;
             }
@@ -632,22 +640,32 @@ impl<'a> PracticeEngine<'a> {
             })
             .unwrap_or_default();
 
-        // 空格與題目一定要對得上。模型會跳號、會多給一題、會忘了挖空——
-        // 不檢查的話使用者會看到「有題目卻沒有空格」或反過來，
+        // 空格與題目一定要對得上。模型會跳號、會亂序、會多給一題、
+        // 會忘了挖空——不檢查的話使用者會看到「有題目卻沒有空格」，
         // 而且送出之後判分還是照跑，錯得無聲無息。
-        let numbers = practice::blank_numbers(&passage);
-        if numbers.is_empty() || items.is_empty() {
+        //
+        // 亂序（`[2, 5, 1, 3, …]`）是最常見的一種，而它其實不是壞資料：
+        // 編號沒少也沒重複，只是沒照文章順序寫。那個在本地改得掉，
+        // 所以重新編號而不是丟掉整份題目。
+        if passage.trim().is_empty() || items.is_empty() {
             return Err(PracticeError::BadResponse("沒有產出挖空的文章".into()));
         }
-        let usable = numbers.len().min(items.len());
-        if numbers != (1..=usable).collect::<Vec<_>>() || items.len() != usable {
+
+        let (passage, order) = practice::renumber_blanks(&passage, items.len());
+        if order.is_empty() {
+            return Err(PracticeError::BadResponse(
+                "文章裡一個空格都沒有，克漏字沒有東西可以作答".into(),
+            ));
+        }
+        if order.len() != items.len() {
             tracing::warn!(
-                ?numbers,
+                blanks = order.len(),
                 items = items.len(),
-                "克漏字的空格與題目對不上，截到共同的長度"
+                "克漏字有題目沒有對應的空格，那些題目丟掉"
             );
         }
-        items.truncate(usable);
+        // 依空格的出現順序重排；沒有空格的題目在這一步自然被丟掉
+        items = order.iter().map(|&i| items[i].clone()).collect();
 
         shuffle_answers(&mut items, shuffle_seed(now));
 
@@ -1195,6 +1213,33 @@ impl<'a> PracticeEngine<'a> {
         )
         .bind(profile_id)
         .bind(format_ts(now))
+        .bind(limit)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(wordforge_db::DbError::from)?;
+        Ok(words)
+    }
+
+    /// 今天到期、而且**至少複習過一次**的字。
+    ///
+    /// 跟 `due_words` 的差別只有 `reps > 0`，但那一個條件很重要：
+    /// 牌組裡剛加進去、他從來沒看過的新卡在排程上也算「今天到期」。
+    /// 克漏字拿那種字挖空，考的就不是「想不想得起來」而是「猜不猜得中」。
+    async fn studied_due_words(
+        &self,
+        profile_id: i64,
+        limit: i64,
+        now: OffsetDateTime,
+    ) -> Result<Vec<String>> {
+        let words: Vec<String> = sqlx::query_scalar(
+            "SELECT l.text FROM card c JOIN lemma l ON l.id = c.lemma_id
+             WHERE c.profile_id = ? AND c.suspended = 0 AND c.due <= ?
+               AND c.reps > 0 AND l.lang = ?
+             ORDER BY c.due LIMIT ?",
+        )
+        .bind(profile_id)
+        .bind(format_ts(now))
+        .bind(&self.target_lang)
         .bind(limit)
         .fetch_all(self.db.pool())
         .await

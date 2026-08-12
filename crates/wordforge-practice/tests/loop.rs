@@ -172,6 +172,32 @@ async fn put_in_deck(db: &Db, profile: i64, lemma_id: i64) {
     .unwrap();
 }
 
+/// 把一個字加進牌組**並且真的複習過一次**。
+///
+/// 跟 `put_in_deck` 的差別只有 `reps` 與 `state`，但那個差別是真的：
+/// 剛加進牌組、還沒看過的卡在排程上也算「今天到期」，可是那不是
+/// 「學過的字」。克漏字只挖學過的字，所以測試的牌組也得長得像
+/// 真的用過的牌組——填一張沒有複習紀錄的卡進去，測到的會是另一件事。
+async fn study(db: &Db, profile: i64, lemma_id: i64) {
+    let card = cards::ensure(
+        db,
+        ProfileId(profile),
+        LemmaId(lemma_id),
+        wordforge_core::model::CardKind::Recognition,
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let (next, log) = wordforge_core::srs::Scheduler::default().review(
+        &card,
+        wordforge_core::model::Rating::Easy,
+        t0(),
+        None,
+    );
+    cards::record_review(db, &next, &log).await.unwrap();
+}
+
 /// 把一個字推到詞彙量之外，讓它真的算「不會」。
 ///
 /// 覆蓋率驗收把「詞頻在估計詞彙量以內」的字算成會的（那才跟告訴模型的
@@ -1652,7 +1678,7 @@ async fn choosing_cloze_actually_produces_a_cloze() {
     let (db, profile) = setup(&["borrow", "return", "weather"]).await;
     set_vocabulary(&db, profile, 1_000).await;
     for lemma in 1..=3 {
-        put_in_deck(&db, profile, lemma).await;
+        study(&db, profile, lemma).await;
     }
 
     let llm = FakeLlm::new(&[r#"{"title":"A Rainy Day",
@@ -1708,7 +1734,7 @@ async fn a_missed_blank_goes_back_into_the_deck() {
     let (db, profile) = setup(&["borrow", "return", "weather"]).await;
     set_vocabulary(&db, profile, 1_000).await;
     for lemma in 1..=3 {
-        put_in_deck(&db, profile, lemma).await;
+        study(&db, profile, lemma).await;
     }
 
     let llm = FakeLlm::new(&[r#"{"title":"T",
@@ -1759,7 +1785,7 @@ async fn extra_cloze_questions_without_a_blank_are_dropped() {
     let (db, profile) = setup(&["borrow", "return"]).await;
     set_vocabulary(&db, profile, 1_000).await;
     for lemma in 1..=2 {
-        put_in_deck(&db, profile, lemma).await;
+        study(&db, profile, lemma).await;
     }
 
     let llm = FakeLlm::new(&[r#"{"title":"T","passage":"Please {{1}} it back.",
@@ -1799,7 +1825,7 @@ async fn cloze_does_not_flush_the_reading_word_history() {
     for i in 0..12 {
         make_rare(&db, 5 + i, 3_500 + i).await;
     }
-    put_in_deck(&db, profile, 4).await;
+    study(&db, profile, 4).await;
 
     let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat.",
         "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
@@ -1841,4 +1867,59 @@ async fn cloze_does_not_flush_the_reading_word_history() {
             "{word} 上一篇才教過，克漏字把閱讀的歷史沖掉了"
         );
     }
+}
+
+/// 這條測試存在的理由是它真的發生過：模型回了
+/// `numbers=[2, 5, 1, 3, 4, 7, 6, 8]`——八個編號一個沒少、一個沒重複，
+/// 只是沒照文章順序寫。原本的檢查把它當成壞資料記了一筆 warning，
+/// 而使用者看到的是第一個空格標著 2、第二個標著 5，右邊題目卻是 1、2、3…
+///
+/// 這個在本地改得掉，所以要改掉，不是丟掉整份題目。
+#[tokio::test]
+async fn blanks_written_out_of_order_are_renumbered_not_rejected() {
+    let (db, profile) = setup(&["a1", "a2", "a3", "a4"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for lemma in 1..=4 {
+        study(&db, profile, lemma).await;
+    }
+
+    // 空格照 2、4、1、3 的順序出現，選項用可辨識的字串標記原本的題號
+    let llm = FakeLlm::new(&[r#"{"title":"T",
+        "passage":"w {{2}} x {{4}} y {{1}} z {{3}}.",
+        "items":[
+          {"options":["one-right","one-wrong"],"answer_index":0},
+          {"options":["two-right","two-wrong"],"answer_index":0},
+          {"options":["three-right","three-wrong"],"answer_index":0},
+          {"options":["four-right","four-wrong"],"answer_index":0}
+        ]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Cloze), t0())
+        .await
+        .unwrap();
+
+    let wordforge_practice::payload::ExerciseBody::Cloze { passage, items, .. } = &exercise.body
+    else {
+        panic!("該是克漏字");
+    };
+
+    // 文章裡的空格重新編成出現順序
+    assert_eq!(
+        wordforge_core::practice::blank_numbers(passage),
+        vec![1, 2, 3, 4],
+        "空格沒有照出現順序重新編號：{passage}"
+    );
+    assert_eq!(items.len(), 4, "一題都不該被丟掉");
+
+    // 第 k 格對應的題目要是原本標著 k 的那一題
+    let answered: Vec<&str> = items
+        .iter()
+        .map(|i| i.options[i.answer_index].as_str())
+        .collect();
+    assert_eq!(
+        answered,
+        vec!["two-right", "four-right", "one-right", "three-right"],
+        "題目沒有跟著空格的順序重排"
+    );
 }

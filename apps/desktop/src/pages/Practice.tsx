@@ -1,3 +1,4 @@
+import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BLANK_PATTERN,
@@ -19,6 +20,7 @@ import {
   listMaterials,
   loadExercise,
   type Material,
+  onDataReset,
   practiceStatus,
   type PracticeStatus,
   type ProfileLanguages,
@@ -109,6 +111,24 @@ export default function Practice() {
   useEffect(() => {
     void refreshHistory(historyPage);
   }, [refreshHistory, historyPage]);
+
+  // 這一頁切走不會卸載（出一題要幾十秒，回來題目不能消失），
+  // 代價是它看不到別的地方做了什麼。在設定頁按下重置之後，
+  // 這裡還會顯示著已經不存在的題目與舊的詞彙量。
+  useEffect(
+    () =>
+      onDataReset(() => {
+        present(null);
+        setShowHistory(false);
+        setHistoryPage(0);
+        void refresh();
+        void refreshHistory(0);
+        void getStudySettings()
+          .then((s) => setFontSize(s.reading_font_size))
+          .catch(() => {});
+      }),
+    [refresh, refreshHistory],
+  );
 
   /** 把一份題目擺上畫面，順便把上一份的作答與批改清乾淨。 */
   function present(ex: ExerciseView | null) {
@@ -252,7 +272,13 @@ export default function Practice() {
       : choices.filter((c) => c == null).length;
 
   return (
-    <div className={wide ? "practice wide" : "practice"}>
+    <div
+      className={wide ? "practice wide" : "practice"}
+      // 字級是一個設定，作用在整份練習上：文章、翻譯、題目、選項。
+      // 只調文章的話，右邊的題目還是原本那麼小，眼睛在兩欄之間
+      // 跳來跳去反而更累。
+      style={{ "--exercise-font": `${fontSize}px` } as React.CSSProperties}
+    >
       {status && (
         <section className="panel">
           <div className="row">
@@ -344,7 +370,7 @@ export default function Practice() {
                     `　這篇有 ${Math.round(exercise.coverage * 100)}% 的字你已經學過。`}
                 </p>
 
-                <p className="passage" style={{ fontSize: `${fontSize}px` }}>
+                <p className="passage">
                   {reading.passage.split(/(\s+)/).map((chunk, i) => {
                     if (!chunk.trim()) return chunk;
                     const word = normalizeWord(chunk);
@@ -353,7 +379,7 @@ export default function Practice() {
                       <span
                         key={i}
                         className={[
-                          "word",
+                          "token",
                           isMarked ? "marked" : "",
                           feedback && lookup === word ? "looking" : "",
                         ]
@@ -393,7 +419,7 @@ export default function Practice() {
               {feedback && reading.translation && (
                 <section className="panel translation-pane">
                   <h2>全文翻譯</h2>
-                  <p className="passage" style={{ fontSize: `${fontSize}px` }}>
+                  <p className="passage">
                     {reading.translation}
                   </p>
                 </section>
@@ -441,9 +467,14 @@ export default function Practice() {
             </div>
           )}
 
-          {/* 克漏字：短文在左、每一格的選項在右 */}
+          {/* 克漏字：短文在左、每一格的選項在右，批改完中間插入翻譯。
+              跟閱讀測驗一樣的版面——同樣是「對照原文看」的需求。 */}
           {exercise && cloze && (
-            <div className="reading-layout">
+            <div
+              className={
+                feedback && cloze.translation ? "reading-layout three" : "reading-layout"
+              }
+            >
               <section className="panel exercise passage-pane">
                 <PassageHeader
                   title={cloze.title}
@@ -459,15 +490,15 @@ export default function Practice() {
                   items={cloze.items}
                   choices={choices}
                   feedback={feedback}
-                  fontSize={fontSize}
                 />
-                {feedback && cloze.translation && (
-                  <details className="full-translation" open>
-                    <summary>全文翻譯</summary>
-                    <p>{cloze.translation}</p>
-                  </details>
-                )}
               </section>
+
+              {feedback && cloze.translation && (
+                <section className="panel translation-pane">
+                  <h2>全文翻譯</h2>
+                  <p className="passage">{cloze.translation}</p>
+                </section>
+              )}
 
               <div className="answer-pane">
                 <section className="panel exercise">
@@ -477,6 +508,7 @@ export default function Practice() {
                     setChoices={setChoices}
                     feedback={feedback}
                     numbered
+                    compact
                   />
                   {!feedback && (
                     <SubmitRow
@@ -661,19 +693,17 @@ function ClozePassage({
   items,
   choices,
   feedback,
-  fontSize,
 }: {
   passage: string;
   items: { options: string[]; answer_index: number }[];
   choices: (number | null)[];
   feedback: Feedback | null;
-  fontSize: number;
 }) {
   // 依 {{n}} 切開。用 split 保留分隔符，一次走完不必自己算位置。
   const parts = useMemo(() => passage.split(new RegExp(BLANK_PATTERN.source, "g")), [passage]);
 
   return (
-    <p className="passage" style={{ fontSize: `${fontSize}px` }}>
+    <p className="passage">
       {parts.map((part, i) => {
         // split 帶捕獲群組時，奇數索引是空格編號
         if (i % 2 === 0) return <span key={i}>{part}</span>;
@@ -996,6 +1026,7 @@ function Choices({
   setChoices,
   feedback,
   numbered = false,
+  compact = false,
 }: {
   items: {
     question: string;
@@ -1009,6 +1040,14 @@ function Choices({
   feedback: Feedback | null;
   /** 克漏字要標「第 N 格」才對得回文章裡的空格 */
   numbered?: boolean;
+  /**
+   * 選項橫排。
+   *
+   * 克漏字的選項就是幾個單字或片語，一個一列的話一題佔掉四行，
+   * 八格要捲很久。閱讀與文法的選項是整句話，橫排會擠成一團，
+   * 所以這件事不能一體適用，要由呼叫端決定。
+   */
+  compact?: boolean;
 }) {
   return (
     <ol className={numbered ? "questions blanks" : "questions"}>
@@ -1023,7 +1062,7 @@ function Choices({
               </span>
             )}
           </p>
-          <div className="options">
+          <div className={compact ? "options compact" : "options"}>
             {q.options.map((option, j) => (
               <label
                 key={j}
