@@ -32,3 +32,7 @@ apps/desktop/src-tauri/gen/
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# 個人的待辦清單，不進版控——內容是隨手記的優化項目，
+# 每次改完就整份換掉，留在版控裡只會製造無意義的 diff。
+docs/fix.md

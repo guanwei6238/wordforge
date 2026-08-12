@@ -1,4 +1,4 @@
-# 給 AI 助理的工作指引
+# 工作指引
 
 這份文件寫給在這個 repo 上工作的 AI 助理。人類貢獻者看
 [CONTRIBUTING.md](../CONTRIBUTING.md)（環境、風格、commit 格式），
