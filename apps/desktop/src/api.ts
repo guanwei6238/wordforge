@@ -611,6 +611,12 @@ export function materialCoverage(
 export type Backend = "none" | "cli" | "api";
 export type CliPreset = "claude_code" | "codex" | "custom";
 
+/** 推理強度怎麼傳給 CLI。claude 用獨立旗標，codex 走設定覆寫。 */
+export type EffortStyle =
+  | { kind: "unsupported" }
+  | { kind: "flag"; value: string }
+  | { kind: "config"; value: { flag: string; key: string } };
+
 export interface CliConfig {
   preset: CliPreset;
   program: string;
@@ -620,7 +626,17 @@ export interface CliConfig {
   model_flag: string | null;
   /** 要用哪個模型；留空用 CLI 自己的預設 */
   model: string;
+  effort_style: EffortStyle;
+  /** 推理強度；留空用 CLI 自己的預設 */
+  effort: string;
   timeout_secs: number;
+}
+
+/** 這個 CLI 有哪些模型與推理強度可選。清單會過期，所以 UI 也要允許自訂。 */
+export interface CliOptions {
+  preset: CliPreset;
+  models: string[];
+  efforts: string[];
 }
 
 export interface ApiSettings {
@@ -644,6 +660,7 @@ export interface CliAvailability {
   program: string;
   installed: boolean;
   version: string | null;
+  options: CliOptions;
 }
 
 /** 偵測這台機器上裝了哪些 AI CLI */

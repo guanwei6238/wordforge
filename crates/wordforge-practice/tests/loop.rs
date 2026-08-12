@@ -145,6 +145,20 @@ async fn put_in_deck(db: &Db, profile: i64, lemma_id: i64) {
     .unwrap();
 }
 
+/// 把一個字推到詞彙量之外，讓它真的算「不會」。
+///
+/// 覆蓋率驗收把「詞頻在估計詞彙量以內」的字算成會的（那才跟告訴模型的
+/// 數字一致）。所以測試裡想要一個字被判定為生字，就得給它一個
+/// 超出詞彙量的詞頻——`ubiquitous` 在現實中本來也是這樣。
+async fn make_rare(db: &Db, lemma_id: i64, rank: i64) {
+    sqlx::query("UPDATE lemma SET freq_rank = ? WHERE id = ?")
+        .bind(rank)
+        .bind(lemma_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
 /// 設定分級測驗估的詞彙量，用來決定題型。
 async fn set_vocabulary(db: &Db, profile: i64, n: i64) {
     sqlx::query(
@@ -294,6 +308,9 @@ async fn a_passage_that_is_too_hard_gets_regenerated() {
     for lemma in 1..=5 {
         put_in_deck(&db, profile, lemma).await;
     }
+    // 後兩個要超出詞彙量才會被算成生字
+    make_rare(&db, 6, 30_000).await;
+    make_rare(&db, 7, 30_000).await;
     sqlx::query("UPDATE card SET state='review', stability=40.0")
         .execute(db.pool())
         .await
@@ -773,6 +790,7 @@ async fn the_retry_shows_the_model_its_previous_attempt() {
     for lemma in 1..=5 {
         put_in_deck(&db, profile, lemma).await;
     }
+    make_rare(&db, 6, 30_000).await;
     sqlx::query("UPDATE card SET state='review', stability=40.0")
         .execute(db.pool())
         .await
@@ -953,9 +971,9 @@ async fn the_profile_language_drives_prompts_and_lookups() {
 async fn the_reading_glossary_comes_from_the_dictionary_not_the_model() {
     let (db, profile) = setup(&["search for", "diligent", "the", "key"]).await;
     set_vocabulary(&db, profile, 2_000).await;
+    // diligent 要超出詞彙量才會被算成生字；其餘的都算會
+    make_rare(&db, 2, 30_000).await;
 
-    // 牌組裡沒有已掌握的字，覆蓋率必定判定太難而重試；
-    // 這條測試要驗的是解析，所以讓三次嘗試都回同一篇，最後一次會被接受
     let passage = r#"{"title":"T","passage":"She had to search for the diligent key.",
             "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[
@@ -1200,4 +1218,52 @@ async fn no_material_means_no_material_section() {
         .unwrap();
 
     assert!(!llm.last_prompt().contains("指定教材"));
+}
+
+/// 完全沒有已知詞資料時，重試沒有意義——不能白燒兩次額度。
+///
+/// 這是實測發現的：使用者背了三週但沒有一張卡的 stability 達到 21 天，
+/// 嚴格定義下已知詞是空集合，覆蓋率永遠 0%，每題都跑滿三輪重試，
+/// 一題 98 秒而且驗收完全沒有作用。
+#[tokio::test]
+async fn no_known_words_means_no_pointless_retries() {
+    let (db, profile) = setup(&["alpha", "beta"]).await;
+    // 詞彙量夠高才出得了閱讀測驗，但字典裡沒有任何字落在那個範圍內，
+    // 牌組也是空的——known_vocabulary 於是是空集合。
+    // 這對應到「分級測驗做過了，但字典的詞頻表還沒匯入」。
+    set_vocabulary(&db, profile, 2_000).await;
+    make_rare(&db, 1, 30_000).await;
+    make_rare(&db, 2, 30_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"title":"T","passage":"Alpha beta gamma delta.",
+            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let ex = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .expect("沒有基準時應該接受第一篇，而不是重試到放棄");
+
+    assert_eq!(llm.call_count(), 1, "只該呼叫一次");
+    assert_eq!(ex.coverage, Some(0.0), "覆蓋率照實記 0，不要假裝有驗過");
+}
+
+/// 有基準時，太難的文章還是要被打回——防呆不能把驗收整個關掉。
+#[tokio::test]
+async fn a_baseline_still_enforces_the_coverage_rule() {
+    let (db, profile) = setup(&["the", "cat", "sat", "on", "mat", "ubiquitous"]).await;
+    set_vocabulary(&db, profile, 3_000).await;
+    make_rare(&db, 6, 30_000).await;
+
+    let hard = r#"{"title":"H","passage":"Ubiquitous ubiquitous ubiquitous.",
+            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let llm = FakeLlm::new(&[hard, hard, hard]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .ok();
+
+    assert_eq!(llm.call_count(), 3, "有基準就該重試到上限");
 }

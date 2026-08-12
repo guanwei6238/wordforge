@@ -291,8 +291,17 @@ impl<'a> PracticeEngine<'a> {
         learner: &LearnerProfile,
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
-        let known =
-            cards::known_lemma_ids(self.db, ProfileId(profile_id), KNOWN_STABILITY_DAYS).await?;
+        // 驗收要用的「他看得懂的字」，跟 prompt 裡告訴模型的是同一個依據。
+        // 用嚴格的 known_lemma_ids 的話，剛開始學的人會拿到空集合，
+        // 覆蓋率永遠 0%，重試迴圈每次跑滿——實測一題 98 秒而且驗收沒有作用。
+        let known = cards::known_vocabulary(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            learner.vocabulary,
+            KNOWN_STABILITY_DAYS,
+        )
+        .await?;
         let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
         let word_count = practice::reading_length(learner.vocabulary);
         let target_words = self.due_words(profile_id, 6, now).await?;
@@ -340,11 +349,25 @@ impl<'a> PracticeEngine<'a> {
             // Prompt 只能提高命中率，本地重算才是保證
             let coverage = self.measure_coverage(&passage, &known).await?;
 
+            tracing::info!(
+                attempt,
+                coverage = coverage.ratio(),
+                band = ?coverage.band(),
+                "覆蓋率驗收"
+            );
+
             // 只有「太難」才重寫。太簡單也不理想（這次學不到新字），
             // 但重試訊息講的是「把難字換掉」，拿去處理太簡單的文章只會更糟；
             // 而且對學習者來說，讀一篇太簡單的文章無害，讀不懂的才是災難。
+            // 完全沒有已知詞資料時（還沒做分級測驗、牌組也是空的），
+            // 覆蓋率必定是 0，重寫幾次都一樣。與其燒兩次額度，不如接受。
+            let no_baseline = known.is_empty();
+            if no_baseline {
+                tracing::warn!("沒有任何已知詞資料，跳過覆蓋率驗收（建議先做分級測驗）");
+            }
+
             let too_hard = coverage.band() == wordforge_core::coverage::CoverageBand::TooHard;
-            let acceptable = !too_hard || attempt == COVERAGE_RETRIES;
+            let acceptable = !too_hard || no_baseline || attempt == COVERAGE_RETRIES;
             if acceptable {
                 let questions: Vec<ChoiceItem> = value
                     .get("questions")
@@ -590,8 +613,18 @@ impl<'a> PracticeEngine<'a> {
         feedback.score = local.score;
 
         // 解析裡的生字與片語由本地字典查，不佔 token 也不用等模型
-        let known =
-            cards::known_lemma_ids(self.db, ProfileId(profile_id), KNOWN_STABILITY_DAYS).await?;
+        // 解析裡的「生字」也要用同一個定義，否則會把他早就會的字全列出來
+        let learner = self
+            .learner_profile(profile_id, OffsetDateTime::now_utc())
+            .await?;
+        let known = cards::known_vocabulary(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            learner.vocabulary,
+            KNOWN_STABILITY_DAYS,
+        )
+        .await?;
         feedback.glossary = self.build_glossary(passage, &known).await?;
         Ok(feedback)
     }
@@ -803,7 +836,19 @@ impl<'a> PracticeEngine<'a> {
                 .map(|m| m.content.chars().count())
                 .sum::<usize>();
 
+        let started = std::time::Instant::now();
         let result = self.llm.chat(req).await;
+        let elapsed = started.elapsed();
+
+        // 出一題要多久、時間花在哪，使用者是感覺得到的。沒有這行的話
+        // 「太慢了」只能靠猜——是模型慢、是重試、還是本地查詢慢？
+        tracing::info!(
+            purpose,
+            prompt_chars,
+            elapsed_ms = elapsed.as_millis() as u64,
+            ok = result.is_ok(),
+            "LLM 呼叫完成"
+        );
 
         let (response_chars, input_tokens, output_tokens, ok) = match &result {
             Ok(resp) => (

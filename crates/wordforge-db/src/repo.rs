@@ -571,10 +571,13 @@ pub mod cards {
         Ok(())
     }
 
-    /// 這位學習者「算是會了」的字。
+    /// 這位學習者「算是會了」的字——**嚴格定義**，用於統計顯示。
     ///
     /// 定義：辨識卡已經畢業到長期複習，且 stability 達到門檻
-    /// （預設 21 天 ≈ 撐得過三週不複習）。90% 法則的分母就是這份集合。
+    /// （預設 21 天 ≈ 撐得過三週不複習）。
+    ///
+    /// 這個定義刻意保守，因為「已掌握 N 字」是要給使用者看的成就數字，
+    /// 寧可低報。**不要拿它做 90% 法則的驗收**——見 [`known_vocabulary`]。
     pub async fn known_lemma_ids(
         db: &Db,
         profile_id: ProfileId,
@@ -587,6 +590,53 @@ pub mod cards {
         )
         .bind(profile_id.0)
         .bind(min_stability)
+        .fetch_all(db.pool())
+        .await?;
+
+        Ok(ids.into_iter().map(LemmaId).collect())
+    }
+
+    /// 90% 法則驗收要用的「他看得懂的字」。
+    ///
+    /// 這跟 [`known_lemma_ids`] 是兩個問題，混用會出大事：
+    ///
+    /// - 「已掌握 N 字」是成就數字，要保守，只算真的背熟的
+    /// - 「這篇文章他看不看得懂」要算**全部看得懂的字**，包括從來沒進過
+    ///   牌組、但分級測驗說他早就會的那幾千個
+    ///
+    /// 混用的後果實測過：使用者背了三週、21 張卡進入複習但最高 stability
+    /// 只有 15.7，於是嚴格定義回傳 **0 個字**。覆蓋率永遠是 0%，
+    /// 每一篇文章都被判定太難，重試迴圈每次都跑滿三輪——一題 98 秒，
+    /// 而且驗收本身完全沒有作用（最後接受的只是「第三篇，不管它是什麼」）。
+    ///
+    /// 而同一時間 prompt 裡跟模型說的是「他掌握約 5200 個單字」。
+    /// 出題端與驗收端對「他會什麼」的認知必須一致，否則驗收只是在空轉。
+    ///
+    /// 所以這裡的定義跟 `known_sample` 的抽樣池對齊：
+    ///
+    /// 1. 已經進入長期複習的卡（真的背過）
+    /// 2. 分級測驗判定太簡單而收起來的卡（測驗說他會）
+    /// 3. 詞頻落在估計詞彙量以內的字（推定會，跟告訴模型的數字同一個依據）
+    pub async fn known_vocabulary(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+        vocabulary: i64,
+        min_stability: f64,
+    ) -> Result<HashSet<LemmaId>> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT lemma_id FROM card
+             WHERE profile_id = ?1 AND kind = 'recognition'
+               AND ((state = 'review' AND stability >= ?2)
+                    OR (suspended = 1 AND reps = 0))
+             UNION
+             SELECT id FROM lemma
+             WHERE lang = ?3 AND freq_rank IS NOT NULL AND freq_rank <= ?4",
+        )
+        .bind(profile_id.0)
+        .bind(min_stability)
+        .bind(lang)
+        .bind(vocabulary.max(0))
         .fetch_all(db.pool())
         .await?;
 

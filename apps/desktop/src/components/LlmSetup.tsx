@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   type CliAvailability,
   type CliPreset,
+  type EffortStyle,
   detectAiBackends,
   errorMessage,
   getLlmSettings,
@@ -10,27 +11,46 @@ import {
   updateLlmSettings,
 } from "../api";
 
-/** 每個 CLI 怎麼呼叫。這些都是實測過的參數。 */
+/**
+ * 每個 CLI 怎麼呼叫。這些都是實測過的參數。
+ *
+ * 模型與推理強度的**清單**不在這裡——那份由後端提供（`CliAvailability.options`），
+ * 免得同一份清單在前後端各維護一次然後長歪。
+ */
 const CLI_SPECS: Record<
   string,
-  { args: string[]; systemFlag: string | null; modelFlag: string | null; model: string; models: string[] }
+  {
+    args: string[];
+    systemFlag: string | null;
+    modelFlag: string | null;
+    model: string;
+    effortStyle: EffortStyle;
+    effort: string;
+  }
 > = {
   claude_code: {
     args: ["-p", "--output-format", "text"],
     systemFlag: "--append-system-prompt",
     modelFlag: "--model",
     model: "sonnet",
-    models: ["haiku", "sonnet", "opus"],
+    effortStyle: { kind: "flag", value: "--effort" },
+    effort: "low",
   },
   codex: {
     // 資料目錄不是 git repo，不加這個會直接拒絕執行
     args: ["exec", "--skip-git-repo-check"],
     systemFlag: null,
     modelFlag: "-m",
+    // 留空用 ~/.codex/config.toml；寫死型號會在舊版 codex 上被拒絕
     model: "",
-    models: [],
+    // codex 沒有獨立的 effort 旗標
+    effortStyle: { kind: "config", value: { flag: "-c", key: "model_reasoning_effort" } },
+    effort: "low",
   },
 };
+
+/** 下拉選單裡代表「我要自己打」的值。用一個不會跟模型名撞到的字串。 */
+const CUSTOM = "\u0000custom";
 
 /**
  * 目前的設定對應到下拉選單的哪一個值。
@@ -45,6 +65,67 @@ function choiceId(settings: LlmSettings): string {
     return "api:openai";
   }
   return "none";
+}
+
+/**
+ * 「從清單挑，或自己打」的欄位。
+ *
+ * 純文字輸入框使用者不知道該填什麼；純下拉選單則會在清單過期時
+ * 把人鎖死。兩個都要有。
+ */
+function Choice({
+  label,
+  value,
+  options,
+  emptyLabel,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  emptyLabel: string;
+  onChange: (value: string) => void;
+}) {
+  // 目前的值不在清單裡，就代表使用者自訂過，要維持在自訂模式
+  const [custom, setCustom] = useState(value !== "" && !options.includes(value));
+
+  if (options.length === 0 || custom) {
+    return (
+      <label>
+        {label}
+        <input value={value} placeholder={emptyLabel} onChange={(e) => onChange(e.target.value)} />
+        {options.length > 0 && (
+          <button className="link" onClick={() => setCustom(false)}>
+            回到清單
+          </button>
+        )}
+      </label>
+    );
+  }
+
+  return (
+    <label>
+      {label}
+      <select
+        value={value}
+        onChange={(e) => {
+          if (e.target.value === CUSTOM) {
+            setCustom(true);
+            return;
+          }
+          onChange(e.target.value);
+        }}
+      >
+        <option value="">{emptyLabel}</option>
+        {options.map((o) => (
+          <option key={o} value={o}>
+            {o}
+          </option>
+        ))}
+        <option value={CUSTOM}>自訂…</option>
+      </select>
+    </label>
+  );
 }
 
 /**
@@ -103,7 +184,10 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
   if (!settings) return <p className="muted">載入中…</p>;
 
   const current = settings;
-  const spec = CLI_SPECS[current.cli.preset];
+  // 清單來自後端；偵測不到就退回空的，欄位變成純文字輸入
+  const options = detected.find((d) => d.preset === current.cli.preset)?.options;
+  const models = options?.models ?? [];
+  const efforts = options?.efforts ?? [];
 
   function choose(id: string) {
     if (id === "none") {
@@ -126,6 +210,8 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
           system_flag: s?.systemFlag ?? null,
           model_flag: s?.modelFlag ?? null,
           model: s?.model ?? "",
+          effort_style: s?.effortStyle ?? { kind: "unsupported" },
+          effort: s?.effort ?? "",
         },
       });
       return;
@@ -187,32 +273,34 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
             ，prompt 從 stdin 送入。
           </p>
 
-          <label>
-            模型
-            {spec && spec.models.length > 0 ? (
-              <select
-                value={current.cli.model}
-                onChange={(e) => save({ ...current, cli: { ...current.cli, model: e.target.value } })}
-              >
-                <option value="">（CLI 預設）</option>
-                {spec.models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                value={current.cli.model}
-                placeholder="（CLI 預設）"
-                onChange={(e) => save({ ...current, cli: { ...current.cli, model: e.target.value } })}
-              />
-            )}
-          </label>
+          <Choice
+            label="模型"
+            value={current.cli.model}
+            options={models}
+            emptyLabel="（CLI 預設）"
+            onChange={(model) => save({ ...current, cli: { ...current.cli, model } })}
+          />
           <p className="muted hint">
             出題與批改是「照著明確規格產生結構化輸出」，中等模型就夠用，
             而且快得多、也比較不會撞到訂閱的速率限制。
+            清單是已知可用的選項，會隨各家改版過期——選「自訂」可以自己打。
           </p>
+
+          {efforts.length > 0 && (
+            <>
+              <Choice
+                label="推理強度"
+                value={current.cli.effort}
+                options={efforts}
+                emptyLabel="（CLI 預設）"
+                onChange={(effort) => save({ ...current, cli: { ...current.cli, effort } })}
+              />
+              <p className="muted hint">
+                這個比換模型更有感。出題不太需要深度推理，但 CLI 的預設值常常是高的——
+                實測把一題從 98 秒降到 37 秒，主要就是靠這裡跟修掉重試迴圈。
+              </p>
+            </>
+          )}
           <p className="muted hint">
             比 API 慢（每題要啟動一個行程，可能幾十秒），訂閱也有速率限制，
             連續出很多題會撞到。

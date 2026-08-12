@@ -26,7 +26,10 @@ pub mod client;
 pub mod prompts;
 mod shell_path;
 
-pub use cli::{CliAvailability, CliConfig, CliLlm, CliPreset, detect_backends};
+pub use cli::{
+    CliAvailability, CliConfig, CliLlm, CliOptions, CliPreset, EffortStyle, cli_options,
+    detect_backends,
+};
 pub use client::{HttpLlm, LlmProvider};
 
 use serde::{Deserialize, Serialize};

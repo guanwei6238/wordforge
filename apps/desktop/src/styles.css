@@ -911,3 +911,18 @@ button.link {
   color: var(--muted);
   font-size: 0.8rem;
 }
+
+/* 「回到清單」這種次要動作，不該長得像主要按鈕 */
+button.link {
+  border: none;
+  background: none;
+  padding: 0 0.3rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+button.link:hover {
+  color: var(--text);
+}

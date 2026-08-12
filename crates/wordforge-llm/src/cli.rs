@@ -59,7 +59,51 @@ pub struct CliConfig {
     /// 出題與批改不需要最強的模型：這些任務是「照著明確規格產生結構化輸出」，
     /// 中等模型就夠，而且快得多、也比較不會撞到訂閱的速率限制。
     pub model: String,
+    /// 推理強度怎麼傳。不同 CLI 的形狀不一樣，見 [`EffortStyle`]。
+    #[serde(default)]
+    pub effort_style: EffortStyle,
+    /// 推理強度。留空就用 CLI 自己的預設。
+    ///
+    /// 這是比換模型更划算的旋鈕：出題是照規格產出結構化內容，
+    /// 不太需要深度推理，但預設值常常是高的。調低通常能省下大半時間。
+    #[serde(default)]
+    pub effort: String,
     pub timeout_secs: u64,
+}
+
+/// 推理強度要用什麼形狀傳給 CLI。
+///
+/// 兩個 CLI 的做法不一樣，不能用同一個「旗標 + 值」的模型硬套：
+///
+/// ```text
+/// claude   --effort high                        獨立旗標
+/// codex    -c model_reasoning_effort=high       設定覆寫
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum EffortStyle {
+    /// 這個 CLI 不支援調整推理強度
+    #[default]
+    Unsupported,
+    /// `<旗標> <值>`
+    Flag(String),
+    /// `-c <鍵>=<值>`
+    Config { flag: String, key: String },
+}
+
+impl EffortStyle {
+    /// 組出要附加的參數。強度留空或不支援時回空陣列。
+    fn args(&self, effort: &str) -> Vec<String> {
+        let effort = effort.trim();
+        if effort.is_empty() {
+            return Vec::new();
+        }
+        match self {
+            EffortStyle::Unsupported => Vec::new(),
+            EffortStyle::Flag(flag) => vec![flag.clone(), effort.to_string()],
+            EffortStyle::Config { flag, key } => vec![flag.clone(), format!("{key}={effort}")],
+        }
+    }
 }
 
 impl CliConfig {
@@ -73,6 +117,9 @@ impl CliConfig {
             model_flag: Some("--model".into()),
             // 出題不需要最強的模型，預設用中等的那個
             model: "sonnet".into(),
+            effort_style: EffortStyle::Flag("--effort".into()),
+            // 出題是照規格產出結構化內容，不太需要深度推理
+            effort: "low".into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -86,8 +133,19 @@ impl CliConfig {
             // codex exec 沒有獨立的 system prompt 參數
             system_flag: None,
             model_flag: Some("-m".into()),
-            // 留空用 codex 自己的預設，模型名稱因帳號方案而異
+            // 留空用 codex 自己的 ~/.codex/config.toml。
+            //
+            // 不寫死型號是因為實測過會壞：`gpt-5.6-luna` 在 codex-cli 0.142.5
+            // 上會被拒絕（"requires a newer version of Codex"）。任何寫死的
+            // 型號都會在某個版本上炸掉，而使用者的 config.toml 一定是對的。
+            // 想指定的話設定頁的下拉選單裡有。
             model: String::new(),
+            // codex 沒有獨立的 effort 旗標，要走設定覆寫
+            effort_style: EffortStyle::Config {
+                flag: "-c".into(),
+                key: "model_reasoning_effort".into(),
+            },
+            effort: "low".into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -103,9 +161,66 @@ impl CliConfig {
                 system_flag: None,
                 model_flag: None,
                 model: String::new(),
+                effort_style: EffortStyle::Unsupported,
+                effort: String::new(),
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
             },
         }
+    }
+}
+
+/// 設定頁要顯示的選項。
+///
+/// 純文字輸入框對使用者不友善——他不會知道 `gpt-5.6-luna` 或 `xhigh`
+/// 是不是有效的值，打錯了也要等到出題失敗才知道。
+///
+/// 但**清單一定會過期**：模型名稱常換，而且因帳號方案而異。所以這裡
+/// 給的是「已知可用的選項」，UI 必須同時允許自己輸入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliOptions {
+    pub preset: CliPreset,
+    /// 建議的模型。第一個是預設值。
+    pub models: Vec<String>,
+    /// 支援的推理強度。空的代表這個 CLI 不支援調整。
+    pub efforts: Vec<String>,
+}
+
+/// 各 CLI 的模型與推理強度選項。
+///
+/// 值取自各 CLI 的 `--help`，不是猜的：
+///
+/// ```text
+/// claude --help
+///   --model <model>   別名 'fable' / 'opus' / 'sonnet'，或完整名稱
+///   --effort <level>  low, medium, high, xhigh, max
+///
+/// codex exec --help
+///   -m, --model <MODEL>
+///   （沒有 effort 旗標，走 -c model_reasoning_effort=）
+/// ```
+///
+/// Claude 這邊刻意用**別名**而不是完整型號：別名永遠指向該級別的最新模型，
+/// 完整型號會在下一次改版時失效，而這份清單沒有人會記得回來更新。
+pub fn cli_options(preset: CliPreset) -> CliOptions {
+    let (models, efforts): (&[&str], &[&str]) = match preset {
+        CliPreset::ClaudeCode => (
+            &["sonnet", "opus", "haiku", "fable"],
+            &["low", "medium", "high", "xhigh", "max"],
+        ),
+        // codex 沒有公開的模型清單。新型號需要夠新的 CLI——
+        // `gpt-5.6-luna` 在 0.142.5 上會回
+        // "requires a newer version of Codex"，所以選了沒反應要先升級 codex。
+        CliPreset::Codex => (
+            &["gpt-5.6-luna", "gpt-5.5", "gpt-5"],
+            &["low", "medium", "high"],
+        ),
+        CliPreset::Custom => (&[], &[]),
+    };
+
+    CliOptions {
+        preset,
+        models: models.iter().map(|s| s.to_string()).collect(),
+        efforts: efforts.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -118,13 +233,10 @@ pub struct CliAvailability {
     pub installed: bool,
     /// 裝了的話是哪一版，讓使用者確認自己看的是同一個東西
     pub version: Option<String>,
+    /// 這個後端有哪些模型與推理強度可選
+    pub options: CliOptions,
 }
 
-/// 這台機器上有哪些 CLI 可以用。
-///
-/// 直接執行 `--version` 而不是找 PATH：使用者可能用 alias、
-/// wrapper script 或自訂路徑，能不能跑起來才是真正的答案。
-/// 兩個指令都在 0.3 秒內回應，開設定頁時查一次不影響體感。
 /// 把「找不到直譯器」翻成使用者能動手處理的話。
 ///
 /// `/usr/bin/env: 'node': No such file or directory` 加上退出碼 127
@@ -139,12 +251,11 @@ fn interpreter_hint(body: &str, program: &str) -> Option<String> {
         })?;
 
     Some(format!(
-        "`{program}` 是 {missing} 程式，但系統找不到 {missing}。
-
-         如果你在終端機裡跑 `{program}` 是正常的，那多半是因為 {missing} 裝在          nvm / asdf 之類的版本管理器底下——那些路徑只有互動式 shell 才會載入，         從應用程式選單啟動的程式看不到。
-
-         可以試試：從終端機啟動 App，或把 {missing} 的路徑加進 ~/.profile。
-
+        "`{program}` 是 {missing} 程式，但系統找不到 {missing}。\n\n\
+         如果你在終端機裡跑 `{program}` 是正常的，那多半是因為 {missing} 裝在 \
+         nvm / asdf 之類的版本管理器底下——那些路徑只有互動式 shell 才會載入，\
+         從應用程式選單啟動的程式看不到。\n\n\
+         可以試試：從終端機啟動 App，或把 {missing} 的路徑加進 ~/.profile。\n\n\
          原始訊息：{body}"
     ))
 }
@@ -166,6 +277,11 @@ async fn command_with_user_path(program: &str) -> Command {
     cmd
 }
 
+/// 這台機器上有哪些 CLI 可以用。
+///
+/// 直接執行 `--version` 而不是找 PATH：使用者可能用 alias、
+/// wrapper script 或自訂路徑，能不能跑起來才是真正的答案。
+/// 兩個指令都在 0.3 秒內回應，開設定頁時查一次不影響體感。
 pub async fn detect_backends() -> Vec<CliAvailability> {
     let candidates = [
         (CliPreset::ClaudeCode, "Claude Code", "claude"),
@@ -190,6 +306,7 @@ pub async fn detect_backends() -> Vec<CliAvailability> {
             program: program.to_string(),
             installed: version.is_some(),
             version,
+            options: cli_options(preset),
         });
     }
     out
@@ -217,6 +334,8 @@ impl CliLlm {
             args.push(flag.clone());
             args.push(self.config.model.trim().to_string());
         }
+
+        args.extend(self.config.effort_style.args(&self.config.effort));
 
         if let (Some(flag), Some(system)) = (&self.config.system_flag, &req.system) {
             args.push(flag.clone());
@@ -479,6 +598,86 @@ mod tests {
         assert_eq!(args[pos + 1], "gpt-5");
     }
 
+    /// claude 用獨立旗標，codex 走設定覆寫——形狀不同，不能用同一套硬套。
+    #[test]
+    fn each_cli_passes_effort_in_its_own_shape() {
+        let mut cfg = CliConfig::claude_code();
+        cfg.effort = "low".into();
+        let args = CliLlm::new(cfg).unwrap().build_args(&req());
+        let pos = args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("沒有 effort");
+        assert_eq!(args[pos + 1], "low");
+
+        let mut cfg = CliConfig::codex();
+        cfg.effort = "medium".into();
+        let args = CliLlm::new(cfg).unwrap().build_args(&req());
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=medium"),
+            "{args:?}"
+        );
+    }
+
+    /// 留空代表「用 CLI 自己的預設」，不能傳一個空字串進去。
+    #[test]
+    fn an_empty_effort_adds_nothing() {
+        let mut cfg = CliConfig::claude_code();
+        cfg.effort = "  ".into();
+        let args = CliLlm::new(cfg).unwrap().build_args(&req());
+        assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+    }
+
+    /// 不支援的 CLI 不能被塞一個它看不懂的參數。
+    #[test]
+    fn an_unsupported_cli_never_gets_an_effort_argument() {
+        let mut cfg = CliConfig::preset(CliPreset::Custom);
+        cfg.program = "sh".into();
+        cfg.effort = "high".into();
+        let args = CliLlm::new(cfg).unwrap().build_args(&req());
+        assert!(args.is_empty(), "{args:?}");
+    }
+
+    /// 設定頁靠這份清單做下拉選單。清單會過期，但空的清單等於沒有 UI。
+    #[test]
+    fn every_supported_preset_offers_choices() {
+        for preset in [CliPreset::ClaudeCode, CliPreset::Codex] {
+            let o = cli_options(preset);
+            assert!(!o.models.is_empty(), "{preset:?} 沒有模型選項");
+            assert!(!o.efforts.is_empty(), "{preset:?} 沒有強度選項");
+        }
+        // 預設值要嘛在清單裡，要嘛是空的（代表「用 CLI 自己的設定」）。
+        // 落在兩者之外的話，設定頁一打開就會顯示成「自訂」，很奇怪。
+        for (preset, default_model) in [
+            (CliPreset::ClaudeCode, CliConfig::claude_code().model),
+            (CliPreset::Codex, CliConfig::codex().model),
+        ] {
+            let models = cli_options(preset).models;
+            assert!(
+                default_model.is_empty() || models.contains(&default_model),
+                "{preset:?} 的預設模型 {default_model:?} 不在清單裡"
+            );
+        }
+        assert!(
+            cli_options(CliPreset::ClaudeCode)
+                .efforts
+                .contains(&CliConfig::claude_code().effort)
+        );
+    }
+
+    /// 舊的設定檔沒有 effort 欄位，讀進來不能整份壞掉。
+    #[test]
+    fn settings_written_before_effort_existed_still_load() {
+        let old = r#"{"preset":"claude_code","program":"claude","args":["-p"],
+                      "system_flag":null,"model_flag":"--model","model":"sonnet",
+                      "timeout_secs":300}"#;
+        let cfg: CliConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.model, "sonnet");
+        assert_eq!(cfg.effort, "");
+        assert_eq!(cfg.effort_style, EffortStyle::Unsupported);
+    }
+
     /// 偵測要看「跑不跑得起來」而不是「PATH 裡有沒有」——
     /// 使用者可能用 alias、wrapper script 或自訂路徑。
     #[tokio::test]
@@ -525,6 +724,8 @@ mod tests {
             system_flag: None,
             model_flag: None,
             model: "cat".into(),
+            effort_style: EffortStyle::Unsupported,
+            effort: String::new(),
             timeout_secs: 10,
         })
         .unwrap();
@@ -558,6 +759,8 @@ mod tests {
             system_flag: None,
             model_flag: None,
             model: "failing".into(),
+            effort_style: EffortStyle::Unsupported,
+            effort: String::new(),
             timeout_secs: 10,
         })
         .unwrap();
@@ -580,6 +783,8 @@ mod tests {
             system_flag: None,
             model_flag: None,
             model: String::new(),
+            effort_style: EffortStyle::Unsupported,
+            effort: String::new(),
             timeout_secs: 10,
         })
         .unwrap();
@@ -610,6 +815,8 @@ mod tests {
             system_flag: None,
             model_flag: None,
             model: String::new(),
+            effort_style: EffortStyle::Unsupported,
+            effort: String::new(),
             timeout_secs: 10,
         })
         .unwrap();
@@ -648,6 +855,8 @@ mod tests {
             system_flag: None,
             model_flag: None,
             model: "sleepy".into(),
+            effort_style: EffortStyle::Unsupported,
+            effort: String::new(),
             timeout_secs: 1,
         })
         .unwrap();
