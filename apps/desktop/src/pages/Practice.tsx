@@ -354,6 +354,13 @@ export default function Practice() {
             </div>
           )}
 
+          {feedback.taught_words?.length > 0 && (
+            <p className="muted">
+              這篇教的新字：{feedback.taught_words.join("、")}
+              ——都已排進複習，之後的文章不會再拿同一批。
+            </p>
+          )}
+
           {feedback.added_to_deck.length > 0 ? (
             <p className="ok">
               已把 {feedback.added_to_deck.length} 個你不熟的字排進複習：

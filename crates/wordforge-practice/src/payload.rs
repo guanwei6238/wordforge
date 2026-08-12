@@ -157,6 +157,10 @@ pub struct Feedback {
     /// 文章裡的生字與片語，由本地字典查出來，不是模型寫的。
     #[serde(default)]
     pub glossary: Vec<GlossaryNote>,
+    /// 這篇刻意要教的新字。跟 `unknown_words` 分開：那些是你答錯時
+    /// 露出來的，這些是系統本來就打算教你的。兩者都會進牌組。
+    #[serde(default)]
+    pub taught_words: Vec<String>,
 }
 
 #[cfg(test)]

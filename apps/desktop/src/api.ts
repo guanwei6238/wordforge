@@ -831,6 +831,8 @@ export interface Feedback {
   unknown_words: string[];
   /** 實際加進牌組的（字典查得到、還沒學過的） */
   added_to_deck: string[];
+  /** 這篇刻意要教的新字。跟 unknown_words 分開：那些是你答錯時露出來的 */
+  taught_words: string[];
   /** 文章裡的生字與片語，本地字典查的 */
   glossary: GlossaryNote[];
 }

@@ -1353,3 +1353,120 @@ async fn a_drained_pool_repeats_rather_than_giving_none() {
         "只有一個候選時要重複給，不能給空的"
     );
 }
+
+/// 這篇教的生詞，讀完就該進牌組。
+///
+/// 不這樣做的話，使用者得自己一個一個點「我不會」才會被記錄，
+/// 而人不會這樣做——從上下文看懂了就往下讀了。結果是那些字永遠留在
+/// 候選池裡，只能靠五篇的記憶視窗擋著，六篇之後又拿到同一批。
+#[tokio::test]
+async fn words_taught_by_an_article_enter_the_deck() {
+    let (db, profile) = setup(&["the", "cat", "sat", "solitary", "gaze"]).await;
+    set_vocabulary(&db, profile, 3_000).await;
+    make_rare(&db, 4, 3_500).await;
+    make_rare(&db, 5, 3_600).await;
+
+    let llm = FakeLlm::new(&[
+        // 大部分是已知詞，覆蓋率才過得了驗收
+        r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat solitary.",
+            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#,
+        r#"{"score":100,"items":[{"index":1,"correct":true}],"unknown_words":[]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let ex = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+    assert!(!ex.target_words.is_empty(), "這篇要有生詞");
+
+    // 全部答對、一個字都沒標記——最常見的情況
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: ex.exercise_id,
+                answers: vec![],
+                choices: vec![Some(0)],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    for word in &ex.target_words {
+        assert!(
+            feedback.taught_words.contains(word),
+            "{word} 該被列為這篇教的字：{:?}",
+            feedback.taught_words
+        );
+        let in_deck: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM card c JOIN lemma l ON l.id = c.lemma_id
+             WHERE c.profile_id = ? AND l.text = ?",
+        )
+        .bind(profile)
+        .bind(word)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(in_deck, 1, "{word} 沒有進牌組");
+    }
+}
+
+/// 進了牌組之後就不該再被當成生詞——輪換從此是永久的，
+/// 不再只靠五篇的記憶視窗。
+#[tokio::test]
+async fn a_word_already_taught_is_never_offered_as_new_again() {
+    let (db, profile) = setup(&["the", "cat", "sat", "solitary", "gaze"]).await;
+    set_vocabulary(&db, profile, 3_000).await;
+    make_rare(&db, 4, 3_500).await;
+    make_rare(&db, 5, 3_600).await;
+
+    let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat.",
+        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let graded = r#"{"score":100,"items":[{"index":1,"correct":true}],"unknown_words":[]}"#;
+    let llm = FakeLlm::new(&[passage, graded, passage, graded, passage]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let first = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: first.exercise_id,
+                answers: vec![],
+                choices: vec![Some(0)],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    // 把出題歷史清掉，證明「不重複」靠的是牌組而不是記憶視窗
+    sqlx::query("DELETE FROM exercise WHERE profile_id = ?")
+        .bind(profile)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let second = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::Reading),
+            t0() + Duration::hours(1),
+        )
+        .await
+        .unwrap();
+
+    for word in &second.target_words {
+        assert!(
+            !first.target_words.contains(word),
+            "{word} 已經教過也進牌組了，不該再當生詞"
+        );
+    }
+}

@@ -628,9 +628,40 @@ impl<'a> PracticeEngine<'a> {
             }
         }
 
-        feedback.added_to_deck = self
-            .add_unknown_words(profile_id, &feedback.unknown_words, now)
-            .await?;
+        // 這篇刻意教的生詞也一起排進複習。
+        //
+        // 那些字是系統自己挑的——「你程度上緣、還沒學過」——然後放進
+        // 一篇有上下文的文章讓他讀。讀完就是這個字的第一次接觸，
+        // 該進牌組了。
+        //
+        // 不這樣做的話使用者得自己一個一個點「我不會」才會被記錄，
+        // 而人不會這樣做：從上下文看懂了就往下讀了。結果是那些字
+        // 永遠留在候選池裡，下一篇又拿到同一批。
+        //
+        // 進了牌組還有一個好處：`new_word_candidates` 排除牌組裡的字，
+        // 所以輪換從此是永久的，五篇的記憶視窗只是還沒作答時的備援。
+        // 只有閱讀類的 `target_words` 是「刻意挑的生詞」。翻譯題存的是
+        // 到期的複習字——那些他已經在學了，當成新教的字加進牌組是錯的。
+        let injects_new_words = matches!(body, ExerciseBody::Reading { .. });
+        let taught: Vec<String> = record
+            .target_words
+            .iter()
+            .filter(|_| injects_new_words)
+            .filter(|w| {
+                !feedback
+                    .unknown_words
+                    .iter()
+                    .any(|u| u.eq_ignore_ascii_case(w))
+            })
+            .cloned()
+            .collect();
+
+        let mut to_add = feedback.unknown_words.clone();
+        to_add.extend(taught.iter().cloned());
+
+        feedback.added_to_deck = self.add_unknown_words(profile_id, &to_add, now).await?;
+        // UI 要分得出「你不會所以幫你加」與「這篇教的，順便加」
+        feedback.taught_words = taught;
 
         self.record_grammar_results(profile_id, &body, input, &feedback, now)
             .await?;
