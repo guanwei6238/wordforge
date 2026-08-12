@@ -295,6 +295,14 @@ impl<'a> PracticeEngine<'a> {
     ) -> Result<ExerciseView> {
         let count = practice::translation_count(learner.vocabulary);
         let words = self.translation_words(profile_id, count, now).await?;
+        // 湊不出那麼多字就少出幾題。硬湊只能拿沒學過的字填，
+        // 那等於要他寫出從沒見過的單字——寧可這次只練三題。
+        // 一個字都沒有時保持原題數：那時模型是自由造句，不受單字限制。
+        let count = if words.is_empty() {
+            count
+        } else {
+            count.min(words.len())
+        };
 
         let excerpt = self
             .material_excerpt(&words, now.unix_timestamp() as u64)
@@ -1387,11 +1395,13 @@ impl<'a> PracticeEngine<'a> {
     ///
     /// ## 湊不齊的時候
     ///
-    /// 依序放寬，每一層都比上一層差一點，但都比「出不了題」好：
+    /// 學過的字先互相補：到期的不夠就多抽學會的，隨機抽的不夠就用剩下的
+    /// 到期字。補完還是少於 `count` 就**回傳少於 count 個**——呼叫端會
+    /// 把題數縮到實際拿得到的字數，不硬湊。少出兩題比拿沒學過的字出題好。
     ///
-    /// 1. 學過且到期的 → 隨機抽學會的 → 兩邊互相補
-    /// 2. 還是不夠：連沒學過的到期字也拿。新使用者的牌組全是新卡，
-    ///    這時候一個字都給不出來比給沒學過的字更糟。
+    /// 只有**一個學過的字都沒有**時才退到沒學過的到期字。那是新使用者
+    /// 才會遇到的狀況（匯完字典、加了一批字就來練），這時候給空白比
+    /// 給新卡更糟。
     async fn translation_words(
         &self,
         profile_id: i64,
@@ -1443,8 +1453,10 @@ impl<'a> PracticeEngine<'a> {
             words.extend(more);
         }
 
-        // 最後手段：連沒學過的到期字也拿
-        if words.len() < count {
+        // 最後手段：一個學過的字都沒有時，才拿沒學過的到期字。
+        // 條件是 `is_empty` 而不是 `< count`——只差幾個字的時候要縮題數，
+        // 不是拿新卡湊滿。
+        if words.is_empty() {
             fill(
                 self.due_words(profile_id, count as i64, now).await?,
                 &mut words,

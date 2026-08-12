@@ -1684,6 +1684,43 @@ async fn translation_does_not_quiz_words_the_learner_has_never_studied() {
     }
 }
 
+/// 學過的字不夠出滿題數時，**縮題數**而不是拿新卡湊滿。
+///
+/// 少出兩題比要使用者寫出從沒見過的單字好。只有一個學過的字都沒有時
+/// 才會退到新卡（見下一條測試）。
+#[tokio::test]
+async fn too_few_studied_words_shrinks_the_exercise_instead_of_using_new_cards() {
+    let (db, profile) = setup(&["alpha", "never1", "never2", "never3", "never4"]).await;
+    set_vocabulary(&db, profile, 1_000).await; // 滿額是 5 題
+
+    study(&db, profile, 1).await; // 只有一個字學過
+    for id in 2..=5 {
+        put_in_deck(&db, profile, id).await;
+    }
+
+    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        prompt.contains("請出 1 個"),
+        "題數要縮到拿得到的字數：\n{prompt}"
+    );
+    for never in ["never1", "never2", "never3", "never4"] {
+        assert!(!prompt.contains(never), "不該拿新卡湊滿：{never}");
+    }
+}
+
 /// 但牌組裡**只有**沒學過的字時，還是要出得了題。
 ///
 /// 新使用者匯完字典、加了一批字就來練翻譯，這時候一個學過的字都沒有。
