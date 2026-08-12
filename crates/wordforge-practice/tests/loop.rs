@@ -375,7 +375,7 @@ async fn a_passage_that_is_too_hard_gets_regenerated() {
             "questions":[],"new_words":[]}"#,
         // 重寫後只用已知詞
         r#"{"title":"Easy","passage":"The cat sat on the mat. The cat sat.",
-            "questions":[{"question":"Where?","options":["mat","tree"],"answer_index":0}],
+            "questions":[{"question":"Where?","options":["mat","tree"],"option_notes":["note1","note2"],"answer_index":0}],
             "new_words":[]}"#,
     ]);
 
@@ -407,9 +407,9 @@ async fn grammar_choices_are_graded_locally() {
     set_vocabulary(&db, profile, 1_000).await;
 
     let llm = FakeLlm::new(&[r#"{"items":[
-             {"prompt":"I ___ yesterday","options":["go","went"],"answer_index":1,
+             {"prompt":"I ___ yesterday","options":["go","went"],"option_notes":["note1","note2"],"answer_index":1,
               "grammar_point":"tense","explanation":"過去式"},
-             {"prompt":"She ___ a book","options":["read","reads"],"answer_index":1,
+             {"prompt":"She ___ a book","options":["read","reads"],"option_notes":["note1","note2"],"answer_index":1,
               "grammar_point":"agreement"}
            ]}"#]);
     let engine = PracticeEngine::new(&db, &llm);
@@ -449,11 +449,11 @@ async fn wrong_grammar_answers_become_recorded_weak_points() {
     set_vocabulary(&db, profile, 1_000).await;
 
     let llm = FakeLlm::new(&[r#"{"items":[
-             {"prompt":"I ___ yesterday","options":["go","went"],"answer_index":1,
+             {"prompt":"I ___ yesterday","options":["go","went"],"option_notes":["note1","note2"],"answer_index":1,
               "grammar_point":"tense","explanation":"過去式"},
-             {"prompt":"She ___ a book","options":["read","reads"],"answer_index":1,
+             {"prompt":"She ___ a book","options":["read","reads"],"option_notes":["note1","note2"],"answer_index":1,
               "grammar_point":"subject-verb agreement"},
-             {"prompt":"___ apple","options":["a","an"],"answer_index":1,
+             {"prompt":"___ apple","options":["a","an"],"option_notes":["note1","note2"],"answer_index":1,
               "grammar_point":"articles"}
            ]}"#]);
     let engine = PracticeEngine::new(&db, &llm);
@@ -680,7 +680,9 @@ async fn the_vocabulary_sample_is_bounded_and_spans_difficulties() {
     drop(conn);
     set_vocabulary(&db, profile.0, 2_000).await;
 
-    let llm = FakeLlm::new(&[r#"{"items":[{"prompt":"x","options":["a","b"],"answer_index":0}]}"#]);
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"prompt":"x","options":["a","b"],"option_notes":["note1","note2"],"answer_index":0}]}"#,
+    ]);
     let engine = PracticeEngine::new(&db, &llm);
     engine
         .generate(profile.0, Some(ExerciseKind::Grammar), t0())
@@ -765,7 +767,9 @@ async fn a_small_deck_does_not_make_the_learner_look_like_a_beginner() {
     }
     set_vocabulary(&db, profile.0, 1_000).await;
 
-    let llm = FakeLlm::new(&[r#"{"items":[{"prompt":"x","options":["a","b"],"answer_index":0}]}"#]);
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"prompt":"x","options":["a","b"],"option_notes":["note1","note2"],"answer_index":0}]}"#,
+    ]);
     let engine = PracticeEngine::new(&db, &llm);
     engine
         .generate(profile.0, Some(ExerciseKind::Grammar), t0())
@@ -881,9 +885,9 @@ async fn grammar_labels_are_normalized_to_one_point() {
 
     // 三題都在考時態，但模型每題寫成不同說法
     let llm = FakeLlm::new(&[r#"{"items":[
-             {"prompt":"a","options":["x","y"],"answer_index":0,"grammar_point":"tense"},
-             {"prompt":"b","options":["x","y"],"answer_index":0,"grammar_point":"Past Tense"},
-             {"prompt":"c","options":["x","y"],"answer_index":0,"grammar_point":"verb_tense"}
+             {"prompt":"a","options":["x","y"],"option_notes":["note1","note2"],"answer_index":0,"grammar_point":"tense"},
+             {"prompt":"b","options":["x","y"],"option_notes":["note1","note2"],"answer_index":0,"grammar_point":"Past Tense"},
+             {"prompt":"c","options":["x","y"],"option_notes":["note1","note2"],"answer_index":0,"grammar_point":"verb_tense"}
            ]}"#]);
     let engine = PracticeEngine::new(&db, &llm);
     let exercise = engine
@@ -921,8 +925,8 @@ async fn unrecognised_grammar_labels_are_dropped() {
     set_vocabulary(&db, profile, 1_000).await;
 
     let llm = FakeLlm::new(&[r#"{"items":[
-             {"prompt":"a","options":["x","y"],"answer_index":0,"grammar_point":"這句怪怪的"},
-             {"prompt":"b","options":["x","y"],"answer_index":0,"grammar_point":"articles"}
+             {"prompt":"a","options":["x","y"],"option_notes":["note1","note2"],"answer_index":0,"grammar_point":"這句怪怪的"},
+             {"prompt":"b","options":["x","y"],"option_notes":["note1","note2"],"answer_index":0,"grammar_point":"articles"}
            ]}"#]);
     let engine = PracticeEngine::new(&db, &llm);
     let exercise = engine
@@ -1028,7 +1032,7 @@ async fn the_reading_glossary_comes_from_the_dictionary_not_the_model() {
     make_rare(&db, 2, 30_000).await;
 
     let passage = r#"{"title":"T","passage":"She had to search for the diligent key.",
-            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+            "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[
         passage,
         passage,
@@ -1099,7 +1103,7 @@ async fn phrases_are_detected_in_a_language_without_spaces() {
     set_vocabulary(&db, profile, 2_000).await;
 
     let passage = r#"{"title":"T","passage":"勤勉な人は気にする。",
-            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+            "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[
         passage,
         passage,
@@ -1304,7 +1308,7 @@ async fn no_known_words_means_no_pointless_retries() {
     make_rare(&db, 2, 30_000).await;
 
     let llm = FakeLlm::new(&[r#"{"title":"T","passage":"Alpha beta gamma delta.",
-            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#]);
+            "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#]);
 
     let engine = PracticeEngine::new(&db, &llm);
     let ex = engine
@@ -1324,7 +1328,7 @@ async fn a_baseline_still_enforces_the_coverage_rule() {
     make_rare(&db, 6, 30_000).await;
 
     let hard = r#"{"title":"H","passage":"Ubiquitous ubiquitous ubiquitous.",
-            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+            "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[hard, hard, hard]);
 
     let engine = PracticeEngine::new(&db, &llm);
@@ -1358,7 +1362,7 @@ async fn consecutive_articles_teach_different_new_words() {
     }
 
     let passage = r#"{"title":"T","passage":"The cat sat.",
-        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+        "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[passage, passage, passage, passage, passage, passage]);
     let engine = PracticeEngine::new(&db, &llm);
 
@@ -1395,7 +1399,7 @@ async fn a_drained_pool_repeats_rather_than_giving_none() {
     make_rare(&db, 4, 3_500).await;
 
     let passage = r#"{"title":"T","passage":"The cat sat.",
-        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+        "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[passage, passage, passage, passage, passage, passage]);
     let engine = PracticeEngine::new(&db, &llm);
 
@@ -1437,7 +1441,7 @@ async fn words_taught_by_an_article_enter_the_deck() {
     let llm = FakeLlm::new(&[
         // 大部分是已知詞，覆蓋率才過得了驗收
         r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat solitary.",
-            "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#,
+            "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#,
         r#"{"score":100,"items":[{"index":1,"correct":true}],"unknown_words":[]}"#,
     ]);
 
@@ -1492,7 +1496,7 @@ async fn a_word_already_taught_is_never_offered_as_new_again() {
     make_rare(&db, 5, 3_600).await;
 
     let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat.",
-        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+        "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let graded = r#"{"score":100,"items":[{"index":1,"correct":true}],"unknown_words":[]}"#;
     let llm = FakeLlm::new(&[passage, graded, passage, graded, passage]);
     let engine = PracticeEngine::new(&db, &llm);
@@ -1550,10 +1554,10 @@ async fn the_correct_answer_does_not_always_sit_in_the_same_slot() {
 
     // 每一份都是四題，而且模型每次都把答案放在第一個
     const ITEMS: &str = r#"{"items":[
-             {"prompt":"a","options":["A1","A2","A3","A4"],"answer_index":0},
-             {"prompt":"b","options":["B1","B2","B3","B4"],"answer_index":0},
-             {"prompt":"c","options":["C1","C2","C3","C4"],"answer_index":0},
-             {"prompt":"d","options":["D1","D2","D3","D4"],"answer_index":0}
+             {"prompt":"a","options":["A1","A2","A3","A4"],"option_notes":["note1","note2","note3","note4"],"answer_index":0},
+             {"prompt":"b","options":["B1","B2","B3","B4"],"option_notes":["note1","note2","note3","note4"],"answer_index":0},
+             {"prompt":"c","options":["C1","C2","C3","C4"],"option_notes":["note1","note2","note3","note4"],"answer_index":0},
+             {"prompt":"d","options":["D1","D2","D3","D4"],"option_notes":["note1","note2","note3","note4"],"answer_index":0}
            ]}"#;
     const ROUNDS: i64 = 10;
 
@@ -1641,7 +1645,7 @@ async fn the_full_translation_is_kept_when_the_model_gives_one() {
     set_vocabulary(&db, profile, 2_000).await;
 
     let with = r#"{"title":"T","passage":"The cat sat.","translation":"貓坐下了。",
-        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+        "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[with]);
     let engine = PracticeEngine::new(&db, &llm);
     let exercise = engine
@@ -1656,7 +1660,7 @@ async fn the_full_translation_is_kept_when_the_model_gives_one() {
 
     // 只給空字串的話要當成沒給——UI 會出現一個打開來是空白的「全文翻譯」
     let blank = r#"{"title":"T","passage":"The cat sat.","translation":"   ",
-        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+        "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let llm = FakeLlm::new(&[blank]);
     let engine = PracticeEngine::new(&db, &llm);
     let exercise = engine
@@ -1685,9 +1689,9 @@ async fn choosing_cloze_actually_produces_a_cloze() {
         "passage":"I had to {{1}} an umbrella because the {{2}} was bad.",
         "translation":"因為天氣很差，我得借一把傘。",
         "items":[
-          {"options":["borrow","lend","buy","sell"],"answer_index":0,
+          {"options":["borrow","lend","buy","sell"],"option_notes":["note1","note2","note3","note4"],"answer_index":0,
            "explanation":"跟別人借用 borrow"},
-          {"options":["weather","water","winter","wonder"],"answer_index":0,
+          {"options":["weather","water","winter","wonder"],"option_notes":["note1","note2","note3","note4"],"answer_index":0,
            "explanation":"講的是天氣"}
         ]}"#]);
 
@@ -1740,8 +1744,8 @@ async fn a_missed_blank_goes_back_into_the_deck() {
     let llm = FakeLlm::new(&[r#"{"title":"T",
         "passage":"I had to {{1}} an umbrella because the {{2}} was bad.",
         "items":[
-          {"options":["borrow","lend","buy","sell"],"answer_index":0},
-          {"options":["weather","water","winter","wonder"],"answer_index":0}
+          {"options":["borrow","lend","buy","sell"],"option_notes":["note1","note2","note3","note4"],"answer_index":0},
+          {"options":["weather","water","winter","wonder"],"option_notes":["note1","note2","note3","note4"],"answer_index":0}
         ]}"#]);
 
     let engine = PracticeEngine::new(&db, &llm);
@@ -1790,9 +1794,9 @@ async fn extra_cloze_questions_without_a_blank_are_dropped() {
 
     let llm = FakeLlm::new(&[r#"{"title":"T","passage":"Please {{1}} it back.",
         "items":[
-          {"options":["return","borrow"],"answer_index":0},
-          {"options":["a","b"],"answer_index":0},
-          {"options":["c","d"],"answer_index":0}
+          {"options":["return","borrow"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["a","b"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["c","d"],"option_notes":["note1","note2"],"answer_index":0}
         ]}"#]);
 
     let engine = PracticeEngine::new(&db, &llm);
@@ -1828,9 +1832,9 @@ async fn cloze_does_not_flush_the_reading_word_history() {
     study(&db, profile, 4).await;
 
     let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat.",
-        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+        "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let cloze = r#"{"title":"C","passage":"Please {{1}} it.",
-        "items":[{"options":["borrow","lend"],"answer_index":0}]}"#;
+        "items":[{"options":["borrow","lend"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
 
     let llm = FakeLlm::new(&[passage, cloze, cloze, cloze, cloze, cloze, passage]);
     let engine = PracticeEngine::new(&db, &llm);
@@ -1887,10 +1891,10 @@ async fn blanks_written_out_of_order_are_renumbered_not_rejected() {
     let llm = FakeLlm::new(&[r#"{"title":"T",
         "passage":"w {{2}} x {{4}} y {{1}} z {{3}}.",
         "items":[
-          {"options":["one-right","one-wrong"],"answer_index":0},
-          {"options":["two-right","two-wrong"],"answer_index":0},
-          {"options":["three-right","three-wrong"],"answer_index":0},
-          {"options":["four-right","four-wrong"],"answer_index":0}
+          {"options":["one-right","one-wrong"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["two-right","two-wrong"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["three-right","three-wrong"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["four-right","four-wrong"],"option_notes":["note1","note2"],"answer_index":0}
         ]}"#]);
 
     let engine = PracticeEngine::new(&db, &llm);
@@ -1999,9 +2003,9 @@ async fn per_question_comments_follow_the_index_not_the_position() {
 
     let passage = r#"{"title":"T","passage":"The cat sat.",
         "questions":[
-          {"question":"Q1","options":["a","b"],"answer_index":0},
-          {"question":"Q2","options":["a","b"],"answer_index":0},
-          {"question":"Q3","options":["a","b"],"answer_index":0}
+          {"question":"Q1","options":["a","b"],"option_notes":["note1","note2"],"answer_index":0},
+          {"question":"Q2","options":["a","b"],"option_notes":["note1","note2"],"answer_index":0},
+          {"question":"Q3","options":["a","b"],"option_notes":["note1","note2"],"answer_index":0}
         ]}"#;
     // 模型回的順序是 3、1，而且漏了第 2 題
     let graded = r#"{"score":0,"items":[
@@ -2038,4 +2042,159 @@ async fn per_question_comments_follow_the_index_not_the_position() {
         "模型沒講第二題，就不該把別題的講評貼上來"
     );
     assert_eq!(feedback.items[2].comment.as_deref(), Some("第三題的講評"));
+}
+
+/// 逐選項解說沒生齊時要補一次，而且**只收解說**。
+///
+/// 這條測試存在的理由是壞掉的方式很難看出來：重試回來的內容如果整份收下，
+/// 模型很可能順手把題目重寫一遍——那樣答案就跟原本的題目對不上了，
+/// 而使用者看不出來。只搬 option_notes，壞掉的重試最多是「還是沒有解說」。
+#[tokio::test]
+async fn missing_option_notes_are_filled_without_rewriting_the_questions() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[
+        // 第一次：兩題都沒有 option_notes
+        r#"{"items":[
+             {"prompt":"a","options":["a-right","a-wrong"],"answer_index":0},
+             {"prompt":"b","options":["b-right","b-wrong"],"answer_index":0}
+           ]}"#,
+        // 補的時候順手把題目也重寫了——這些欄位必須被忽略
+        r#"{"items":[
+             {"prompt":"REWRITTEN","options":["x","y"],"answer_index":1,
+              "option_notes":["a-right 的說明","a-wrong 的說明"]},
+             {"prompt":"REWRITTEN","options":["x","y"],"answer_index":1,
+              "option_notes":["b-right 的說明","b-wrong 的說明"]}
+           ]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "缺解說時該補一次");
+
+    // 重試訊息要帶著上一次的結果：非交互式的後端不記得自己寫過什麼
+    let retry = llm.last_prompt();
+    assert!(retry.contains("a-right"), "沒有附上上一次的題目：{retry}");
+    assert!(retry.contains("不要改動也不要重寫題目"), "{retry}");
+
+    let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+        panic!("該是選擇題");
+    };
+
+    for item in items {
+        // 題目與選項一律沿用原本那份
+        assert_ne!(item.question, "REWRITTEN", "重試把題目蓋掉了");
+        assert!(
+            item.options
+                .iter()
+                .all(|o| o.ends_with("-right") || o.ends_with("-wrong")),
+            "選項被重試蓋掉了：{:?}",
+            item.options
+        );
+        // 解說要收下，而且跟著它自己的選項
+        assert_eq!(item.option_notes.len(), item.options.len());
+        for (option, note) in item.options.iter().zip(&item.option_notes) {
+            assert_eq!(note, &format!("{option} 的說明"), "解說配到別的選項了");
+        }
+    }
+}
+
+/// 補回來的解說長度還是對不上時不能收——配錯的解說比沒有解說更糟，
+/// 因為畫面上看起來完全合理。
+#[tokio::test]
+async fn a_still_mismatched_retry_is_rejected_rather_than_misaligned() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"prompt":"a","options":["x","y","z"],"answer_index":0}]}"#,
+        // 三個選項卻只回兩句
+        r#"{"items":[{"option_notes":["只有兩句","第二句"]}]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+        panic!("該是選擇題");
+    };
+    assert!(
+        items[0].option_notes.is_empty(),
+        "長度對不上還收下來了：{:?}",
+        items[0].option_notes
+    );
+    assert_eq!(items[0].options.len(), 3, "題目本身不該受影響");
+}
+
+/// 解說生齊了就不該多打一次模型。
+#[tokio::test]
+async fn complete_option_notes_cost_no_extra_call() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[
+         {"prompt":"a","options":["x","y"],"answer_index":0,
+          "option_notes":["x 的說明","y 的說明"]}
+       ]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 1, "解說已經齊了還多打了一次");
+}
+
+/// 克漏字的解析也要能點字查意思，跟閱讀一樣。
+#[tokio::test]
+async fn a_cloze_analysis_can_look_words_up_too() {
+    let (db, profile) = setup(&["borrow", "umbrella", "the"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for lemma in 1..=3 {
+        study(&db, profile, lemma).await;
+    }
+
+    let llm = FakeLlm::new(&[r#"{"title":"T","passage":"I had to {{1}} the umbrella.",
+        "items":[{"options":["borrow","lend"],"answer_index":0,
+                  "option_notes":["跟別人借用","借出去，方向相反"]}]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Cloze), t0())
+        .await
+        .unwrap();
+
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: answer(&exercise, &[Some(true)]),
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 1, "解析是本地查的，不該再打模型");
+    assert!(
+        feedback.glossary.iter().any(|g| g.text == "umbrella"),
+        "文章裡的字要查得到釋義：{:?}",
+        feedback.glossary
+    );
+    assert!(
+        !feedback.glossary.iter().any(|g| g.text == "the"),
+        "虛詞不該出現在解析裡"
+    );
 }

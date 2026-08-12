@@ -490,6 +490,17 @@ impl<'a> PracticeEngine<'a> {
                             .collect()
                     })
                     .unwrap_or_default();
+
+                // 補解說要在洗牌**之前**：重試回來的解說是照原本的選項順序寫的，
+                // 洗完再補就會配到別的選項上
+                self.fill_option_notes(
+                    profile_id,
+                    &mut req,
+                    &mut questions,
+                    "questions",
+                    &value.to_string(),
+                )
+                .await?;
                 shuffle_answers(&mut questions, shuffle_seed(now));
 
                 let new_words: Vec<NewWord> = value
@@ -612,7 +623,7 @@ impl<'a> PracticeEngine<'a> {
         // 指定教材時取材範圍由課本決定，主題輪換就不該再插手
         let topic = if excerpt.is_some() { "" } else { topic };
 
-        let req = prompts::cloze_passage(&prompts::ClozeSpec {
+        let mut req = prompts::cloze_passage(&prompts::ClozeSpec {
             target_lang: self.target_name(),
             native_lang: self.native_name(),
             word_count: practice::reading_length(learner.vocabulary),
@@ -667,6 +678,15 @@ impl<'a> PracticeEngine<'a> {
         // 依空格的出現順序重排；沒有空格的題目在這一步自然被丟掉
         items = order.iter().map(|&i| items[i].clone()).collect();
 
+        // 補解說要在洗牌之前，否則補回來的解說會配到別的選項上
+        self.fill_option_notes(
+            profile_id,
+            &mut req,
+            &mut items,
+            "items",
+            &value.to_string(),
+        )
+        .await?;
         shuffle_answers(&mut items, shuffle_seed(now));
 
         let body = ExerciseBody::Cloze {
@@ -709,7 +729,7 @@ impl<'a> PracticeEngine<'a> {
         let excerpt = self
             .material_excerpt(&learner.weak_grammar, now.unix_timestamp() as u64)
             .await?;
-        let req = prompts::grammar_drill(
+        let mut req = prompts::grammar_drill(
             self.target_name(),
             self.native_name(),
             &learner.weak_grammar,
@@ -732,6 +752,16 @@ impl<'a> PracticeEngine<'a> {
         if items.is_empty() {
             return Err(PracticeError::BadResponse("一題都沒產出來".into()));
         }
+
+        // 補解說要在洗牌之前，否則補回來的解說會配到別的選項上
+        self.fill_option_notes(
+            profile_id,
+            &mut req,
+            &mut items,
+            "items",
+            &value.to_string(),
+        )
+        .await?;
         shuffle_answers(&mut items, shuffle_seed(now));
 
         self.store(
@@ -780,9 +810,12 @@ impl<'a> PracticeEngine<'a> {
             // 克漏字在本地判分就夠了：答案是選出來的，對錯沒有模糊空間。
             // 答錯的那幾個字要排回複習——挖空的本來就是他該複習的字，
             // 填不出來就是「還沒真的會」，比到期時間更直接的證據。
-            ExerciseBody::Cloze { items, .. } => {
+            ExerciseBody::Cloze { items, passage, .. } => {
                 let mut fb = grade_choices(items, input);
                 fb.unknown_words = missed_words(items, input);
+                // 解析時點文章裡的字要查得到意思，跟閱讀一樣。
+                // 這一份完全來自本地字典，不多打一次模型。
+                fb.glossary = self.passage_glossary(profile_id, passage).await?;
                 fb
             }
             ExerciseBody::Choices { items } => grade_choices(items, input),
@@ -919,8 +952,17 @@ impl<'a> PracticeEngine<'a> {
         feedback.items = align_comments(&feedback.items, local.items);
         feedback.score = local.score;
 
-        // 解析裡的生字與片語由本地字典查，不佔 token 也不用等模型
-        // 解析裡的「生字」也要用同一個定義，否則會把他早就會的字全列出來
+        feedback.glossary = self.passage_glossary(profile_id, passage).await?;
+        Ok(feedback)
+    }
+
+    /// 一篇文章的解析：每個字的意思、哪些他不會、哪裡有片語。
+    ///
+    /// 閱讀與克漏字共用。全部本地做——查的是使用者自己匯入的字典，
+    /// 不佔 token，也不用等 CLI 冷啟動。
+    ///
+    /// 「生字」的定義要跟出題時一致，否則會把他早就會的字全列出來。
+    async fn passage_glossary(&self, profile_id: i64, passage: &str) -> Result<Vec<GlossaryNote>> {
         let learner = self
             .learner_profile(profile_id, OffsetDateTime::now_utc())
             .await?;
@@ -932,8 +974,7 @@ impl<'a> PracticeEngine<'a> {
             KNOWN_STABILITY_DAYS,
         )
         .await?;
-        feedback.glossary = self.build_glossary(passage, &known).await?;
-        Ok(feedback)
+        self.build_glossary(passage, &known).await
     }
 
     /// 從文章本身算出解析：每個字的意思、哪些你不會、哪裡有片語。
@@ -1224,6 +1265,87 @@ impl<'a> PracticeEngine<'a> {
         Ok(words)
     }
 
+    /// 逐選項解說沒生齊就補一次。
+    ///
+    /// ## 為什麼要在本地驗
+    ///
+    /// 「每個選項各寫一句」是 prompt 裡的請求，模型只會**大致**遵守——
+    /// 而這一項驗得起來：`option_notes.len() == options.len()`，一行程式。
+    /// 凡是能在本地驗的就不要只相信模型，這跟覆蓋率驗收是同一個原則。
+    ///
+    /// ## 為什麼只收解說、不收題目
+    ///
+    /// 重試回來的內容只拿 `option_notes`，題目、選項、答案一律沿用原本那份。
+    /// 模型很可能順手把題目重寫一遍——那樣答案就跟文章對不上了，
+    /// 而且使用者看不出來。只搬那一個欄位，壞掉的重試最多是「還是沒有解說」。
+    ///
+    /// 只補一次。連兩次寫不出來代表這個模型就是不寫，再問只是燒額度；
+    /// 缺解說是體驗差一級，不是壞掉。
+    async fn fill_option_notes(
+        &self,
+        profile_id: i64,
+        req: &mut wordforge_llm::ChatRequest,
+        items: &mut [ChoiceItem],
+        field: &str,
+        previous: &str,
+    ) -> Result<()> {
+        let missing = missing_option_notes(items);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(?missing, field, "逐選項解說沒生齊，要求補上");
+
+        req.messages.push(prompts::option_notes_retry(
+            self.native_name(),
+            field,
+            &missing,
+            previous,
+        ));
+
+        // 補解說失敗不該讓整份練習失敗——題目本身是好的，
+        // 少的只是「你選的那個為什麼不行」那一句
+        let value = match self.ask_json(profile_id, "generate", req).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "補解說的呼叫失敗，維持沒有解說的版本");
+                return Ok(());
+            }
+        };
+
+        let filled: Vec<Vec<String>> = value
+            .get(field)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|item| {
+                        item.get("option_notes")
+                            .and_then(|n| n.as_array())
+                            .map(|n| {
+                                n.iter()
+                                    .filter_map(|s| s.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (item, notes) in items.iter_mut().zip(filled) {
+            // 長度還是對不上就不要收——配錯的解說比沒有解說更糟，
+            // 因為畫面上看起來完全合理
+            if notes.len() == item.options.len() && notes.iter().all(|n| !n.trim().is_empty()) {
+                item.option_notes = notes;
+            }
+        }
+
+        let still_missing = missing_option_notes(items);
+        if !still_missing.is_empty() {
+            tracing::warn!(?still_missing, "補完之後還是缺，不再重試");
+        }
+        Ok(())
+    }
+
     /// 今天到期、而且**至少複習過一次**的字。
     ///
     /// 跟 `due_words` 的差別只有 `reps > 0`，但那一個條件很重要：
@@ -1400,6 +1522,22 @@ fn missed_words(items: &[ChoiceItem], input: &GradeInput) -> Vec<String> {
         .enumerate()
         .filter(|(i, item)| input.choices.get(*i).copied().flatten() != Some(item.answer_index))
         .filter_map(|(_, item)| item.options.get(item.answer_index).cloned())
+        .collect()
+}
+
+/// 哪幾題的逐選項解說沒生齊（題號 1 起算）。
+///
+/// 長度對不上也算缺：短一截的話最後幾個選項會沒有解說，
+/// 長一截則代表模型自己也搞混了哪句配哪個選項——兩種都不能收。
+fn missing_option_notes(items: &[ChoiceItem]) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.option_notes.len() != item.options.len()
+                || item.option_notes.iter().any(|n| n.trim().is_empty())
+        })
+        .map(|(i, _)| i + 1)
         .collect()
 }
 

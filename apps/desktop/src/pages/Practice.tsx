@@ -490,7 +490,12 @@ export default function Practice() {
                   items={cloze.items}
                   choices={choices}
                   feedback={feedback}
+                  lookup={lookup}
+                  onLookup={setLookup}
                 />
+                {feedback && (
+                  <p className="muted hint">點文章裡的任何一個字可以查它的意思。</p>
+                )}
               </section>
 
               {feedback && cloze.translation && (
@@ -501,6 +506,14 @@ export default function Practice() {
               )}
 
               <div className="answer-pane">
+                {feedback && lookup && (
+                  <WordNotes
+                    term={lookup}
+                    glossary={feedback.glossary ?? []}
+                    onClose={() => setLookup(null)}
+                  />
+                )}
+
                 <section className="panel exercise">
                   <Choices
                     items={cloze.items}
@@ -693,11 +706,16 @@ function ClozePassage({
   items,
   choices,
   feedback,
+  lookup,
+  onLookup,
 }: {
   passage: string;
   items: { options: string[]; answer_index: number }[];
   choices: (number | null)[];
   feedback: Feedback | null;
+  /** 解析時點開的那個字。作答前是 null——那時候給翻譯等於送答案 */
+  lookup: string | null;
+  onLookup: (term: string | null) => void;
 }) {
   // 依 {{n}} 切開。用 split 保留分隔符，一次走完不必自己算位置。
   const parts = useMemo(() => passage.split(new RegExp(BLANK_PATTERN.source, "g")), [passage]);
@@ -706,7 +724,28 @@ function ClozePassage({
     <p className="passage">
       {parts.map((part, i) => {
         // split 帶捕獲群組時，奇數索引是空格編號
-        if (i % 2 === 0) return <span key={i}>{part}</span>;
+        // 偶數段是文章本文。批改之後每個字都能點開查意思，
+        // 作答前不行——那時候給翻譯等於直接送答案。
+        if (i % 2 === 0) {
+          if (!feedback) return <span key={i}>{part}</span>;
+          return (
+            <span key={i}>
+              {part.split(/(\s+)/).map((chunk, j) => {
+                if (!chunk.trim()) return chunk;
+                const word = normalizeWord(chunk);
+                return (
+                  <span
+                    key={j}
+                    className={lookup === word ? "token looking" : "token"}
+                    onClick={() => onLookup(lookup === word ? null : word)}
+                  >
+                    {chunk}
+                  </span>
+                );
+              })}
+            </span>
+          );
+        }
 
         const n = Number(part);
         const item = items[n - 1];

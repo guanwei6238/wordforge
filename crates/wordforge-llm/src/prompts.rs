@@ -679,6 +679,41 @@ pub fn translation_task(
     }
 }
 
+/// 逐選項解說沒生齊時，用這個追加訊息要求補上。
+///
+/// ## 為什麼要把上一次的結果整份附回去
+///
+/// 非交互式的後端**完全不記得自己上一次寫了什麼**：CLI 每次都是全新的行程，
+/// API 那邊我們也沒有把它的回答加進 messages。少了這一段，模型只能重寫一份
+/// 不相干的題目——那比缺解說更糟，因為連題目都變了。
+///
+/// 這跟 `coverage_retry` 是同一個模式，理由也一樣。
+///
+/// `missing` 是缺解說的題號（1 起算），`field` 是那份 JSON 裡裝題目的欄位名。
+pub fn option_notes_retry(
+    native_lang: &str,
+    field: &str,
+    missing: &[usize],
+    previous: &str,
+) -> Message {
+    Message::user(format!(
+        "這份題目的 option_notes 沒有生齊。\n\n\
+         你上一次輸出的是：\n---\n{previous}\n---\n\n\
+         第 {which} 題的 option_notes 缺漏或長度跟 options 對不上。\n\
+         每一題的 option_notes 都必須跟該題的 options **一樣長、一樣順序**，\n\
+         一個選項一句{native_lang}說明：對的那個為什麼成立，錯的那些各自錯在哪。\n\
+         「因為正確答案是 X」不算解釋——要講這個選項本身哪裡不成立。\n\n\
+         請只輸出這個 JSON，把**每一題**補齊：\n\
+         {{\"{field}\": [{{\"option_notes\": [\"每個選項各一句\"]}}]}}\n\
+         題目的順序、選項的內容與 answer_index 都照上面那份，不要改動也不要重寫題目。",
+        which = missing
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("、"),
+    ))
+}
+
 /// 產生的文章沒通過本地覆蓋率驗收時，用這個追加訊息要求重寫。
 ///
 /// 帶上實際超標的詞，比單純說「太難了」有效得多。
@@ -1159,6 +1194,29 @@ mod tests {
         assert!(text.contains("正確答案：C"));
         assert!(text.contains("unknown_words"));
         assert!(text.contains("只放文章裡真的出現過的單字原形"));
+    }
+
+    /// 補逐選項解說的重試也必須自帶上一次的結果。
+    ///
+    /// 非交互式的後端完全不記得自己上一次寫了什麼——少了這一段，
+    /// 模型只能重寫一份不相干的題目，那比缺解說更糟。
+    #[test]
+    fn the_notes_retry_carries_the_previous_attempt() {
+        let previous = r#"{"items":[{"options":["a","b"],"answer_index":0}]}"#;
+        let m = option_notes_retry("繁體中文", "items", &[1, 3], previous);
+
+        assert!(
+            m.content.contains(previous),
+            "沒有附上上一次的結果，模型無從「照上面那份」補：{}",
+            m.content
+        );
+        assert!(m.content.contains("第 1、3 題"), "{}", m.content);
+        assert!(
+            m.content.contains("不要改動也不要重寫題目"),
+            "沒有擋掉「順便把題目重寫一遍」：{}",
+            m.content
+        );
+        assert!(m.content.contains("\"items\""), "要講清楚欄位名");
     }
 
     /// 重試訊息要自帶上一篇文章。
