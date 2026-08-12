@@ -134,19 +134,33 @@ pub async fn recent_topics(db: &Db, profile_id: ProfileId, limit: i64) -> Result
 /// 排除最近教過的就會自然輪換。用歷史而不是亂數：亂數可能連續兩篇
 /// 抽到同一個字，而且「教過的字隔幾篇再出現一次」本來就是我們要的
 /// ——那是間隔重複，不是缺陷。
+/// `kinds` 限定只看哪些題型。**一定要限定**：不限的話，中間穿插的文法題
+/// 與翻譯題會佔掉記憶名額，把閱讀的歷史沖掉——做五題文法之後，
+/// 下一篇閱讀就會拿回六篇前的同一批字。文法題存的 `target_words` 甚至
+/// 是空的，佔了名額卻沒有排除任何東西。
 pub async fn recent_target_words(
     db: &Db,
     profile_id: ProfileId,
+    kinds: &[&str],
     limit: i64,
 ) -> Result<Vec<String>> {
-    let rows: Vec<String> = sqlx::query_scalar(
+    if kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", kinds.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let sql = format!(
         "SELECT target_lemmas_json FROM exercise
-         WHERE profile_id = ? ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(profile_id.0)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
+         WHERE profile_id = ? AND kind IN ({placeholders})
+         ORDER BY created_at DESC LIMIT ?"
+    );
+    let mut q = sqlx::query_scalar::<_, String>(&sql).bind(profile_id.0);
+    for kind in kinds {
+        q = q.bind(*kind);
+    }
+    let rows: Vec<String> = q.bind(limit).fetch_all(db.pool()).await?;
 
     Ok(rows
         .iter()
@@ -267,13 +281,68 @@ mod tests {
             .unwrap();
         }
 
-        let mut recent = recent_target_words(&db, profile, 5).await.unwrap();
+        let mut recent = recent_target_words(&db, profile, &["reading"], 5)
+            .await
+            .unwrap();
         recent.sort();
         assert_eq!(recent, vec!["alpha", "beta", "gamma"]);
 
         // 只看最近一篇時，更早的字要能重新被挑到
-        let latest = recent_target_words(&db, profile, 1).await.unwrap();
+        let latest = recent_target_words(&db, profile, &["reading"], 1)
+            .await
+            .unwrap();
         assert_eq!(latest, vec!["gamma"]);
+    }
+
+    /// 中間穿插的文法題不能把閱讀的生詞歷史沖掉。
+    ///
+    /// 文法題存的 target_words 是空的，佔了記憶名額卻沒排除任何東西——
+    /// 做五題文法之後，下一篇閱讀就會拿回六篇前的同一批字。
+    #[tokio::test]
+    async fn other_exercise_kinds_do_not_flush_the_reading_history() {
+        let (db, profile) = setup().await;
+
+        create(
+            &db,
+            NewExercise {
+                profile_id: profile,
+                kind: "reading",
+                payload_json: "{}",
+                target_words: &["alpha".to_string()],
+                coverage: None,
+                model: None,
+                material_id: None,
+                topic: None,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        // 之後做了五題文法
+        for i in 1..=5 {
+            create(
+                &db,
+                NewExercise {
+                    profile_id: profile,
+                    kind: "grammar",
+                    payload_json: "{}",
+                    target_words: &[],
+                    coverage: None,
+                    model: None,
+                    material_id: None,
+                    topic: None,
+                },
+                t0() + time::Duration::minutes(i),
+            )
+            .await
+            .unwrap();
+        }
+
+        let recent = recent_target_words(&db, profile, &["reading"], 5)
+            .await
+            .unwrap();
+        assert_eq!(recent, vec!["alpha"], "閱讀的歷史被文法題沖掉了");
     }
 
     #[tokio::test]

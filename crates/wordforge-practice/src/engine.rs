@@ -360,7 +360,15 @@ impl<'a> PracticeEngine<'a> {
         // 排掉最近幾篇教過的。生詞不會自動進牌組，所以沒有這一步的話
         // 每一篇都會拿到一模一樣的字——實測確認過。
         let recent =
-            exercises::recent_target_words(self.db, ProfileId(profile_id), NEW_WORD_MEMORY).await?;
+            // 只看會注入生詞的題型。不限的話中間穿插的文法題與翻譯題
+            // 會佔掉記憶名額，把閱讀的歷史沖掉。
+            exercises::recent_target_words(
+                self.db,
+                ProfileId(profile_id),
+                &[ExerciseKind::Reading.as_str(), ExerciseKind::Cloze.as_str()],
+                NEW_WORD_MEMORY,
+            )
+            .await?;
         let fresh: Vec<practice::NewWord> = candidates
             .iter()
             .filter(|c| !recent.iter().any(|r| r == &c.text))
