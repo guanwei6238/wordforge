@@ -110,6 +110,12 @@ const TOPIC_MEMORY: i64 = 6;
 /// 再多的話一篇短文會被打成蜂窩，前後文的線索反而不夠推出答案。
 const CLOZE_BLANKS: i64 = 8;
 
+/// 格式不合格時最多重問幾次。
+///
+/// 連兩次寫不出合格的 JSON 代表這個模型就是做不到，再問只是燒額度——
+/// 而且每一次都是一趟完整的呼叫，使用者已經在等了。
+const FORMAT_RETRIES: usize = 1;
+
 pub struct PracticeEngine<'a> {
     db: &'a Db,
     llm: &'a dyn LlmProvider,
@@ -275,7 +281,7 @@ impl<'a> PracticeEngine<'a> {
         let excerpt = self
             .material_excerpt(&due_words, now.unix_timestamp() as u64)
             .await?;
-        let req = prompts::translation_task(
+        let mut req = prompts::translation_task(
             self.target_name(),
             self.native_name(),
             kind == ExerciseKind::TranslationToTarget,
@@ -283,7 +289,14 @@ impl<'a> PracticeEngine<'a> {
             &due_words,
             count,
         );
-        let value = self.ask_json(profile_id, "generate", &req).await?;
+        let value = self
+            .ask_valid_json(
+                profile_id,
+                "generate",
+                &mut req,
+                crate::validate::check_translation,
+            )
+            .await?;
 
         let raw_items = value
             .get("items")
@@ -481,15 +494,7 @@ impl<'a> PracticeEngine<'a> {
             let too_hard = coverage.ratio() < target_coverage - COVERAGE_TOLERANCE;
             let acceptable = !too_hard || no_baseline || attempt == COVERAGE_RETRIES;
             if acceptable {
-                let mut questions: Vec<ChoiceItem> = value
-                    .get("questions")
-                    .and_then(|q| q.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|q| serde_json::from_value(q.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let mut questions: Vec<ChoiceItem> = parse_choice_items(&value, "questions");
 
                 // 補解說要在洗牌**之前**：重試回來的解說是照原本的選項順序寫的，
                 // 洗完再補就會配到別的選項上
@@ -633,7 +638,14 @@ impl<'a> PracticeEngine<'a> {
             topic: (!topic.is_empty()).then_some(topic),
             material_excerpt: excerpt.as_deref(),
         });
-        let value = self.ask_json(profile_id, "generate", &req).await?;
+        let value = self
+            .ask_valid_json(
+                profile_id,
+                "generate",
+                &mut req,
+                crate::validate::check_cloze,
+            )
+            .await?;
 
         let passage = value
             .get("passage")
@@ -641,15 +653,7 @@ impl<'a> PracticeEngine<'a> {
             .unwrap_or_default()
             .to_string();
 
-        let mut items: Vec<ChoiceItem> = value
-            .get("items")
-            .and_then(|i| i.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|i| serde_json::from_value(i.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut items: Vec<ChoiceItem> = parse_choice_items(&value, "items");
 
         // 空格與題目一定要對得上。模型會跳號、會亂序、會多給一題、
         // 會忘了挖空——不檢查的話使用者會看到「有題目卻沒有空格」，
@@ -737,18 +741,17 @@ impl<'a> PracticeEngine<'a> {
             GRAMMAR_BATCH as usize,
             excerpt.as_deref(),
         );
-        let value = self.ask_json(profile_id, "generate", &req).await?;
-
-        let mut items: Vec<ChoiceItem> = value
-            .get("items")
-            .and_then(|i| i.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|i| serde_json::from_value(i.clone()).ok())
-                    .collect()
+        let value = self
+            .ask_valid_json(profile_id, "generate", &mut req, |v| {
+                crate::validate::check_choice_items("items", v)
             })
-            .unwrap_or_default();
+            .await?;
 
+        let mut items: Vec<ChoiceItem> = parse_choice_items(&value, "items");
+
+        // 驗收不當閘門，所以修不好的題目還是會在這裡被丟掉——差別是
+        // 現在丟掉之前已經 log 過、也給過模型一次修正的機會。
+        // 一題都不剩就真的沒有東西可以交出去了。
         if items.is_empty() {
             return Err(PracticeError::BadResponse("一題都沒產出來".into()));
         }
@@ -1265,6 +1268,62 @@ impl<'a> PracticeEngine<'a> {
         Ok(words)
     }
 
+    /// 送出請求並驗收格式，沒過就把它的輸出串回輸入、指出哪裡錯，再問一次。
+    ///
+    /// ## 為什麼一定要串回去
+    ///
+    /// 非交互式的後端**完全不記得自己上一次寫了什麼**：CLI 每次都是全新的
+    /// 行程，API 那邊我們也沒把它的回答加進 messages。只說「第三題的
+    /// answer_index 超出範圍」它根本不知道第三題是什麼，只能重寫一份不相干的。
+    ///
+    /// ## 為什麼要驗
+    ///
+    /// 原本每個地方都寫 `filter_map(|q| from_value(q).ok())`——解析失敗的題目
+    /// **直接消失**。使用者拿到三題而不是四題，畫面上沒有任何異狀，
+    /// log 也沒有一行。那種壞法看起來完全正常，是最難查的一類。
+    ///
+    /// 重試次數壓在兩次：連兩次寫不出合格的 JSON 代表這個模型就是做不到，
+    /// 再問只是燒額度，而且使用者已經等很久了。
+    async fn ask_valid_json<F>(
+        &self,
+        profile_id: i64,
+        purpose: &str,
+        req: &mut wordforge_llm::ChatRequest,
+        check: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: Fn(&serde_json::Value) -> Vec<crate::validate::Problem>,
+    {
+        let mut latest = None;
+
+        for attempt in 0..=FORMAT_RETRIES {
+            let value = self.ask_json(profile_id, purpose, req).await?;
+            let problems: Vec<String> = check(&value).iter().map(|p| p.to_string()).collect();
+
+            if problems.is_empty() {
+                if attempt > 0 {
+                    tracing::info!(attempt, "格式修正成功");
+                }
+                return Ok(value);
+            }
+
+            tracing::warn!(attempt, ?problems, "回應沒通過格式檢查");
+            if attempt < FORMAT_RETRIES {
+                req.messages
+                    .push(prompts::format_retry(&problems, &value.to_string()));
+            }
+            latest = Some(value);
+        }
+
+        // 修不好就把最後一版交出去，讓呼叫端拿能用的部分。
+        //
+        // **不在這裡失敗**：驗收的目的是給模型一次修正的機會，不是閘門。
+        // 四題壞了一題的話，三題的練習仍然做得完；整份不給只是把「少一題」
+        // 換成「什麼都沒有」。真的一題都不能用時，呼叫端自己會報錯。
+        tracing::warn!("格式仍不合格，改用能用的部分");
+        Ok(latest.expect("迴圈至少跑一次"))
+    }
+
     /// 逐選項解說沒生齊就補一次。
     ///
     /// ## 為什麼要在本地驗
@@ -1523,6 +1582,23 @@ fn missed_words(items: &[ChoiceItem], input: &GradeInput) -> Vec<String> {
         .filter(|(i, item)| input.choices.get(*i).copied().flatten() != Some(item.answer_index))
         .filter_map(|(_, item)| item.options.get(item.answer_index).cloned())
         .collect()
+}
+
+/// 把驗收過的題目解析出來。
+///
+/// **一定要先驗收再叫這個**：這裡仍然會跳過解析不了的項目，但驗收
+/// 已經保證不會有那種東西了。原本沒有驗收那一層，於是壞掉的題目
+/// 直接消失——使用者拿到三題而不是四題，畫面上沒有任何異狀。
+fn parse_choice_items(value: &serde_json::Value, field: &str) -> Vec<ChoiceItem> {
+    value
+        .get(field)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 哪幾題的逐選項解說沒生齊（題號 1 起算）。

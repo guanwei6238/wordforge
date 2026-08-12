@@ -679,6 +679,35 @@ pub fn translation_task(
     }
 }
 
+/// 回應的格式沒通過驗收時，用這個追加訊息要求改正。
+///
+/// ## 為什麼要把上一次的輸出整份附回去
+///
+/// 非交互式的後端**完全不記得自己上一次寫了什麼**：CLI 每次都是全新的
+/// 行程，API 那邊我們也沒有把它的回答加進 messages。只說「第三題的
+/// answer_index 超出範圍」它根本不知道第三題是什麼，只能重寫一份。
+///
+/// 所以格式錯誤的修正一定是這個形狀：**把它的輸出串回輸入，再指出
+/// 哪裡錯**。`coverage_retry` 與 `option_notes_retry` 是同一個模式。
+///
+/// `problems` 用 JSON Pointer 定位（`/questions/2/answer_index`），
+/// 因為那是模型指得回去的方式——說「第三題」它還要自己數。
+pub fn format_retry(problems: &[String], previous: &str) -> Message {
+    Message::user(format!(
+        "上一次的輸出沒有通過格式檢查。\n\n\
+         你上一次輸出的是：\n---\n{previous}\n---\n\n\
+         這些地方要改（路徑是 JSON Pointer）：\n{list}\n\n\
+         請把整份 JSON 重新輸出一次，改掉上面列的問題，\n\
+         其餘內容盡量保留——沒有被指出來的地方就照原樣，不要重寫。\n\
+         只輸出 JSON，不要任何說明文字。",
+        list = problems
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
 /// 逐選項解說沒生齊時，用這個追加訊息要求補上。
 ///
 /// ## 為什麼要把上一次的結果整份附回去
@@ -1194,6 +1223,31 @@ mod tests {
         assert!(text.contains("正確答案：C"));
         assert!(text.contains("unknown_words"));
         assert!(text.contains("只放文章裡真的出現過的單字原形"));
+    }
+
+    /// 格式修正的重試一定要把上一次的輸出串回輸入。
+    ///
+    /// 非交互式的後端不記得自己寫過什麼——只說「第三題的 answer_index
+    /// 超出範圍」它根本不知道第三題是什麼，只能重寫一份。
+    #[test]
+    fn the_format_retry_carries_the_previous_output() {
+        let previous = r#"{"items":[{"options":["a","b"],"answer_index":9}]}"#;
+        let m = format_retry(
+            &["/items/0/answer_index：是 9，但只有 2 個選項（索引從 0 起算）。".to_string()],
+            previous,
+        );
+
+        assert!(m.content.contains(previous), "沒有附上上一次的輸出");
+        assert!(
+            m.content.contains("/items/0/answer_index"),
+            "要用 JSON Pointer 定位，說「第幾題」它還要自己數：{}",
+            m.content
+        );
+        assert!(
+            m.content.contains("其餘內容盡量保留"),
+            "沒有擋掉「順便整份重寫」：{}",
+            m.content
+        );
     }
 
     /// 補逐選項解說的重試也必須自帶上一次的結果。

@@ -2198,3 +2198,104 @@ async fn a_cloze_analysis_can_look_words_up_too() {
         "虛詞不該出現在解析裡"
     );
 }
+
+/// 格式壞掉時要把模型自己的輸出串回輸入，指出哪裡錯，再問一次。
+///
+/// 這條測試存在的理由是原本沒有這一層：`filter_map(...ok())` 把解析不了的
+/// 題目**默默丟掉**，使用者拿到三題而不是四題，畫面上沒有任何異狀。
+#[tokio::test]
+async fn a_malformed_response_is_sent_back_with_the_problems() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[
+        // 第一題的 answer_index 超出範圍，第二題根本缺 options
+        r#"{"items":[
+             {"prompt":"a","options":["x","y"],"answer_index":9,
+              "option_notes":["n1","n2"]},
+             {"prompt":"b"}
+           ]}"#,
+        // 修好之後的版本
+        r#"{"items":[
+             {"prompt":"a","options":["x","y"],"answer_index":0,
+              "option_notes":["n1","n2"]},
+             {"prompt":"b","options":["p","q"],"answer_index":1,
+              "option_notes":["n3","n4"]}
+           ]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "格式壞掉就該回問一次");
+
+    // 重試訊息要帶著它自己的輸出——非交互式的後端不記得寫過什麼
+    let retry = llm.last_prompt();
+    assert!(
+        retry.contains(r#""answer_index":9"#),
+        "沒有把上一次的輸出串回去：{retry}"
+    );
+    assert!(
+        retry.contains("/items/0/answer_index"),
+        "沒有用 JSON Pointer 指出哪裡錯：{retry}"
+    );
+    assert!(retry.contains("/items/1"), "第二題的問題也要講：{retry}");
+
+    let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+        panic!("該是選擇題");
+    };
+    assert_eq!(items.len(), 2, "修好之後兩題都要在");
+    for item in items {
+        assert!(item.answer_index < item.options.len());
+    }
+}
+
+/// 修不好的時候不能整份不給——三題的練習仍然做得完，
+/// 整份不給只是把「少一題」換成「什麼都沒有」。
+#[tokio::test]
+async fn an_unfixable_response_still_yields_the_usable_questions() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    // 兩次都是一好一壞
+    const BROKEN: &str = r#"{"items":[
+         {"prompt":"a","options":["x","y"],"answer_index":0,"option_notes":["n1","n2"]},
+         {"prompt":"b"}
+       ]}"#;
+    let llm = FakeLlm::new(&[BROKEN, BROKEN]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "只重問一次，不無限重試");
+
+    let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+        panic!("該是選擇題");
+    };
+    assert_eq!(items.len(), 1, "壞掉的那題丟掉，好的那題照樣給");
+}
+
+/// 一題都不能用時才真的失敗——那時候沒有東西可以交出去。
+#[tokio::test]
+async fn a_completely_unusable_response_is_an_error() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[]}"#, r#"{"items":[]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let err = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("一題都沒產出來"),
+        "錯誤訊息要說得出發生什麼事：{err}"
+    );
+}
