@@ -150,6 +150,7 @@ async fn setup_lang(lang: &str, words: &[&str]) -> (Db, i64) {
                 }],
                 ..Default::default()
             },
+            wordforge_db::dict::WriteMode::Replace,
         )
         .await
         .unwrap();
@@ -673,6 +674,7 @@ async fn the_vocabulary_sample_is_bounded_and_spans_difficulties() {
                 }],
                 ..Default::default()
             },
+            wordforge_db::dict::WriteMode::Replace,
         )
         .await
         .unwrap();
@@ -755,6 +757,7 @@ async fn a_small_deck_does_not_make_the_learner_look_like_a_beginner() {
                 }],
                 ..Default::default()
             },
+            wordforge_db::dict::WriteMode::Replace,
         )
         .await
         .unwrap();
@@ -1636,6 +1639,79 @@ async fn the_translation_direction_reaches_the_prompt() {
     let to_target = llm.last_prompt();
     assert!(to_target.contains("繁體中文 → English"), "{to_target}");
     assert!(to_target.contains("**繁體中文**句子"), "{to_target}");
+}
+
+/// 這條測試存在的理由是它曾經是錯的：翻譯題用 `due_words`，那個查詢
+/// 不看 `reps`。批改時 LLM 標出來的生詞會直接建成新卡，而新卡一建好
+/// 就算「今天到期」——實測一個真實牌組，141 張到期的卡裡有 138 張
+/// 從來沒看過。結果是中翻英要使用者寫出一個他從沒見過的單字。
+#[tokio::test]
+async fn translation_does_not_quiz_words_the_learner_has_never_studied() {
+    let (db, profile) = setup(&[
+        "alpha", "beta", "gamma", "delta", "epsilon", // 學過的
+        "never1", "never2", "never3", "never4", // 只是躺在牌組裡
+    ])
+    .await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    for id in 1..=5 {
+        study(&db, profile, id).await;
+    }
+    for id in 6..=9 {
+        put_in_deck(&db, profile, id).await;
+    }
+
+    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    // 往後推，讓學過的字真的到期（`study` 給 Easy，下次複習排得很遠）
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    for never in ["never1", "never2", "never3", "never4"] {
+        assert!(
+            !prompt.contains(never),
+            "沒學過的字不該出現在翻譯題裡：{never}\n{prompt}"
+        );
+    }
+}
+
+/// 但牌組裡**只有**沒學過的字時，還是要出得了題。
+///
+/// 新使用者匯完字典、加了一批字就來練翻譯，這時候一個學過的字都沒有。
+/// 給他沒學過的字，比一個字都給不出來好。
+#[tokio::test]
+async fn a_brand_new_deck_still_produces_a_translation_exercise() {
+    let (db, profile) = setup(&["fresh1", "fresh2", "fresh3"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for id in 1..=3 {
+        put_in_deck(&db, profile, id).await;
+    }
+
+    let items = r#"{"items":[{"source":"S","target_word":"fresh1","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        ["fresh1", "fresh2", "fresh3"]
+            .iter()
+            .any(|w| prompt.contains(w)),
+        "沒有可用的字時仍然要拿新卡頂上，不然這一頁對新使用者是空的：\n{prompt}"
+    );
 }
 
 /// 解析要能給出全文翻譯；模型沒給的時候不能變成一段空白。

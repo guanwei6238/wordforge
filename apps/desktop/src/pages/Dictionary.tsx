@@ -9,6 +9,7 @@ import {
   wordDetail,
 } from "../api";
 import SpeakButton from "../components/SpeakButton";
+import WordSenses from "../components/WordSenses";
 
 /**
  * 查字典頁。
@@ -140,54 +141,7 @@ export default function Dictionary() {
               </button>
             </header>
 
-            {selected.pronunciations.length > 0 && (
-              <p className="prons">
-                {selected.pronunciations.map((p, i) => (
-                  <span key={i} className="pron">
-                    {p.accent && <span className="tag">{p.accent}</span>}
-                    {p.ipa}
-                    {p.is_synthetic && <span className="tag">合成音</span>}
-                  </span>
-                ))}
-              </p>
-            )}
-
-            <ol className="senses">
-              {selected.senses.map((s, i) => (
-                <li key={i}>
-                  <p className="gloss">
-                    {s.pos && <span className="tag pos">{s.pos}</span>}
-                    {s.gloss}
-                  </p>
-                  {s.translation && <p className="translation">{s.translation}</p>}
-                  {(s.register || s.domain) && (
-                    <p className="labels">
-                      {s.register && <span className="tag">{s.register}</span>}
-                      {s.domain && <span className="tag">{s.domain}</span>}
-                    </p>
-                  )}
-                  {s.examples.map((ex, j) => (
-                    <p key={j} className="example">
-                      {ex.text}
-                      {ex.translation && <span className="muted"> — {ex.translation}</span>}
-                    </p>
-                  ))}
-                  {/* CC BY-SA 的標示義務，不能省略 */}
-                  {s.attribution && <p className="attribution">— {s.attribution}</p>}
-                </li>
-              ))}
-            </ol>
-
-            {selected.forms.length > 0 && (
-              <p className="forms">
-                <span className="muted">變化形：</span>
-                {selected.forms.map(([form, tag], i) => (
-                  <span key={i} className="tag" title={tag}>
-                    {form}
-                  </span>
-                ))}
-              </p>
-            )}
+            <WordSenses detail={selected} showTags={false} />
           </article>
         )}
       </div>

@@ -682,7 +682,9 @@ pub fn translation_task(
     native_lang: &str,
     direction_to_target: bool,
     material_excerpt: Option<&str>,
-    due_words: &[String],
+    // 這次要練到的字。一部分是今天到期的，一部分是從學過的字裡隨機抽的
+    // （見 `practice::translation_mix`），所以文案不能寫「今天該複習的」。
+    words: &[String],
     count: usize,
 ) -> ChatRequest {
     let system = format!(
@@ -703,8 +705,10 @@ pub fn translation_task(
          練習方向是「{source} → {answer}」：\n\
          請出 {count} 個**{source}**句子，讓學習者翻譯成{answer}。\n\
          `source` 欄位一定要是{source}，寫成{answer}就是出錯了，這一題會作廢。\n\
-         每個句子要自然、日常，並且**必須**用到下列其中一個今天該複習的\n\
-         {target}單字（學習者翻譯時就等於複習了這個字）：\n{words}\n\
+         每個句子要自然、日常，並且**必須**用到下列{target}單字之一\n\
+         （學習者翻譯時就等於練到了這個字）：\n{words}\n\
+         這些字是照著他的複習進度挑出來的，所以**一題用一個、盡量不要重複**，\n\
+         剛好把清單用完。\n\
          方向是{target} → {native}時，那個字直接出現在題目句子裡；\n\
          方向是{native} → {target}時，題目句子要寫成翻出來自然會用到它。\n\n",
         count = count,
@@ -712,7 +716,7 @@ pub fn translation_task(
         target = target_lang,
         source = source_lang,
         answer = answer_lang,
-        words = due_words.join("、"),
+        words = words.join("、"),
     );
 
     if let Some(excerpt) = material_excerpt {

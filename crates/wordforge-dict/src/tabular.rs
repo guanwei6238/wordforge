@@ -61,19 +61,28 @@ pub fn parse<R: Read>(reader: R, lang: &str, delimiter: u8) -> Result<Vec<DictEn
 }
 
 fn to_entry(row: Row, lang: &str) -> DictEntry {
-    // 使用者最常只填翻譯，所以 gloss 缺席時用翻譯頂上，避免整筆被當成無釋義而丟棄
-    let gloss = row
-        .gloss
-        .clone()
-        .or_else(|| row.translation.clone())
-        .unwrap_or_default();
+    // 使用者最常只填翻譯，所以 gloss 缺席時用翻譯頂上，避免整筆被當成無釋義而丟棄。
+    //
+    // 但這時候**不能**把它標成目標語言：頂上來的是母語翻譯，
+    // 標成 `gloss_lang = lang` 等於謊報，之後「撈出目標語言的定義」
+    // 這種查詢會把中文當英文定義撈回來。不知道就標空的。
+    let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
+    let (gloss, gloss_lang) = match (
+        non_empty(row.gloss.clone()),
+        non_empty(row.translation.clone()),
+    ) {
+        // 照格式說明，gloss 欄位放的是目標語言的定義
+        (Some(g), _) => (g, lang.to_string()),
+        (None, Some(t)) => (t, String::new()),
+        (None, None) => (String::new(), String::new()),
+    };
 
     let senses = if gloss.is_empty() {
         Vec::new()
     } else {
         vec![SenseEntry {
             gloss,
-            gloss_lang: lang.to_string(),
+            gloss_lang,
             translation: row.translation,
             register: None,
             domain: None,
@@ -144,6 +153,32 @@ mod tests {
         let entries = parse(csv.as_bytes(), "en", b',').unwrap();
         assert!(entries[0].is_usable());
         assert_eq!(entries[0].senses[0].gloss, "書");
+    }
+
+    /// 翻譯頂上來當 gloss 的時候，語言是母語不是目標語言。
+    /// 這條測試存在的理由是它曾經標成目標語言：一份 `word,translation`
+    /// 的中文 CSV 匯進來，每一條中文都被標成 `gloss_lang = "en"`，
+    /// 之後「撈目標語言的定義」會把中文當英文定義撈回來。
+    /// 量不到的東西標空的，不要謊報。
+    #[test]
+    fn a_translation_standing_in_for_a_gloss_is_not_labelled_as_the_target_language() {
+        let entries = parse("word,translation\nbook,書\n".as_bytes(), "en", b',').unwrap();
+        assert_eq!(entries[0].senses[0].gloss, "書");
+        assert_eq!(entries[0].senses[0].gloss_lang, "", "不知道就標空的");
+
+        // 使用者真的填了 gloss 欄位時，照格式說明那就是目標語言
+        let entries = parse("word,gloss\nbook,A bound volume.\n".as_bytes(), "en", b',').unwrap();
+        assert_eq!(entries[0].senses[0].gloss_lang, "en");
+    }
+
+    /// gloss 欄位存在但這一列是空的，不該讓整筆被丟掉——
+    /// 翻譯還在，那就是可用的資料。
+    #[test]
+    fn an_empty_gloss_column_falls_back_to_the_translation() {
+        let entries = parse("word,gloss,translation\nbook,,書\n".as_bytes(), "en", b',').unwrap();
+        assert!(entries[0].is_usable());
+        assert_eq!(entries[0].senses[0].gloss, "書");
+        assert_eq!(entries[0].senses[0].gloss_lang, "");
     }
 
     #[test]

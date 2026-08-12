@@ -371,6 +371,7 @@ mod tests {
                         }],
                         ..Default::default()
                     },
+                    crate::dict::WriteMode::Replace,
                 )
                 .await
                 .unwrap(),

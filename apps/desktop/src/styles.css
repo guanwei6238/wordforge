@@ -111,6 +111,31 @@ h1 {
   justify-content: center;
 }
 
+/* 翻面後可以展開的完整詞條。卡片本身置中，但釋義與例句是要讀的，
+   置中會很難掃——所以這一塊改回靠左，並且限寬避免行太長。 */
+.card-detail {
+  width: 100%;
+  max-width: 44rem;
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+  text-align: left;
+}
+
+.card-detail summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+/* 卡片裡的字級比字典頁小一點：這裡是輔助資訊，
+   主角是上面那個 2.5rem 的單字與剛剛按的評分。 */
+.card-detail .word-senses {
+  font-size: 0.95rem;
+  margin-top: 0.75rem;
+}
+
 button {
   font: inherit;
   padding: 0.5rem 1rem;
@@ -889,6 +914,31 @@ button.link {
 .word-notes p {
   margin: 0;
   font-size: 0.85rem;
+}
+
+/* 母語翻譯與目標語言定義來自不同的字典，兩個都顯示才完整。
+   翻譯在上、定義在下——先看得懂，再看它在目標語言裡怎麼被描述。 */
+.word-notes dd {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.word-notes .gloss {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+/* 覆盤時才發現不會的字，用這顆補進牌組。
+   作答前的標記走另一條路（送出時一起帶），所以只在批改後出現。 */
+.word-notes .add-review {
+  margin-left: 0.4rem;
+}
+
+.word-notes .add-review:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 /* 全文翻譯：預設收起來。作答前不給（等於送答案），

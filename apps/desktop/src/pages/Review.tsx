@@ -13,9 +13,12 @@ import {
   type StudyStats,
   studyStats,
   suspendCard,
+  type WordDetail,
+  wordDetail,
 } from "../api";
 import QueueEmpty from "../components/QueueEmpty";
 import SpeakButton from "../components/SpeakButton";
+import WordSenses from "../components/WordSenses";
 
 /**
  * 複習頁：只做「看字 → 想意思 → 自評」這一條路徑。
@@ -32,6 +35,12 @@ export default function Review() {
   const [loading, setLoading] = useState(true);
   const [shownAt, setShownAt] = useState(() => Date.now());
   const [newWord, setNewWord] = useState("");
+  // 翻面後要不要一併攤開整個詞條。
+  //
+  // 這個開關**刻意不隨著換卡重設**：想看細節的人每張都想看，
+  // 每次都要再按一次等於沒有這個功能。收合狀態下也不會去查資料庫。
+  const [showDetail, setShowDetail] = useState(false);
+  const [detail, setDetail] = useState<WordDetail | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -52,6 +61,22 @@ export default function Review() {
   }, [refresh]);
 
   const current = queue[0];
+
+  // 詳情是翻面之後才需要的，而且只在使用者真的展開時才查。
+  // 沒翻面就先抓的話，等於每張卡都多打一次資料庫換來一份沒人看的資料。
+  useEffect(() => {
+    if (!current || !revealed || !showDetail) return;
+    let cancelled = false;
+    setDetail(null);
+    void wordDetail(current.lemma_id)
+      .then((d) => {
+        if (!cancelled) setDetail(d);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [current, revealed, showDetail]);
 
   /**
    * 從佇列拿掉這張卡，但不評分。
@@ -175,12 +200,27 @@ export default function Review() {
           {revealed ? (
             <>
               <p className="meaning">{current.translation ?? current.gloss ?? "（尚無釋義）"}</p>
+              {/* 評分按鈕擺在完整詞條之前。自評要對著「剛剛考的那個意思」，
+                  先看完十五條義項再按，按的就不是同一件事了。 */}
               <div className="ratings">
                 <button onClick={() => grade(RATING.again)}>忘記了 (1)</button>
                 <button onClick={() => grade(RATING.hard)}>有點難 (2)</button>
                 <button onClick={() => grade(RATING.good)}>記得 (3)</button>
                 <button onClick={() => grade(RATING.easy)}>很簡單 (4)</button>
               </div>
+
+              <details
+                className="card-detail"
+                open={showDetail}
+                onToggle={(e) => setShowDetail(e.currentTarget.open)}
+              >
+                <summary>完整詞條</summary>
+                {detail ? (
+                  <WordSenses detail={detail} />
+                ) : (
+                  <p className="muted">載入中…</p>
+                )}
+              </details>
             </>
           ) : (
             <button className="reveal" onClick={() => setRevealed(true)}>

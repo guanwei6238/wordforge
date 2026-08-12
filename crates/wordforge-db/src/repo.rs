@@ -1092,6 +1092,53 @@ pub mod cards {
         Ok(words)
     }
 
+    /// 從「已經學會的字」裡隨機抽幾個。
+    ///
+    /// 跟 [`shaky_words`] 和 `due_words` 都不一樣：那兩個都是**有順序的**
+    /// （最可能忘掉的優先、最早到期的優先），所以短時間內連出幾份題目
+    /// 會拿到同一批字。這個函數存在的唯一理由就是打破那個重複。
+    ///
+    /// `exclude` 用來避開這次已經選過的字，比對不分大小寫——
+    /// 卡片存的是字典裡的原始拼寫，兩個來源的大小寫不一定一致。
+    ///
+    /// 只取 `state = 'review'`：學習中的卡本來就會頻繁出現在複習佇列裡，
+    /// 再抽到這裡等於重複考同一批。
+    pub async fn sample_known_words(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+        exclude: &[String],
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+
+        // ORDER BY RANDOM() 會掃過符合條件的卡。牌組是使用者自己的規模
+        // （數百到數千張），不是字典那 224 萬列，所以掃得起。
+        let words: Vec<String> = sqlx::query_scalar(
+            "SELECT l.text
+             FROM card c JOIN lemma l ON l.id = c.lemma_id
+             WHERE c.profile_id = ?1 AND c.suspended = 0
+               AND l.lang = ?2 AND c.state = 'review'
+             GROUP BY l.text
+             ORDER BY RANDOM()
+             LIMIT ?3",
+        )
+        .bind(profile_id.0)
+        .bind(lang)
+        // 排除是在 Rust 這邊做的，所以要多撈一些才夠扣
+        .bind(limit + exclude.len() as i64)
+        .fetch_all(db.pool())
+        .await?;
+
+        Ok(words
+            .into_iter()
+            .filter(|w| !exclude.iter().any(|e| e.eq_ignore_ascii_case(w)))
+            .take(limit as usize)
+            .collect())
+    }
+
     /// 把一張卡藏到明天。
     ///
     /// 不動排程：埋葬的意思是「今天不想看到」，不是「我答錯了」。
@@ -3051,6 +3098,86 @@ mod tests {
             vec!["almost_gone", "fading", "fresh"],
             "最快忘掉的要排最前面"
         );
+    }
+
+    /// 這個函數存在的理由是「不重複」，所以測的就是它會不會重複。
+    ///
+    /// 翻譯題原本全部用 `ORDER BY due` 的字，一天連出幾份會拿到一模一樣的
+    /// 單字。這裡驗兩件事：抽到的字會變，而且 `exclude` 真的排除得掉。
+    #[tokio::test]
+    async fn sampling_known_words_does_not_keep_returning_the_same_ones() {
+        let (db, profile) = setup().await;
+
+        for i in 0..20 {
+            let lemma = add_word(&db, &format!("word{i}"), i + 1).await;
+            let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE card SET state='review', stability=50.0, reps=4 WHERE id=?")
+                .bind(card.id.unwrap().0)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+
+        // 抽很多次，只要不是每次都同一組就達到目的了
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let got = cards::sample_known_words(&db, profile, "en", &[], 3)
+                .await
+                .unwrap();
+            assert_eq!(got.len(), 3);
+            seen.insert(got);
+        }
+        assert!(
+            seen.len() > 1,
+            "20 次抽樣全都一樣，那就跟 ORDER BY due 沒兩樣了"
+        );
+
+        // exclude 不分大小寫：卡片存的是字典裡的原始拼寫
+        let excluded: Vec<String> = (0..18).map(|i| format!("WORD{i}")).collect();
+        let got = cards::sample_known_words(&db, profile, "en", &excluded, 5)
+            .await
+            .unwrap();
+        let mut got = got;
+        got.sort();
+        assert_eq!(got, vec!["word18", "word19"], "只剩沒被排除的兩個");
+    }
+
+    /// 還在學的卡本來就會頻繁出現在複習佇列裡，再抽到翻譯題等於重複考。
+    #[tokio::test]
+    async fn sampling_known_words_skips_cards_still_being_learned() {
+        let (db, profile) = setup().await;
+
+        let learned = add_word(&db, "settled", 1).await;
+        let card = cards::ensure(&db, profile, learned, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE card SET state='review', stability=50.0, reps=4 WHERE id=?")
+            .bind(card.id.unwrap().0)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // 新卡與學習中的卡都不該被抽到
+        let fresh = add_word(&db, "brandnew", 2).await;
+        cards::ensure(&db, profile, fresh, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+        let learning = add_word(&db, "halfway", 3).await;
+        let c = cards::ensure(&db, profile, learning, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE card SET state='learning', reps=1 WHERE id=?")
+            .bind(c.id.unwrap().0)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let got = cards::sample_known_words(&db, profile, "en", &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(got, vec!["settled"]);
     }
 
     /// stability 高的字撐得比較久，同樣隔了三十天也沒那麼急。

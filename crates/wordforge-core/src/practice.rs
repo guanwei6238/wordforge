@@ -252,6 +252,32 @@ pub fn translation_count(vocabulary: i64) -> usize {
     if vocabulary < 500 { 3 } else { 5 }
 }
 
+/// 翻譯題的選字配比：幾題考今天到期的、幾題從學過的字裡隨機抽。
+///
+/// 回傳 `(到期, 隨機)`，兩者相加等於 `count`。
+///
+/// ## 為什麼不能全部用到期的字
+///
+/// 到期的順序是**固定的**（`ORDER BY due`），所以一天之內連出幾份翻譯題，
+/// 每份都拿到同一批字。使用者的原話是「翻譯用的單字都是相同的」。
+/// 這跟生詞選詞曾經完全決定性是同一個毛病。
+///
+/// 留一部分給隨機抽的舊字還有第二個好處：那些字 FSRS 認為已經穩了、
+/// 短期內不會再排到，但「以為學會了」正是最需要抽查的狀態。
+/// 這條路徑不動排程，只是拿來造句。
+pub fn translation_mix(count: usize) -> (usize, usize) {
+    // 3:2。整數運算避免浮點；count = 5 → 3，count = 3 → 2。
+    //
+    // 上界 `count - 1` 是為了保證兩題以上時隨機那邊一定拿得到名額：
+    // 純算比例的話 count = 2 會四捨五入成 2/0，等於這個機制沒開。
+    let due = (count * 3)
+        .div_ceil(5)
+        .min(count.saturating_sub(1))
+        .max(1)
+        .min(count);
+    (due, count - due)
+}
+
 // ------------------------------------------------------------------ 克漏字
 
 /// 克漏字挖空的標記。模型照這個格式寫，`{{1}}` 是第一格。
@@ -630,6 +656,23 @@ mod tests {
     fn beginners_get_fewer_translation_items() {
         assert_eq!(translation_count(100), 3);
         assert_eq!(translation_count(3_000), 5);
+    }
+
+    /// 這條測試存在的理由是翻譯題曾經全部用到期的字，而到期的順序是固定的
+    /// （`ORDER BY due`），所以連出幾份會拿到一模一樣的單字。
+    #[test]
+    fn some_translation_items_come_from_words_that_are_not_due() {
+        assert_eq!(translation_mix(5), (3, 2));
+        assert_eq!(translation_mix(3), (2, 1));
+
+        // 不管幾題，兩邊都要有——全給其中一邊就等於沒有這個機制
+        for count in 1..=20 {
+            let (due, extra) = translation_mix(count);
+            assert_eq!(due + extra, count, "count = {count}");
+            if count >= 2 {
+                assert!(due > 0 && extra > 0, "count = {count} 時是 {due}/{extra}");
+            }
+        }
     }
 
     #[test]

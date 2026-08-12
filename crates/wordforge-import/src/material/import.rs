@@ -194,6 +194,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
+                wordforge_db::dict::WriteMode::Replace,
             )
             .await
             .unwrap();

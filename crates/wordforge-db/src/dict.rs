@@ -73,6 +73,31 @@ pub struct EntryWrite<'a> {
     pub tags: Vec<&'a str>,
 }
 
+/// 一筆詞條寫進來的時候，要不要先清掉這個來源在同一個 lemma 上的舊資料。
+///
+/// 這是個 enum 而不是 `bool`，因為兩個模式的正確用法差很多，
+/// 而且用錯的後果是**安靜地掉資料**：
+///
+/// lemma 的鍵是 `(lang, text, pos)`，但一份 dump 裡同一組鍵可以出現好幾次——
+/// Wiktionary 的 `cat` 就有多個詞源各自一筆 `pos="noun"`（動物、catapult 的
+/// 縮寫、category 的縮寫…）。整批匯入時如果每筆都 `Replace`，
+/// 最後處理的那個詞源會把前面所有詞源的釋義刪光。真的發生過：
+/// 資料庫裡 `cat` 只剩下一堆縮寫，「貓」整組不見了。
+#[derive(Debug)]
+pub enum WriteMode<'a> {
+    /// 先刪掉這個來源寫在這個 lemma 上的舊釋義與發音，再寫新的。
+    ///
+    /// 單筆寫入用這個（教材匯入、測試 fixture）。
+    Replace,
+    /// 整份 dump 匯入。同一個 lemma 在這一輪裡**只清一次**，
+    /// 之後遇到的詞源都接在後面。
+    ///
+    /// `seen` 記的就是「這一輪已經清過哪些 lemma」，
+    /// 由呼叫端擁有並跨批次沿用。不用「開始前把整個來源清光」是因為
+    /// 那樣中途取消會只剩半份字典；這個做法沒碰到的詞條仍保有舊資料。
+    Batch(&'a mut std::collections::HashSet<i64>),
+}
+
 // ---------------------------------------------------------------- 寫入
 
 /// 登記匯入來源。同一個 slug 重複匯入會更新版本與時間，不會產生第二筆。
@@ -104,13 +129,14 @@ pub async fn upsert_source(db: &Db, src: NewSource<'_>, now: OffsetDateTime) -> 
 
 /// 寫入一個詞條。
 ///
-/// 對「同一個來源」是冪等的：重新匯入一份更新的 dump 時，
-/// 會先清掉這個來源先前寫在這個詞條上的釋義與發音再重寫，
-/// 但**不會**動到其他來源的資料，也不會動到使用者的學習進度。
+/// 對「同一個來源」是冪等的，但冪等的做法由 `mode` 決定，
+/// 兩種模式的差別與踩過的坑見 [`WriteMode`]。
+/// 兩種模式都**不會**動到其他來源的資料，也不會動到使用者的學習進度。
 pub async fn write_entry(
     conn: &mut SqliteConnection,
     source: SourceId,
     entry: &EntryWrite<'_>,
+    mode: WriteMode<'_>,
 ) -> Result<LemmaId> {
     let normalized = wordforge_core::text::normalize(entry.headword);
     // 前後各補一個空白，這樣 LIKE '% zk %' 不會誤中 'zkk'
@@ -140,18 +166,42 @@ pub async fn write_entry(
     .fetch_one(&mut *conn)
     .await?;
 
-    // 先清掉本來源的舊資料，避免重複匯入時釋義越疊越多。
-    // example 掛在 sense 底下，會跟著 CASCADE 一起消失。
-    sqlx::query("DELETE FROM sense WHERE lemma_id = ? AND source_id = ?")
+    // Batch 模式下，這一輪第一次碰到這個 lemma 時才清——
+    // 之後的詞源都是接在後面。這就是「多詞源不互相洗掉」的機制本身。
+    let appending = match mode {
+        WriteMode::Replace => false,
+        WriteMode::Batch(seen) => !seen.insert(lemma_id),
+    };
+
+    if !appending {
+        // 先清掉本來源的舊資料，避免重複寫入時釋義越疊越多。
+        // example 掛在 sense 底下，會跟著 CASCADE 一起消失。
+        sqlx::query("DELETE FROM sense WHERE lemma_id = ? AND source_id = ?")
+            .bind(lemma_id)
+            .bind(source.0)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM pronunciation WHERE lemma_id = ? AND source_id = ?")
+            .bind(lemma_id)
+            .bind(source.0)
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    // 接在既有釋義後面時要延續編號，不然第二個詞源的第一條又是 0，
+    // 之後 `ORDER BY sort_order` 會把兩個詞源交錯著吐出來。
+    let base_order: i64 = if appending {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(sort_order) FROM sense WHERE lemma_id = ? AND source_id = ?",
+        )
         .bind(lemma_id)
         .bind(source.0)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("DELETE FROM pronunciation WHERE lemma_id = ? AND source_id = ?")
-        .bind(lemma_id)
-        .bind(source.0)
-        .execute(&mut *conn)
-        .await?;
+        .fetch_one(&mut *conn)
+        .await?
+        .map_or(0, |m| m + 1)
+    } else {
+        0
+    };
 
     for (order, sense) in entry.senses.iter().enumerate() {
         let sense_id: i64 = sqlx::query_scalar(
@@ -167,7 +217,7 @@ pub async fn write_entry(
         .bind(sense.translation)
         .bind(sense.register)
         .bind(sense.domain)
-        .bind(order as i64)
+        .bind(base_order + order as i64)
         .fetch_one(&mut *conn)
         .await?;
 
@@ -187,6 +237,26 @@ pub async fn write_entry(
     }
 
     for pron in &entry.pronunciations {
+        // 接在後面時，同一個詞的每個詞源通常都帶同一組 IPA，
+        // 直接插會讓字典頁列出四五個一模一樣的發音。
+        // 這張表沒有唯一約束（發音本來就可以有多筆），所以在這裡擋。
+        if appending {
+            let dup: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM pronunciation
+                  WHERE lemma_id = ? AND source_id = ?
+                    AND accent IS ? AND ipa IS ?
+                  LIMIT 1",
+            )
+            .bind(lemma_id)
+            .bind(source.0)
+            .bind(pron.accent)
+            .bind(pron.ipa)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if dup.is_some() {
+                continue;
+            }
+        }
         sqlx::query(
             "INSERT INTO pronunciation (lemma_id, source_id, accent, ipa, audio_url,
                                         audio_path, audio_license, is_synthetic)
@@ -675,18 +745,54 @@ pub async fn glossary(db: &Db, lang: &str, terms: &[String]) -> Result<Vec<Gloss
         let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        // 同一個詞可能有多個詞性各自一列，取有翻譯的那一列優先，
-        // 否則使用者會看到隨機一個詞性的空釋義
+        // 同一個拼寫在 lemma 表裡通常有好幾列（詞性各一列，大小寫各一列），
+        // 這裡要明確挑出「對學習者最有用」的那一列，理由見 `rank` 註解。
         let sql = format!(
-            "SELECT l.normalized,
-                    MIN(l.text),
-                    (SELECT s.gloss FROM sense s WHERE s.lemma_id = l.id
-                      ORDER BY s.sort_order LIMIT 1),
-                    (SELECT s.translation FROM sense s WHERE s.lemma_id = l.id
-                      AND s.translation IS NOT NULL ORDER BY s.sort_order LIMIT 1)
-             FROM lemma l
-             WHERE l.lang = ? AND l.normalized IN ({placeholders})
-             GROUP BY l.normalized"
+            "WITH ranked AS (
+                 SELECT l.id, l.normalized, l.text,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY l.normalized
+                            ORDER BY
+                                -- 1. 有母語翻譯的排前面。學習者要看的是這個，
+                                --    而專有名詞條目幾乎都只有目標語言釋義。
+                                NOT EXISTS (SELECT 1 FROM sense s
+                                             WHERE s.lemma_id = l.id
+                                               AND s.translation IS NOT NULL
+                                               AND s.translation <> ''),
+                                -- 2. 專有名詞排後面。
+                                --    `pos` 沒有跨字典的正規化，這裡的
+                                --    'name' 是 Wiktionary/kaikki 的寫法；
+                                --    別的字典可能寫 'proper noun'、'propn'
+                                --    或什麼都不寫。所以這是**加分項不是保證**，
+                                --    認不出來時下一條規則接手。
+                                --    留著的理由：日文中文這種沒有大小寫的語言，
+                                --    規則 3 完全失效，這是唯一的訊號。
+                                l.pos = 'name',
+                                -- 3. 拼寫跟正規化形不同的排後面（Straight、CAT）。
+                                --    比 lower() 好：正規化是這個專案自己的規則，
+                                --    lower() 只處理 ASCII。沒有大小寫的語言
+                                --    這條恆為 false，等於少一層過濾而已，
+                                --    不會挑錯——這是刻意的降級。
+                                l.text <> l.normalized,
+                                l.id
+                        ) AS rn
+                 FROM lemma l
+                 WHERE l.lang = ? AND l.normalized IN ({placeholders})
+             )
+             SELECT r.normalized,
+                    r.text,
+                    -- 目標語言的定義可能在另一列（翻譯在 ECDICT、定義在
+                    -- Wiktionary），所以獨立取，但用同一套排序決定先後。
+                    (SELECT s.gloss FROM sense s
+                       JOIN ranked g ON g.id = s.lemma_id
+                      WHERE g.normalized = r.normalized AND s.gloss_lang = ?
+                      ORDER BY g.rn, s.sort_order LIMIT 1),
+                    (SELECT s.translation FROM sense s
+                      WHERE s.lemma_id = r.id
+                        AND s.translation IS NOT NULL AND s.translation <> ''
+                      ORDER BY s.sort_order LIMIT 1)
+             FROM ranked r
+             WHERE r.rn = 1"
         );
 
         let mut q =
@@ -694,6 +800,8 @@ pub async fn glossary(db: &Db, lang: &str, terms: &[String]) -> Result<Vec<Gloss
         for term in chunk {
             q = q.bind(term);
         }
+        // 綁定順序照 SQL 文字順序：CTE 的 lang、各個 term、gloss 子查詢的 lang
+        q = q.bind(lang);
 
         for (term, text, gloss, translation) in q.fetch_all(db.pool()).await? {
             out.push(GlossEntry {
@@ -823,7 +931,9 @@ mod tests {
 
     async fn write(db: &Db, source: SourceId, entry: &EntryWrite<'_>) -> LemmaId {
         let mut conn = db.pool().acquire().await.unwrap();
-        write_entry(&mut conn, source, entry).await.unwrap()
+        write_entry(&mut conn, source, entry, WriteMode::Replace)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1306,5 +1416,290 @@ mod tests {
     async fn detail_returns_none_for_unknown_id() {
         let (db, _, profile) = setup().await;
         assert!(detail(&db, 999, profile).await.unwrap().is_none());
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：lemma 的鍵是 `(lang, text, pos)`，
+    /// 但 Wiktionary 的 `cat` 有好幾個詞源各自一筆 `pos="noun"`。
+    /// `write_entry` 每一筆都先 `DELETE FROM sense WHERE lemma_id=? AND source_id=?`，
+    /// 所以最後處理的那個詞源（catapult、category 那些縮寫）
+    /// 把「貓」的義項整組洗掉了。使用者在字典裡查 cat 只看得到一堆縮寫。
+    #[tokio::test]
+    async fn a_second_etymology_does_not_erase_the_first() {
+        let (db, source, _) = setup().await;
+
+        let animal = EntryWrite {
+            lang: "en",
+            headword: "cat",
+            pos: "noun",
+            senses: vec![NewSense {
+                gloss: "A domesticated feline animal.",
+                gloss_lang: "en",
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let abbreviation = EntryWrite {
+            lang: "en",
+            headword: "cat",
+            pos: "noun",
+            senses: vec![NewSense {
+                gloss: "Abbreviation of catapult.",
+                gloss_lang: "en",
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut conn = db.pool().acquire().await.unwrap();
+        let mut seen = std::collections::HashSet::new();
+        write_entry(&mut conn, source, &animal, WriteMode::Batch(&mut seen))
+            .await
+            .unwrap();
+        let lemma = write_entry(
+            &mut conn,
+            source,
+            &abbreviation,
+            WriteMode::Batch(&mut seen),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        let glosses: Vec<String> =
+            sqlx::query_scalar("SELECT gloss FROM sense WHERE lemma_id = ? ORDER BY sort_order")
+                .bind(lemma.0)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            glosses,
+            vec![
+                "A domesticated feline animal.".to_string(),
+                "Abbreviation of catapult.".to_string(),
+            ],
+            "兩個詞源都要留著，而且照匯入順序排"
+        );
+    }
+
+    /// `Replace` 仍然要是取代——單筆重寫（教材匯入）靠的就是這個。
+    /// 兩個模式的差別是刻意的，不是其中一個沒改到。
+    #[tokio::test]
+    async fn replace_still_overwrites_what_the_same_source_wrote() {
+        let (db, source, _) = setup().await;
+
+        for gloss in ["舊的", "新的"] {
+            write(
+                &db,
+                source,
+                &EntryWrite {
+                    lang: "en",
+                    headword: "cat",
+                    pos: "noun",
+                    senses: vec![NewSense {
+                        gloss,
+                        gloss_lang: "en",
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+
+        let glosses: Vec<String> = sqlx::query_scalar(
+            "SELECT s.gloss FROM sense s JOIN lemma l ON l.id = s.lemma_id
+              WHERE l.text = 'cat' ORDER BY s.sort_order",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(glosses, vec!["新的".to_string()]);
+    }
+
+    /// 同一個詞的每個詞源都會帶同一組 IPA。append 時不擋的話，
+    /// 字典頁會列出四五個一模一樣的發音。
+    #[tokio::test]
+    async fn appending_does_not_pile_up_identical_pronunciations() {
+        let (db, source, _) = setup().await;
+
+        let entry = EntryWrite {
+            lang: "en",
+            headword: "cat",
+            pos: "noun",
+            senses: vec![NewSense {
+                gloss: "g",
+                gloss_lang: "en",
+                ..Default::default()
+            }],
+            pronunciations: vec![NewPronunciation {
+                accent: Some("uk"),
+                ipa: Some("/kæt/"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut conn = db.pool().acquire().await.unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            write_entry(&mut conn, source, &entry, WriteMode::Batch(&mut seen))
+                .await
+                .unwrap();
+        }
+        drop(conn);
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pronunciation p JOIN lemma l ON l.id = p.lemma_id
+              WHERE l.text = 'cat'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：`glossary` 用
+    /// `GROUP BY l.normalized` 配 `MIN(l.text)`，而大寫字母的排序在小寫之前，
+    /// 所以 `Straight`（姓氏）永遠贏過 `straight`（直的）。SQLite 的 bare column
+    /// 規則讓後面兩個 correlated subquery 也跟著綁到那一列，
+    /// 結果是點文章裡的 straight 得到「A surname.」而且完全沒有翻譯。
+    /// 真實資料庫裡 bank→「A surname.」、cat→「Central Atlas Tamazight」
+    /// 也都是同一個原因。
+    #[tokio::test]
+    async fn a_proper_noun_never_outranks_the_everyday_word() {
+        let (db, source, _) = setup().await;
+
+        // 大寫的姓氏條目：只有目標語言釋義，沒有母語翻譯——跟 Wiktionary 一樣
+        write(
+            &db,
+            source,
+            &EntryWrite {
+                lang: "en",
+                headword: "Straight",
+                pos: "name",
+                senses: vec![NewSense {
+                    gloss: "A surname.",
+                    gloss_lang: "en",
+                    translation: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        write(
+            &db,
+            source,
+            &EntryWrite {
+                lang: "en",
+                headword: "straight",
+                pos: "adj",
+                senses: vec![NewSense {
+                    gloss: "Without a bend or curve.",
+                    gloss_lang: "en",
+                    translation: Some("直的"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let got = glossary(&db, "en", &["straight".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "straight");
+        assert_eq!(got[0].translation.as_deref(), Some("直的"));
+    }
+
+    /// 翻譯與目標語言定義常常來自不同的字典（翻譯在 ECDICT、定義在
+    /// Wiktionary），而它們是 lemma 表裡不同的兩列。兩邊都要取得到，
+    /// 否則有 ECDICT 的人就看不到英文定義。
+    #[tokio::test]
+    async fn a_translation_and_a_definition_can_come_from_different_entries() {
+        let (db, source, _) = setup().await;
+
+        // 只有翻譯，沒有目標語言定義（ECDICT 的形狀：pos 是空的）
+        write(
+            &db,
+            source,
+            &EntryWrite {
+                lang: "en",
+                headword: "cat",
+                pos: "",
+                senses: vec![NewSense {
+                    gloss: "n. 貓",
+                    gloss_lang: "zh-TW",
+                    translation: Some("n. 貓"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // 只有目標語言定義，沒有翻譯（Wiktionary 的形狀）
+        write(
+            &db,
+            source,
+            &EntryWrite {
+                lang: "en",
+                headword: "cat",
+                pos: "noun",
+                senses: vec![NewSense {
+                    gloss: "A domesticated feline animal.",
+                    gloss_lang: "en",
+                    translation: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let got = glossary(&db, "en", &["cat".to_string()]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].translation.as_deref(), Some("n. 貓"));
+        assert_eq!(
+            got[0].gloss.as_deref(),
+            Some("A domesticated feline animal.")
+        );
+    }
+
+    /// 沒有匯入雙語字典的人（例如學日文只有 Wiktionary）一樣要查得到東西。
+    /// 排序的第一條規則整個失效時，後面的規則要接得住。
+    #[tokio::test]
+    async fn a_dictionary_without_translations_still_picks_the_common_word() {
+        let (db, source, _) = setup().await;
+
+        for (headword, pos, gloss) in [
+            ("March", "name", "The third month."),
+            ("march", "verb", "To walk with regular steps."),
+        ] {
+            write(
+                &db,
+                source,
+                &EntryWrite {
+                    lang: "en",
+                    headword,
+                    pos,
+                    senses: vec![NewSense {
+                        gloss,
+                        gloss_lang: "en",
+                        translation: None,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+
+        let got = glossary(&db, "en", &["march".to_string()]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "march");
+        assert_eq!(got[0].gloss.as_deref(), Some("To walk with regular steps."));
     }
 }

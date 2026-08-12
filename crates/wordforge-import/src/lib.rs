@@ -189,6 +189,11 @@ pub async fn register_source(db: &Db, meta: &SourceMeta) -> Result<SourceId> {
 /// 解析失敗的項目會被計入 `failed` 並跳過，不會中斷整批匯入。
 /// 資料庫層級的錯誤（磁碟滿、schema 不符）則會直接中止——
 /// 那代表環境有問題，繼續跑只是浪費時間。
+///
+/// 重複匯入同一個來源是冪等的：每個詞條在這一輪第一次被碰到時清空重寫，
+/// 之後同一個詞條的其他詞源接在後面。**不能**改成每筆各自 `Replace`：
+/// 一份 dump 裡同一個 `(lang, text, pos)` 會出現好幾次（Wiktionary 的
+/// 多詞源條目），那樣後面的會把前面的洗掉。詳見 [`dict::WriteMode`]。
 pub async fn import_entries<I>(
     db: &Db,
     source: SourceId,
@@ -202,6 +207,9 @@ where
     let mut progress = ImportProgress::default();
     let mut iter = entries.into_iter();
     let mut exhausted = false;
+    // 這一輪已經清空過的詞條。要跨批次活著——同一個詞的兩個詞源
+    // 落在不同批次是常態。百萬筆量級大約幾十 MB，比起 dump 本身可以忽略。
+    let mut seen = std::collections::HashSet::new();
 
     while !exhausted {
         let mut tx = db.pool().begin().await?;
@@ -221,7 +229,13 @@ where
                 }
                 Ok(entry) if !entry.is_usable() => progress.skipped += 1,
                 Ok(entry) => {
-                    dict::write_entry(&mut tx, source, &to_write(&entry)).await?;
+                    dict::write_entry(
+                        &mut tx,
+                        source,
+                        &to_write(&entry),
+                        dict::WriteMode::Batch(&mut seen),
+                    )
+                    .await?;
                     progress.imported += 1;
                     in_batch += 1;
                 }
@@ -699,5 +713,57 @@ mod tests {
         let stats = dict::stats(&db).await.unwrap();
         assert_eq!(stats.lemmas, 2);
         assert_eq!(stats.senses, 2, "重複匯入不該讓釋義變兩倍");
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：Wiktionary 的 `cat` 有好幾個
+    /// 詞源各自一筆 `pos="noun"`，而 lemma 的鍵只到 `(lang, text, pos)`。
+    /// 每筆進來都先刪光同來源的舊釋義，所以最後那個詞源（catapult、
+    /// category 那些縮寫）贏了，「貓」整組被洗掉。
+    ///
+    /// `batch_size` 刻意設成 1，讓兩個詞源落在不同的 transaction——
+    /// 「這一輪清過誰」必須跨批次記得，不然這個 bug 會原封不動回來。
+    #[tokio::test]
+    async fn every_etymology_of_the_same_word_survives_one_import() {
+        let (db, source) = setup().await;
+
+        let etymology = |gloss: &str| DictEntry {
+            lang: "en".into(),
+            headword: "cat".into(),
+            pos: "noun".into(),
+            senses: vec![SenseEntry {
+                gloss: gloss.into(),
+                gloss_lang: "en".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let entries = vec![
+            Ok(etymology("A domesticated feline animal.")),
+            Ok(etymology("Abbreviation of catapult.")),
+            Ok(etymology("Abbreviation of category.")),
+        ];
+        let opts = ImportOptions {
+            batch_size: 1,
+            ..ImportOptions::default()
+        };
+
+        import_entries(&db, source, entries, &opts, &NoProgress)
+            .await
+            .unwrap();
+
+        let stats = dict::stats(&db).await.unwrap();
+        assert_eq!(stats.lemmas, 1, "三個詞源共用同一個 (lang, text, pos)");
+        assert_eq!(stats.senses, 3, "三個詞源的釋義都要留著");
+
+        // 排序要照匯入順序延續，不能三個都從 0 開始
+        let entries = dict::glossary(&db, "en", &["cat".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            entries[0].gloss.as_deref(),
+            Some("A domesticated feline animal."),
+            "第一個詞源的第一條釋義要排在最前面"
+        );
     }
 }

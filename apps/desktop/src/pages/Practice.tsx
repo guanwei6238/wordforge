@@ -1,6 +1,7 @@
 import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  addWord,
   BLANK_PATTERN,
   currentLanguages,
   deleteExercise,
@@ -45,11 +46,12 @@ const HISTORY_PAGE = 10;
  *
  * 一整條迴圈都在這裡：依程度出題 → 作答 → 批改 → 不會的字自動排進複習。
  *
- * 閱讀測驗分兩個階段，點文章的意思也跟著換：
+ * 閱讀測驗與克漏字分兩個階段，點文章的意思也跟著換：
  *
  * - **作答前**：點任何一個字＝標記「我不會」，送出時一起排進複習。
  * - **解析時**：點任何一個字＝查它的釋義。這時候才給翻譯，
- *   作答前給等於直接送答案。
+ *   作答前給等於直接送答案。解析時才發現不會的字，
+ *   在釋義視窗裡按「＋複習」補加——那時候 `marked_unknown` 已經送出去了。
  */
 export default function Practice() {
   const [status, setStatus] = useState<PracticeStatus | null>(null);
@@ -76,6 +78,9 @@ export default function Practice() {
   const [showHistory, setShowHistory] = useState(false);
   // 解析階段點到的字，顯示釋義用
   const [lookup, setLookup] = useState<string | null>(null);
+  // 覆盤時另外補加進牌組的字。跟 marked 分開：那個是送出時一起帶的，
+  // 這個是批改完才按的，當下就直接寫進牌組了
+  const [addedLater, setAddedLater] = useState<string[]>([]);
   // 文法題要練哪一個點。空字串＝從今天到期的弱點裡挑（隨機）
   const [grammarPoints, setGrammarPoints] = useState<GrammarView[]>([]);
   const [grammarFocus, setGrammarFocus] = useState<string>("");
@@ -145,6 +150,7 @@ export default function Practice() {
     setFeedback(null);
     setMarked([]);
     setLookup(null);
+    setAddedLater([]);
     setAnswers(ex?.body.kind === "translation" ? ex.body.items.map(() => "") : []);
     setChoices(
       ex?.body.kind === "reading"
@@ -237,6 +243,24 @@ export default function Practice() {
       });
       setFontSize(stored.reading_font_size);
     } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+
+  /** 覆盤時補加一個字進牌組。
+   *
+   * 樂觀更新：先標成「已加入」再送，失敗的話收回並顯示錯誤。
+   * 這個按鈕按下去到卡片出現在複習佇列之間沒有別的回饋，
+   * 讓它等一趟 round-trip 會像沒反應。 */
+  async function addLater(word: string) {
+    const clean = word.trim();
+    if (!clean || addedLater.some((w) => w.toLowerCase() === clean.toLowerCase())) return;
+    setAddedLater((w) => [...w, clean]);
+    try {
+      await addWord(clean, langs.target);
+      await refresh();
+    } catch (e) {
+      setAddedLater((w) => w.filter((x) => x !== clean));
       setError(errorMessage(e));
     }
   }
@@ -466,6 +490,8 @@ export default function Practice() {
                     term={lookup}
                     glossary={feedback.glossary ?? []}
                     onClose={() => setLookup(null)}
+                    onAdd={addLater}
+                    added={addedLater}
                   />
                 )}
 
@@ -517,6 +543,7 @@ export default function Practice() {
                 <p className="muted hint">
                   文章裡的每一個空格對應右邊同號的一題。這些字你都學過，
                   考的是在句子裡想不想得起來。
+                  {!feedback && "　點空格以外的任何一個字可以標記「我不會」，送出後會排進複習。"}
                 </p>
                 <ClozePassage
                   passage={cloze.passage}
@@ -525,7 +552,12 @@ export default function Practice() {
                   feedback={feedback}
                   lookup={lookup}
                   onLookup={setLookup}
+                  marked={marked}
+                  onToggleMark={toggleMarked}
                 />
+                {marked.length > 0 && !feedback && (
+                  <p className="muted">標記為不會的字：{marked.join("、")}</p>
+                )}
                 {feedback && (
                   <p className="muted hint">點文章裡的任何一個字可以查它的意思。</p>
                 )}
@@ -544,6 +576,8 @@ export default function Practice() {
                     term={lookup}
                     glossary={feedback.glossary ?? []}
                     onClose={() => setLookup(null)}
+                    onAdd={addLater}
+                    added={addedLater}
                   />
                 )}
 
@@ -741,6 +775,8 @@ function ClozePassage({
   feedback,
   lookup,
   onLookup,
+  marked,
+  onToggleMark,
 }: {
   passage: string;
   items: { options: string[]; answer_index: number }[];
@@ -749,6 +785,8 @@ function ClozePassage({
   /** 解析時點開的那個字。作答前是 null——那時候給翻譯等於送答案 */
   lookup: string | null;
   onLookup: (term: string | null) => void;
+  marked: string[];
+  onToggleMark: (word: string) => void;
 }) {
   // 依 {{n}} 切開。用 split 保留分隔符，一次走完不必自己算位置。
   const parts = useMemo(() => passage.split(new RegExp(BLANK_PATTERN.source, "g")), [passage]);
@@ -757,20 +795,29 @@ function ClozePassage({
     <p className="passage">
       {parts.map((part, i) => {
         // split 帶捕獲群組時，奇數索引是空格編號
-        // 偶數段是文章本文。批改之後每個字都能點開查意思，
-        // 作答前不行——那時候給翻譯等於直接送答案。
+        // 偶數段是文章本文。跟閱讀測驗同一套規則：作答前點字是標記
+        // 「我不會」，批改後才是查釋義——作答前給翻譯等於直接送答案。
+        // 空格本身不在這裡，所以標記不會洩漏任何一題的答案。
         if (i % 2 === 0) {
-          if (!feedback) return <span key={i}>{part}</span>;
           return (
             <span key={i}>
               {part.split(/(\s+)/).map((chunk, j) => {
                 if (!chunk.trim()) return chunk;
                 const word = normalizeWord(chunk);
+                const isMarked = marked.some((w) => w.toLowerCase() === word);
                 return (
                   <span
                     key={j}
-                    className={lookup === word ? "token looking" : "token"}
-                    onClick={() => onLookup(lookup === word ? null : word)}
+                    className={[
+                      "token",
+                      isMarked ? "marked" : "",
+                      feedback && lookup === word ? "looking" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    onClick={() =>
+                      feedback ? onLookup(lookup === word ? null : word) : onToggleMark(chunk)
+                    }
                   >
                     {chunk}
                   </span>
@@ -812,10 +859,15 @@ function WordNotes({
   term,
   glossary,
   onClose,
+  onAdd,
+  added,
 }: {
   term: string;
   glossary: GlossaryNote[];
   onClose: () => void;
+  /** 覆盤時才發現不會的字，這裡補加進牌組。作答前的標記走 marked_unknown */
+  onAdd: (word: string) => void;
+  added: string[];
 }) {
   // 片語也要跳出來：`search for` 分開查兩個字都得不到「尋找」
   const hits = useMemo(
@@ -840,20 +892,39 @@ function WordNotes({
         </p>
       ) : (
         <dl>
-          {hits.map((g, i) => (
-            <div key={i} className="gloss-row">
-              <dt>
-                {g.text}
-                {g.is_phrase && (
-                  <span className="tag" title="片語：單看每個字查不出這個意思">
-                    片語
-                  </span>
-                )}
-                <SpeakButton text={g.text} />
-              </dt>
-              <dd>{g.translation ?? g.gloss ?? <span className="muted">查無釋義</span>}</dd>
-            </div>
-          ))}
+          {hits.map((g, i) => {
+            const isAdded = added.some((w) => w.toLowerCase() === g.term.toLowerCase());
+            return (
+              <div key={i} className="gloss-row">
+                <dt>
+                  {g.text}
+                  {g.is_phrase && (
+                    <span className="tag" title="片語：單看每個字查不出這個意思">
+                      片語
+                    </span>
+                  )}
+                  <SpeakButton text={g.text} />
+                  <button
+                    className="add-review"
+                    disabled={isAdded}
+                    onClick={() => onAdd(g.term)}
+                    title={isAdded ? "已經在牌組裡了" : "把這個詞加進複習牌組"}
+                  >
+                    {isAdded ? "已加入" : "＋複習"}
+                  </button>
+                </dt>
+                <dd>
+                  {/* 翻譯與目標語言定義來自不同字典，兩個都給。
+                      相同的話只顯示一次——ECDICT 兩邊都填了同一句。 */}
+                  {g.translation && <span className="translation">{g.translation}</span>}
+                  {g.gloss && g.gloss !== g.translation && (
+                    <span className="gloss">{g.gloss}</span>
+                  )}
+                  {!g.translation && !g.gloss && <span className="muted">查無釋義</span>}
+                </dd>
+              </div>
+            );
+          })}
         </dl>
       )}
     </div>

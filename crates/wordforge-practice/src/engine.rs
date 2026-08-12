@@ -293,19 +293,18 @@ impl<'a> PracticeEngine<'a> {
         learner: &LearnerProfile,
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
-        // 用今天到期的字出題：翻譯的時候順便複習到了
-        let due_words = self.due_words(profile_id, 8, now).await?;
         let count = practice::translation_count(learner.vocabulary);
+        let words = self.translation_words(profile_id, count, now).await?;
 
         let excerpt = self
-            .material_excerpt(&due_words, now.unix_timestamp() as u64)
+            .material_excerpt(&words, now.unix_timestamp() as u64)
             .await?;
         let mut req = prompts::translation_task(
             self.target_name(),
             self.native_name(),
             kind == ExerciseKind::TranslationToTarget,
             excerpt.as_deref(),
-            &due_words,
+            &words,
             count,
         );
         let value = self
@@ -347,7 +346,7 @@ impl<'a> PracticeEngine<'a> {
             to_target: kind == ExerciseKind::TranslationToTarget,
             items,
         };
-        self.store(profile_id, kind, body, due_words, None, None, now)
+        self.store(profile_id, kind, body, words, None, None, now)
             .await
     }
 
@@ -1340,7 +1339,15 @@ impl<'a> PracticeEngine<'a> {
         Ok(result?.json()?)
     }
 
-    /// 今天到期或即將學到的字，拿來當出題素材。
+    /// 今天到期的字，**含從來沒看過的新卡**。
+    ///
+    /// 這是最後手段，不是預設。批改時 LLM 標出來的生詞會直接建成新卡，
+    /// 而新卡一建好就算「到期」——所以這個查詢回的多半是他一次都沒學過的字。
+    /// 拿那種字出題，中翻英等於要他寫出一個從沒見過的單字。
+    ///
+    /// 正常路徑用 [`Self::studied_due_words`]（多一個 `reps > 0`）。
+    /// 這裡留著是為了新使用者：牌組裡全是新卡時，一個字都拿不到
+    /// 比拿到沒學過的字更糟。
     async fn due_words(
         &self,
         profile_id: i64,
@@ -1350,14 +1357,100 @@ impl<'a> PracticeEngine<'a> {
         let words: Vec<String> = sqlx::query_scalar(
             "SELECT l.text FROM card c JOIN lemma l ON l.id = c.lemma_id
              WHERE c.profile_id = ? AND c.suspended = 0 AND c.due <= ?
+               AND l.lang = ?
              ORDER BY c.due LIMIT ?",
         )
         .bind(profile_id)
         .bind(format_ts(now))
+        .bind(&self.target_lang)
         .bind(limit)
         .fetch_all(self.db.pool())
         .await
         .map_err(wordforge_db::DbError::from)?;
+        Ok(words)
+    }
+
+    /// 翻譯題要用哪些字：一部分今天到期的，一部分從學過的字裡隨機抽。
+    ///
+    /// 配比由 [`practice::translation_mix`] 決定，那裡寫了為什麼不能全用
+    /// 到期的字（順序固定 → 每次拿到同一批）。這裡處理的是取材與補位。
+    ///
+    /// ## 為什麼到期那半邊要看 `reps`
+    ///
+    /// 批改時 LLM 標出來的生詞會**直接建成新卡**，而新卡一建好就算到期。
+    /// 練了幾次之後佇列裡絕大多數是他一次都沒學過的字（實測過一個牌組：
+    /// 141 張到期的卡裡有 138 張 `reps = 0`）。而且它們的 `due` 全擠在
+    /// 同一個時間點，`ORDER BY due` 在平手時順序固定——同一批字每次都贏。
+    ///
+    /// 拿沒學過的字出翻譯題，中翻英等於要他寫出一個從沒見過的單字。
+    /// 克漏字早就擋掉了，這裡跟它用同一個查詢。
+    ///
+    /// ## 湊不齊的時候
+    ///
+    /// 依序放寬，每一層都比上一層差一點，但都比「出不了題」好：
+    ///
+    /// 1. 學過且到期的 → 隨機抽學會的 → 兩邊互相補
+    /// 2. 還是不夠：連沒學過的到期字也拿。新使用者的牌組全是新卡，
+    ///    這時候一個字都給不出來比給沒學過的字更糟。
+    async fn translation_words(
+        &self,
+        profile_id: i64,
+        count: usize,
+        now: OffsetDateTime,
+    ) -> Result<Vec<String>> {
+        let (due_n, extra_n) = practice::translation_mix(count);
+
+        // 多撈一點，讓補位有東西可用
+        let due_pool = self
+            .studied_due_words(profile_id, count as i64, now)
+            .await?;
+        let mut words: Vec<String> = due_pool.iter().take(due_n).cloned().collect();
+
+        let extra = cards::sample_known_words(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            &words,
+            extra_n as i64,
+        )
+        .await?;
+        words.extend(extra);
+
+        let fill = |pool: Vec<String>, words: &mut Vec<String>| {
+            for word in pool {
+                if words.len() >= count {
+                    break;
+                }
+                if !words.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
+                    words.push(word);
+                }
+            }
+        };
+
+        // 隨機抽的不夠時，回頭用剩下的到期字補
+        fill(due_pool, &mut words);
+
+        // 到期的不夠時，再多抽一些學過的
+        if words.len() < count {
+            let more = cards::sample_known_words(
+                self.db,
+                ProfileId(profile_id),
+                &self.target_lang,
+                &words,
+                (count - words.len()) as i64,
+            )
+            .await?;
+            words.extend(more);
+        }
+
+        // 最後手段：連沒學過的到期字也拿
+        if words.len() < count {
+            fill(
+                self.due_words(profile_id, count as i64, now).await?,
+                &mut words,
+            );
+        }
+
         Ok(words)
     }
 
