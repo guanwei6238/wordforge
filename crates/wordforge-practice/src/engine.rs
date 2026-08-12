@@ -74,6 +74,16 @@ const GRAMMAR_BATCH: i64 = 5;
 /// 再長的多半是句子而不是詞條。
 const MAX_PHRASE_LEN: usize = 4;
 
+/// 生詞從「估計詞彙量」到「估計詞彙量 × 這個倍數」之間挑。
+///
+/// 1.5 倍是「再難一點但還會再遇到」的範圍。挑更罕見的字學了用不到，
+/// 而且會讓文章讀起來像在背 GRE 單字書。
+const NEW_WORD_REACH: f64 = 1.5;
+
+/// 先撈幾個候選再做詞性平衡。要夠多才湊得齊各種詞性，
+/// 但這是一次有索引的查詢，多撈幾百個不影響。
+const NEW_WORD_POOL: i64 = 400;
+
 const TOPIC_MEMORY: i64 = 6;
 
 pub struct PracticeEngine<'a> {
@@ -304,7 +314,33 @@ impl<'a> PracticeEngine<'a> {
         .await?;
         let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
         let word_count = practice::reading_length(learner.vocabulary);
-        let target_words = self.due_words(profile_id, 6, now).await?;
+
+        // 新詞預算由覆蓋率目標算出來，不是拍腦袋的數字
+        let budget = wordforge_core::coverage::new_word_budget(
+            word_count,
+            READING_COVERAGE,
+            prompts::ReadingSpec::REPEATS_PER_NEW_WORD,
+        );
+
+        // 新詞必須是他還不會的字。拿到期的複習字來填的話，覆蓋率算起來
+        // 都算會——實測 99%，整篇沒有東西可學。
+        let candidates = lemmas::new_word_candidates(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            learner.vocabulary,
+            NEW_WORD_REACH,
+            NEW_WORD_POOL,
+        )
+        .await?;
+        let target_words: Vec<String> =
+            practice::balance_by_pos(&candidates, practice::DESIRED_POS, budget)
+                .into_iter()
+                .map(|w| w.text)
+                .collect();
+
+        // 到期的字改成「順便複習」：他已經會，不佔生詞預算
+        let review_words = self.due_words(profile_id, 6, now).await?;
 
         // 主題輪換：不指定的話模型永遠寫校園生活與天氣，
         // 十篇讀起來像同一篇。用時間戳當 seed，同一批候選也不會每次都給同一個。
@@ -313,8 +349,9 @@ impl<'a> PracticeEngine<'a> {
         let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
 
         // 指定教材時，取材範圍由課本決定，主題輪換就不該再插手
+        // 教材檢索用複習字：課本裡本來就不會有他還沒學的生詞
         let excerpt = self
-            .material_excerpt(&target_words, now.unix_timestamp() as u64)
+            .material_excerpt(&review_words, now.unix_timestamp() as u64)
             .await?;
         let topic = if excerpt.is_some() { "" } else { topic };
 
@@ -327,6 +364,7 @@ impl<'a> PracticeEngine<'a> {
             cefr: None,
             known_sample: &known_sample,
             target_words: &target_words,
+            review_words: &review_words,
             topic: (!topic.is_empty()).then_some(topic),
             material_excerpt: excerpt.as_deref(),
             question_count: 4,

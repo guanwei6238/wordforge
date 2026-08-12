@@ -48,7 +48,7 @@ const CLI_SPECS: Record<
     model: "gpt-5.6-luna",
     // codex 沒有獨立的 effort 旗標
     effortStyle: { kind: "config", value: { flag: "-c", key: "model_reasoning_effort" } },
-    effort: "high",
+    effort: "medium",
   },
 };
 

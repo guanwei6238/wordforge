@@ -51,8 +51,14 @@ pub struct ReadingSpec<'a> {
     pub cefr: Option<&'a str>,
     /// 已知詞抽樣，讓模型感受實際用字範圍
     pub known_sample: &'a [String],
-    /// 這篇文章要教的新詞（白名單，除此之外不應出現生詞）
+    /// 這篇文章要教的新詞（白名單，除此之外不應出現生詞）。
+    ///
+    /// 這些必須是學習者**還不會**的字，否則整篇沒有東西可學：
+    /// 實測拿「今天到期的複習字」來填，產出的文章覆蓋率 99%，
+    /// 遠高於目標的 96%——90% 法則的重點正是那不足 10%。
     pub target_words: &'a [String],
+    /// 順便複習到的字。這些他已經會，不佔生詞預算。
+    pub review_words: &'a [String],
     pub topic: Option<&'a str>,
     /// 自訂教材摘錄。有值時模型只能用這份材料的內容與用字。
     pub material_excerpt: Option<&'a str>,
@@ -61,7 +67,7 @@ pub struct ReadingSpec<'a> {
 
 impl<'a> ReadingSpec<'a> {
     /// 每個新詞應該在文章中出現幾次，才有足夠上下文可以推敲。
-    const REPEATS_PER_NEW_WORD: usize = 2;
+    pub const REPEATS_PER_NEW_WORD: usize = 2;
 
     /// 依覆蓋率換算允許的生詞詞元數。
     pub fn unknown_budget(&self) -> usize {
@@ -100,6 +106,7 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
          2. 學習者不認識的詞元不可超過 {budget} 個，也就是已知詞覆蓋率至少 {cov:.0}%。\n\
          3. 唯一允許出現的新詞是下列白名單：{targets}\n\
             每個新詞請自然地出現 {repeats} 次以上，並讓上下文足以推敲其意思。\n\
+            **白名單裡的字全部都要用到**——少用一個，這篇就少教一個字。\n\
          4. 白名單以外，不要使用專有名詞、縮寫、俚語或罕見字。\n\
          5. 文章要有完整的起承轉合，不要像單字例句的拼貼。\n\n",
         words = spec.word_count,
@@ -112,6 +119,15 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
         },
         repeats = ReadingSpec::REPEATS_PER_NEW_WORD,
     ));
+
+    if !spec.review_words.is_empty() {
+        prompt.push_str(&format!(
+            "# 順便複習\n\
+             這些字他已經學過、今天剛好該複習。能自然帶進去就帶，\n\
+             但不要為了硬塞而讓句子變得奇怪，也不要因此擠掉上面的新詞：\n{words}\n\n",
+            words = spec.review_words.join("、"),
+        ));
+    }
 
     if let Some(topic) = spec.topic {
         prompt.push_str(&format!("# 主題\n{topic}\n\n"));
@@ -494,6 +510,7 @@ mod tests {
             cefr: Some("A2"),
             known_sample,
             target_words,
+            review_words: &[],
             topic: Some("學校生活"),
             material_excerpt: excerpt,
             question_count: 4,
@@ -516,6 +533,34 @@ mod tests {
         assert!(text.contains("96%"));
         assert!(text.contains("學校生活"));
         assert!(req.json_only);
+    }
+
+    /// 新詞與複習字是兩件事：新詞佔生詞預算、必須全部用到；
+    /// 複習字他已經會，能帶就帶。混在一起講的話模型會分不清楚。
+    #[test]
+    fn review_words_are_asked_for_separately_from_new_words() {
+        let to_vec = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        let targets = to_vec(&["hierarchy", "offend"]);
+        let sample = to_vec(&["the", "cat"]);
+        let review = to_vec(&["apple", "run"]);
+
+        let mut s = spec(&targets, &sample, None);
+        s.review_words = &review;
+        let text = reading_comprehension(&s).messages[0].content.clone();
+
+        assert!(text.contains("hierarchy"));
+        assert!(text.contains("apple"));
+        assert!(text.contains("順便複習"), "{text}");
+        assert!(
+            text.contains("全部都要用到"),
+            "新詞要講明必須全用，不然模型會挑著用：{text}"
+        );
+
+        // 沒有複習字時整段不該出現
+        let plain = reading_comprehension(&spec(&targets, &sample, None)).messages[0]
+            .content
+            .clone();
+        assert!(!plain.contains("順便複習"));
     }
 
     #[test]

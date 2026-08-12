@@ -49,10 +49,10 @@ async fn time_a_reading_exercise() {
     println!("\n=== 整題總耗時: {:?} ===", total.elapsed());
 
     match result {
-        Ok(ex) => println!(
-            "成功：coverage={:?} 目標字={:?}",
-            ex.coverage, ex.target_words
-        ),
+        Ok(ex) => {
+            println!("成功：coverage={:?}", ex.coverage);
+            println!("這篇要教的新詞：{:?}", ex.target_words);
+        }
         Err(e) => println!("失敗：{e}"),
     }
 }

@@ -139,7 +139,7 @@ impl CliConfig {
                 flag: "-c".into(),
                 key: "model_reasoning_effort".into(),
             },
-            effort: "high".into(),
+            effort: "medium".into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }

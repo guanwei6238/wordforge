@@ -164,6 +164,63 @@ pub fn pick_topic(recent: &[String], seed: u64) -> &'static str {
     available[(seed as usize) % available.len()]
 }
 
+/// 一個可以拿來當「這篇要教的新詞」的候選。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewWord {
+    pub lemma_id: i64,
+    pub text: String,
+    /// 這個字可以當哪些詞性。字典常給多個（`backward` 是 adj/adv/noun/verb）。
+    pub pos: Vec<String>,
+    pub freq_rank: i64,
+}
+
+/// 挑新詞時想要的詞性配比。
+///
+/// 不指定的話，照詞頻挑出來的清單會嚴重偏名詞——詞頻表前段的實詞
+/// 大多是名詞，而學習者需要的是能組成句子的各種詞類。動詞尤其重要，
+/// 一篇文章沒有新動詞就只是在換主題，句型不會有變化。
+///
+/// 順序就是優先順序：候選不足時，排在前面的先被滿足。
+pub const DESIRED_POS: &[&str] = &["verb", "noun", "adj", "verb", "noun", "adv"];
+
+/// 從候選裡挑出詞性分散的新詞。
+///
+/// 一個字可以有多個詞性，所以這是個指派問題。用貪婪法：依 `desired`
+/// 的順序，每一格挑「還沒被選、且具備這個詞性、詞頻最前面」的字。
+/// 填不滿的格子最後用剩下的候選補，寧可詞性偏一點也不要少給新詞——
+/// 生詞太少的話文章會太簡單，那是目前實測到的問題。
+pub fn balance_by_pos(candidates: &[NewWord], desired: &[&str], budget: usize) -> Vec<NewWord> {
+    let mut picked: Vec<NewWord> = Vec::new();
+    let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    for want in desired.iter().take(budget) {
+        let found = candidates
+            .iter()
+            .filter(|c| !used.contains(&c.lemma_id))
+            .filter(|c| c.pos.iter().any(|p| p == want))
+            .min_by_key(|c| c.freq_rank);
+
+        if let Some(c) = found {
+            used.insert(c.lemma_id);
+            picked.push(c.clone());
+        }
+    }
+
+    // 詞性湊不齊時用剩下的補滿，常用的優先
+    if picked.len() < budget {
+        let mut rest: Vec<&NewWord> = candidates
+            .iter()
+            .filter(|c| !used.contains(&c.lemma_id))
+            .collect();
+        rest.sort_by_key(|c| c.freq_rank);
+        for c in rest.into_iter().take(budget - picked.len()) {
+            picked.push(c.clone());
+        }
+    }
+
+    picked
+}
+
 /// 一次翻譯練習出幾題。
 pub fn translation_count(vocabulary: i64) -> usize {
     if vocabulary < 500 { 3 } else { 5 }
@@ -291,6 +348,82 @@ mod tests {
         let all: Vec<String> = TOPICS.iter().map(|t| t.to_string()).collect();
         let picked = pick_topic(&all, 5);
         assert!(TOPICS.contains(&picked));
+    }
+
+    fn word(id: i64, text: &str, pos: &[&str], rank: i64) -> NewWord {
+        NewWord {
+            lemma_id: id,
+            text: text.into(),
+            pos: pos.iter().map(|p| p.to_string()).collect(),
+            freq_rank: rank,
+        }
+    }
+
+    /// 照詞頻挑會挑出一整排名詞，那樣的文章句型不會有變化。
+    #[test]
+    fn new_words_span_several_parts_of_speech() {
+        let candidates = vec![
+            word(1, "hierarchy", &["noun"], 5206),
+            word(2, "appetite", &["noun"], 5205),
+            word(3, "offend", &["verb"], 5207),
+            word(4, "sympathetic", &["adj"], 5209),
+            word(5, "hostility", &["noun"], 5211),
+            word(6, "infect", &["verb"], 5200),
+        ];
+
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 4);
+        let kinds: std::collections::HashSet<&str> = picked
+            .iter()
+            .flat_map(|w| w.pos.iter().map(|p| p.as_str()))
+            .collect();
+
+        assert_eq!(picked.len(), 4);
+        assert!(kinds.contains("verb"), "沒有動詞：{picked:?}");
+        assert!(kinds.contains("noun"));
+        assert!(kinds.contains("adj"));
+    }
+
+    /// 同一個字不能被選兩次，即使它符合多個詞性格子。
+    #[test]
+    fn a_word_is_never_picked_twice() {
+        let candidates = vec![
+            word(1, "backward", &["adj", "adv", "noun", "verb"], 100),
+            word(2, "offend", &["verb"], 200),
+            word(3, "appetite", &["noun"], 300),
+        ];
+
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 3);
+        let ids: std::collections::HashSet<i64> = picked.iter().map(|w| w.lemma_id).collect();
+        assert_eq!(ids.len(), 3, "重複選了同一個字：{picked:?}");
+    }
+
+    /// 詞性湊不齊時要補滿——生詞太少會讓文章太簡單，那才是真正的問題。
+    #[test]
+    fn a_short_on_variety_pool_still_fills_the_budget() {
+        let candidates = vec![
+            word(1, "hierarchy", &["noun"], 10),
+            word(2, "appetite", &["noun"], 20),
+            word(3, "hostility", &["noun"], 30),
+        ];
+
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 3);
+        assert_eq!(picked.len(), 3, "寧可全是名詞也不要少給");
+    }
+
+    #[test]
+    fn an_empty_pool_yields_nothing() {
+        assert!(balance_by_pos(&[], DESIRED_POS, 5).is_empty());
+    }
+
+    /// 常用的字優先——學習者比較可能再遇到。
+    #[test]
+    fn the_more_common_word_wins_within_a_part_of_speech() {
+        let candidates = vec![
+            word(1, "rare_verb", &["verb"], 9000),
+            word(2, "common_verb", &["verb"], 5200),
+        ];
+        let picked = balance_by_pos(&candidates, &["verb"], 1);
+        assert_eq!(picked[0].text, "common_verb");
     }
 
     #[test]

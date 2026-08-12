@@ -394,6 +394,87 @@ pub mod lemmas {
         Ok(id.map(LemmaId))
     }
 
+    /// 挑「剛好在他程度上緣」的生詞，給閱讀理解當新詞白名單。
+    ///
+    /// ## 為什麼需要這個
+    ///
+    /// 原本文章的新詞是拿「今天到期的複習字」去填。那些字他已經在學了，
+    /// 覆蓋率算起來都算會——實測產出的文章覆蓋率 99%，遠高於目標的 96%，
+    /// 也就是**整篇沒有任何新東西可學**。90% 法則的重點是那不足 10%，
+    /// 沒有生詞的話這條規則就只是個好看的數字。
+    ///
+    /// ## 挑哪些
+    ///
+    /// 詞頻落在「估計詞彙量」到「估計詞彙量 × `reach`」之間：比他會的
+    /// 再難一點，但還在會再遇到的常用範圍內。挑太罕見的字沒有學習價值。
+    ///
+    /// 排掉的：
+    ///
+    /// - 已經在牌組裡的（不管什麼狀態）——正在學的不算「新」
+    /// - 專有名詞（`name`）——`Romania`、`CH` 學了沒用
+    /// - 虛詞——那些該從閱讀中自然吸收，不該當生詞教
+    /// - 有空格的多詞條目——白名單要的是單字
+    ///
+    /// 詞性從**同名的其他詞條**取：ECDICT 的 `pos` 是空的，詞性資訊
+    /// 在 Wiktionary 那批。實測這個區間 99% 的字對得起來。
+    pub async fn new_word_candidates(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+        vocabulary: i64,
+        reach: f64,
+        limit: i64,
+    ) -> Result<Vec<wordforge_core::practice::NewWord>> {
+        let upper = ((vocabulary as f64) * reach.max(1.0)) as i64;
+
+        let rows: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT l.id, l.text, l.freq_rank,
+                    (SELECT GROUP_CONCAT(DISTINCT p.pos) FROM lemma p
+                      WHERE p.lang = l.lang AND p.normalized = l.normalized AND p.pos <> '')
+             FROM lemma l
+             WHERE l.lang = ?1
+               AND l.freq_rank > ?2 AND l.freq_rank <= ?3
+               AND l.text = lower(l.text)
+               AND length(l.text) >= 3
+               AND l.text NOT LIKE '% %'
+               AND NOT EXISTS (
+                   SELECT 1 FROM card c
+                   WHERE c.profile_id = ?4 AND c.lemma_id = l.id
+               )
+             ORDER BY l.freq_rank
+             LIMIT ?5",
+        )
+        .bind(lang)
+        .bind(vocabulary.max(0))
+        .bind(upper)
+        .bind(profile_id.0)
+        .bind(limit)
+        .fetch_all(db.pool())
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter(|(_, text, _, _)| !wordforge_core::wordlist::is_function_word(lang, text))
+            .map(|(id, text, freq_rank, pos)| {
+                let pos: Vec<String> = pos
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string())
+                    .collect();
+                wordforge_core::practice::NewWord {
+                    lemma_id: id,
+                    text,
+                    pos,
+                    freq_rank,
+                }
+            })
+            // 專有名詞學了沒用，但只有 name 這一個詞性的才排除——
+            // `march`（三月／行進）不該因為也能當專有名詞就被丟掉
+            .filter(|w| !(w.pos.len() == 1 && w.pos[0] == "name"))
+            .collect())
+    }
+
     pub async fn find_by_form(db: &Db, lang: &str, form: &str) -> Result<Option<LemmaId>> {
         let normalized = wordforge_core::text::normalize(form);
         let id: Option<i64> = sqlx::query_scalar(
