@@ -770,6 +770,14 @@ export interface TranslationItem {
 export interface ChoiceItem {
   question: string;
   options: string[];
+  /**
+   * 每個選項一句說明，與 options 平行。
+   *
+   * 這是「針對你的作答說明」的來源：選擇題在本地判分，模型沒看過你
+   * 選了什麼，所以解說在出題時就每個選項各備一句，判分時挑你按的
+   * 那一句。舊的練習紀錄沒有這個欄位，所以可能是空陣列。
+   */
+  option_notes: string[];
   answer_index: number;
   explanation: string | null;
   grammar_point: string | null;

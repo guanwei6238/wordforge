@@ -27,6 +27,15 @@ pub struct ChoiceItem {
     #[serde(alias = "prompt", default)]
     pub question: String,
     pub options: Vec<String>,
+    /// 每個選項一句話：對的那個為什麼對、錯的那些錯在哪。
+    /// 與 `options` 平行，洗牌時必須一起搬。
+    ///
+    /// 這是「針對你的作答說明」的來源。選擇題在本地判分，模型從頭到尾
+    /// 沒看過你選了什麼，所以答案感知的解說只能在**出題時**先備好——
+    /// 每個選項各寫一句，判分時挑你按的那一句出來。不必多打一次模型，
+    /// 而且重做同一份題目時解說還在。
+    #[serde(default)]
+    pub option_notes: Vec<String>,
     pub answer_index: usize,
     #[serde(default)]
     pub explanation: Option<String>,

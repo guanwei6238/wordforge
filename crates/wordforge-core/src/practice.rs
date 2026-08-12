@@ -353,31 +353,33 @@ fn shuffle_in_place<T>(items: &mut [T], state: &mut u64) {
     }
 }
 
-/// 洗一題的選項，回傳 `(新的選項順序, 新的正確答案索引)`。
+/// 洗牌後的順序：`order[k]` 是新的第 k 個位置原本放的是第幾個。
 ///
-/// 就是把整組選項洗過，答案落在哪裡就是哪裡——每題各自獨立、
-/// 位置均勻隨機。不去安排「這份四題要剛好用掉四個位置」：
-/// 那種安排本身就是一種規律，而且會讓前面幾題的答案位置洩漏後面的。
+/// 回傳**排列**而不是洗好的陣列，因為一個選項身上不只掛著文字——
+/// 還有「這個選項為什麼不對」的解說。兩個平行陣列必須用同一個排列
+/// 搬動，只搬其中一個的話每個選項會配到別人的解說，
+/// 而那個畫面看起來完全合理，不會有人發現。
 ///
-/// `answer_index` 超出範圍時原樣回傳——那是模型給了壞資料，
-/// 洗牌只會讓錯誤更難查。
-pub fn shuffle_options(options: &[String], answer_index: usize, seed: u64) -> (Vec<String>, usize) {
-    if options.len() < 2 || answer_index >= options.len() {
-        return (options.to_vec(), answer_index);
+/// 每題各自獨立、位置均勻隨機。不去安排「這份四題要剛好用掉四個
+/// 位置」：那種安排本身就是一種規律，而且會讓前面幾題的答案位置
+/// 洩漏後面的。
+pub fn shuffle_order(len: usize, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..len).collect();
+    if len < 2 {
+        return order;
     }
-
     let mut state = seed | 1;
-    let mut shuffled = options.to_vec();
-    let answer = options[answer_index].clone();
-    shuffle_in_place(&mut shuffled, &mut state);
+    shuffle_in_place(&mut order, &mut state);
+    order
+}
 
-    // 用值去找答案的新位置，不追蹤索引：選項字串在同一題裡不會重複，
-    // 而追蹤索引要在 Fisher-Yates 的每一步跟著換，很容易寫錯。
-    let at = shuffled
-        .iter()
-        .position(|o| *o == answer)
-        .unwrap_or(answer_index);
-    (shuffled, at)
+/// 依 `order` 重排一個陣列。長度對不上時原樣回傳——
+/// 那代表資料已經壞了，硬搬只會把錯誤藏得更深。
+pub fn reorder<T: Clone>(items: &[T], order: &[usize]) -> Vec<T> {
+    if order.len() != items.len() || order.iter().any(|&i| i >= items.len()) {
+        return items.to_vec();
+    }
+    order.iter().map(|&i| items[i].clone()).collect()
 }
 
 #[cfg(test)]
@@ -701,25 +703,39 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
-    /// 洗牌不能弄丟或弄壞答案：新的索引一定指向原本那個正確選項，
-    /// 而且整組選項要一個不多一個不少。
+    /// 洗牌不能弄丟或弄壞答案，也不能把平行陣列拆散。
+    ///
+    /// 選項身上不只掛著文字，還有「這個選項為什麼不對」的解說。
+    /// 兩者用同一個排列搬動，配錯的話畫面看起來完全合理，沒有人會發現。
     #[test]
-    fn shuffling_keeps_pointing_at_the_same_correct_option() {
+    fn one_order_moves_the_options_and_their_notes_together() {
         let opts = options(&["went", "go", "gone", "going"]);
-        let mut original = opts.clone();
-        original.sort();
+        let notes = options(&["對", "現在式", "過去分詞", "進行式"]);
 
         for seed in 0..200u64 {
-            for answer in 0..opts.len() {
-                let want = &opts[answer];
-                let (shuffled, index) = shuffle_options(&opts, answer, seed);
-                assert_eq!(&shuffled[index], want, "seed {seed} 指到了別的選項");
+            let order = shuffle_order(opts.len(), seed);
+            let moved = reorder(&opts, &order);
+            let moved_notes = reorder(&notes, &order);
 
-                let mut sorted = shuffled.clone();
-                sorted.sort();
-                assert_eq!(sorted, original, "選項被弄丟或重複了");
+            for (option, note) in moved.iter().zip(&moved_notes) {
+                let original = opts.iter().position(|o| o == option).unwrap();
+                assert_eq!(note, &notes[original], "seed {seed}：解說配到別的選項了");
             }
+
+            let mut sorted = moved.clone();
+            sorted.sort();
+            let mut original = opts.clone();
+            original.sort();
+            assert_eq!(sorted, original, "選項被弄丟或重複了");
         }
+    }
+
+    /// 長度對不上時原樣回傳。硬搬只會把壞掉的資料藏得更深。
+    #[test]
+    fn a_mismatched_order_leaves_the_array_alone() {
+        let opts = options(&["a", "b", "c"]);
+        assert_eq!(reorder(&opts, &[0, 1]), opts);
+        assert_eq!(reorder(&opts, &[0, 1, 9]), opts);
     }
 
     /// 這條測試存在的理由：模型出的選擇題答案會集中在某一個位置
@@ -729,11 +745,11 @@ mod tests {
     /// 本身也是一種規律，而且會讓前面幾題的答案洩漏後面的。
     #[test]
     fn the_answer_position_is_uniformly_random() {
-        let opts = options(&["went", "go", "gone", "going"]);
         let mut counts = [0usize; 4];
         for seed in 0..4_000u64 {
-            let (_, index) = shuffle_options(&opts, 0, seed);
-            counts[index] += 1;
+            // 正確答案原本在第 0 個，看它被搬到哪裡
+            let order = shuffle_order(4, seed);
+            counts[order.iter().position(|&i| i == 0).unwrap()] += 1;
         }
 
         // 期望值 1000，標準差約 27。±30% 的寬容遠大於正常波動，
@@ -746,12 +762,10 @@ mod tests {
         }
     }
 
-    /// 模型給了壞的 answer_index 時，洗牌會讓錯誤更難查——原樣放過。
+    /// 只有一個選項的話沒得洗，但也不能 panic。
     #[test]
-    fn a_broken_answer_index_is_left_alone() {
-        let opts = options(&["a", "b"]);
-        let (shuffled, index) = shuffle_options(&opts, 9, 3);
-        assert_eq!(shuffled, opts);
-        assert_eq!(index, 9);
+    fn a_degenerate_option_list_is_left_alone() {
+        assert_eq!(shuffle_order(0, 3), Vec::<usize>::new());
+        assert_eq!(shuffle_order(1, 3), vec![0]);
     }
 }

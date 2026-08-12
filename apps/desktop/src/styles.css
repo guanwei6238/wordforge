@@ -945,6 +945,27 @@ button.link {
   font-weight: 500;
 }
 
+/* 你選錯的那個要標出來。只標正確答案的話，答完一份題目回頭看，
+   已經想不起來自己當初按了哪一個。 */
+.option.picked-wrong {
+  color: var(--error);
+  text-decoration: line-through;
+}
+
+/* 講評由具體到一般：先講你選的那個，再講正解，最後才是整題在考什麼 */
+.verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-top: 0.4rem;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--border);
+}
+
+.verdict p {
+  margin: 0;
+}
+
 .corrections {
   list-style: none;
   margin: 0;

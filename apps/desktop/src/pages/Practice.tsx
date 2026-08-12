@@ -1031,6 +1031,7 @@ function Choices({
   items: {
     question: string;
     options: string[];
+    option_notes: string[];
     answer_index: number;
     explanation: string | null;
     difficulty: string | null;
@@ -1066,9 +1067,13 @@ function Choices({
             {q.options.map((option, j) => (
               <label
                 key={j}
-                className={
-                  feedback ? (j === q.answer_index ? "option right" : "option") : "option"
-                }
+                className={[
+                  "option",
+                  feedback && j === q.answer_index ? "right" : "",
+                  feedback && choices[i] === j && j !== q.answer_index ? "picked-wrong" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
               >
                 <input
                   type="radio"
@@ -1081,9 +1086,78 @@ function Choices({
               </label>
             ))}
           </div>
-          {feedback && q.explanation && <p className="muted">{q.explanation}</p>}
+          {feedback && (
+            <Verdict
+              item={q}
+              picked={choices[i] ?? null}
+              comment={feedback.items[i]?.comment ?? null}
+            />
+          )}
         </li>
       ))}
     </ol>
+  );
+}
+
+/**
+ * 一題的講評。
+ *
+ * 重點是**先講你選的那一個**。只講「正確答案為什麼對」對答錯的人沒有
+ * 用——他要知道的是自己那條路錯在哪，不然下次還是會被同一個選項騙到。
+ *
+ * 三個來源，由具體到一般：
+ *
+ * 1. `option_notes[你選的]`——出題時就替每個選項各備一句。選擇題在
+ *    本地判分，模型沒看過你的作答，所以這是唯一「認得出你選了什麼」
+ *    而且不必多打一次模型的來源。
+ * 2. `comment`——批改時模型寫的。只有閱讀與翻譯有（那兩種會真的送去
+ *    批改），而且它看得到你的作答。
+ * 3. `explanation`——整題在考什麼，跟你選什麼無關。
+ */
+function Verdict({
+  item,
+  picked,
+  comment,
+}: {
+  item: { options: string[]; option_notes: string[]; answer_index: number; explanation: string | null };
+  picked: number | null;
+  comment: string | null;
+}) {
+  const note = (index: number | null) =>
+    index == null ? null : (item.option_notes[index]?.trim() || null);
+
+  const correct = picked === item.answer_index;
+  const pickedNote = correct ? null : note(picked);
+  const answerNote = note(item.answer_index);
+
+  // 模型的講評跟出題時的說明有時會撞在一起，一模一樣就只留一份
+  const extra =
+    comment && comment.trim() && comment.trim() !== item.explanation?.trim()
+      ? comment.trim()
+      : null;
+
+  return (
+    <div className="verdict">
+      {!correct && (
+        <p className="error">
+          {picked == null ? (
+            <>沒有作答</>
+          ) : (
+            <>
+              你選了「{item.options[picked]}」
+              {pickedNote && <span className="muted">：{pickedNote}</span>}
+            </>
+          )}
+        </p>
+      )}
+      {answerNote && (
+        <p className={correct ? "ok" : "muted"}>
+          {correct ? "✓ " : ""}
+          正解「{item.options[item.answer_index]}」：{answerNote}
+        </p>
+      )}
+      {extra && <p className="muted">{extra}</p>}
+      {item.explanation && <p className="muted">{item.explanation}</p>}
+    </div>
   );
 }

@@ -75,6 +75,29 @@ impl<'a> ReadingSpec<'a> {
     }
 }
 
+/// `option_notes` 的規則，三種選擇題共用。
+///
+/// ## 為什麼要逐個選項寫
+///
+/// 選擇題在本地判分，模型從頭到尾沒看過學習者選了什麼，所以
+/// 「你選的那個為什麼不行」這件事**只能在出題時先備好**——
+/// 每個選項各寫一句，判分時挑他按的那一句出來。
+///
+/// 這比批改時再打一次模型好：不多花一次呼叫、不用等 CLI 冷啟動，
+/// 而且重做同一份題目時解說還在。
+fn option_notes_rule(native_lang: &str) -> String {
+    format!(
+        "option_notes 要跟 options **一樣長、一樣順序**，一個選項一句話：\n\
+         - 正確的那個：為什麼它成立（依據文章哪裡、哪個文法規則）。\n\
+         - 錯的那些：**針對這個選項本身**講它錯在哪。「因為正確答案是 X」\n\
+           不算——那沒有解釋他為什麼會被這個選項騙到。要講的是這個選項\n\
+           哪裡不成立：意思不對？時態不對？文章沒這樣說？搭配詞不能這樣用？\n\
+         每句話用{native_lang}，控制在一兩句，不要重複整題的 explanation。\n\
+         提到別的選項時要引用它的內容，不要寫「選項 B」或「第二個」——\n\
+         選項的順序會被系統重新排過，那樣寫出來會對不上。"
+    )
+}
+
 /// 一份閱讀測驗裡各題的難度。
 ///
 /// 不指定的話模型會出一整份同一個難度的題目——通常全是「在第幾段找得到」
@@ -196,15 +219,16 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
          \x20 \"new_words\": [{{\"word\": \"新詞\", \"gloss\": \"{native}解釋\", \"line_hint\": \"可推敲出意思的那句話\"}}],\n\
          \x20 \"questions\": [{{\"question\": \"問題（用{target}）\", \
          \"options\": [\"用{target}寫的四個選項\"], \"answer_index\": 0, \
+         \"option_notes\": [\"每個選項各一句{native}說明\"], \
          \"difficulty\": \"easy｜medium｜hard\", \
-         \"explanation\": \"以{native}說明為何是這個答案，以及其他選項錯在哪\"}}]\n\
+         \"explanation\": \"以{native}整體說明這一題在考什麼\"}}]\n\
          }}\n\
-         explanation 提到別的選項時要引用它的內容，不要寫「選項 B」或「第二個」——\n\
-         選項的順序會被系統重新排過，那樣寫出來會對不上。",
+         {notes}",
         native = spec.native_lang,
         target = spec.target_lang,
         n = spec.question_count,
         plan = difficulty_plan(spec.question_count),
+        notes = option_notes_rule(spec.native_lang),
     ));
 
     ChatRequest {
@@ -310,14 +334,15 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
          \x20 \"passage\": \"挖好空格的短文\",\n\
          \x20 \"translation\": \"整篇的{native}翻譯，空格處填上正確答案再翻\",\n\
          \x20 \"items\": [{{\"options\": [\"四個{target}選項\"], \"answer_index\": 0, \
-         \"explanation\": \"用{native}說明為什麼是這個字，以及其他選項為什麼放不進去\"}}]\n\
+         \"option_notes\": [\"每個選項各一句{native}說明\"], \
+         \"explanation\": \"用{native}說明這一格在考什麼\"}}]\n\
          }}\n\
          items 要剛好 {n} 題，第 k 題對應 {{{{k}}}} 那一格。\n\
-         explanation 提到別的選項時要引用它的內容，不要寫「選項 B」或「第二個」——\n\
-         選項的順序會被系統重新排過，那樣寫出來會對不上。",
+         {notes}",
         target = target_lang,
         native = native_lang,
         n = n,
+        notes = option_notes_rule(native_lang),
     ));
 
     ChatRequest {
@@ -438,14 +463,15 @@ pub fn grammar_drill(
          出 {n} 題，每題聚焦一個文法點。{points}\n\
          {{\n\
          \x20 \"items\": [{{\"prompt\": \"題目（含填空）\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \
-         \"answer_index\": 0, \"grammar_point\": \"tense\", \"explanation\": \"{native}說明，\
-         並解釋為什麼其他選項不對\"}}]\n\
+         \"option_notes\": [\"每個選項各一句{native}說明\"], \
+         \"answer_index\": 0, \"grammar_point\": \"tense\", \
+         \"explanation\": \"用{native}說明這一題在考什麼文法\"}}]\n\
          }}\n\
-         explanation 提到別的選項時要引用它的內容，不要寫「選項 B」或「第二個」——\n\
-         選項的順序會被系統重新排過，那樣寫出來會對不上。",
+         {notes}",
         n = question_count,
         native = native_lang,
         points = grammar_point_rule(target_lang),
+        notes = option_notes_rule(native_lang),
     ));
 
     ChatRequest {
@@ -559,7 +585,11 @@ pub fn reading_feedback(
     let prompt = format!(
         "# 文章\n{passage}\n\n# 作答\n{body}\n\
          # 批改要求\n\
-         - 用{native_lang}解釋每一題為什麼是那個答案；答錯的要指出他可能誤解了哪裡。\n\
+         - **針對他選的那個選項講**，不是只講正確答案為什麼對。\n\
+           答錯時要說出他挑的那一個哪裡不成立、文章的哪一句讓他誤會了；\n\
+           「正確答案是 C 因為…」對他沒有用，他要知道的是自己那條路錯在哪。\n\
+           答對的就寫得簡短，一句話確認他抓到重點就好。\n\
+         - 用{native_lang}寫。\n\
          - **判斷他不懂哪些字**：從答錯的題目往回看，那一段裡有哪些字\n\
            是他看不懂才會選錯的？列在 unknown_words，系統會排進複習。\n\
          - 只放文章裡真的出現過的單字原形。\n\n\
@@ -880,6 +910,61 @@ mod tests {
         // 沒指定教材時整段不該出現，否則模型會看到一個空的「指定教材」
         let free = translation_task("English", "繁體中文", true, None, &due, 3);
         assert!(!free.messages[0].content.contains("指定教材"));
+    }
+
+    /// 選擇題在本地判分，模型從頭到尾沒看過學習者選了什麼。
+    /// 「你選的那個為什麼不行」只能在出題時先備好——每個選項各一句，
+    /// 判分時挑他按的那一句出來。三種選擇題都要有。
+    #[test]
+    fn every_option_carries_its_own_note() {
+        let targets = sample_words();
+        let known = sample_words();
+        let due = vec!["borrow".to_string()];
+        let weak = vec!["tense".to_string()];
+
+        let prompts = [
+            reading_comprehension(&spec(&targets, &known, None)).messages[0]
+                .content
+                .clone(),
+            grammar_drill("English", "繁體中文", &weak, &known, 5, None).messages[0]
+                .content
+                .clone(),
+            cloze_passage(&cloze_spec(&due, &known, None, None)).messages[0]
+                .content
+                .clone(),
+        ];
+
+        for text in prompts {
+            assert!(text.contains("option_notes"), "沒有要求逐選項說明：{text}");
+            assert!(
+                text.contains("一樣長、一樣順序"),
+                "沒說要跟 options 對齊，配錯了畫面還是看起來合理：{text}"
+            );
+            assert!(
+                text.contains("「因為正確答案是 X」"),
+                "沒擋掉「因為正確答案是 X」那種等於沒解釋的寫法：{text}"
+            );
+        }
+    }
+
+    /// 批改閱讀時模型看得到他選了什麼，那就該針對那個選項講。
+    #[test]
+    fn reading_feedback_addresses_the_option_the_learner_picked() {
+        let questions = vec![(
+            "Why did she leave?".to_string(),
+            "A".to_string(),
+            "C".to_string(),
+        )];
+        let text = reading_feedback("English", "繁體中文", "She left because...", &questions)
+            .messages[0]
+            .content
+            .clone();
+
+        assert!(text.contains("學習者選了：A"), "要帶上他實際選的：{text}");
+        assert!(
+            text.contains("針對他選的那個選項講"),
+            "沒有要求針對作答說明：{text}"
+        );
     }
 
     /// 這條測試存在的理由是它曾經是錯的：不管哪個方向，出題 prompt 都說

@@ -911,8 +911,12 @@ impl<'a> PracticeEngine<'a> {
         let mut feedback: Feedback =
             serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))?;
 
-        // 分數可以在本地算，不必相信模型的算術
+        // 分數與對錯都在本地算，不必相信模型的算術。
+        // 講評則要照它自己給的 index 對回題號——照陣列位置貼的話，
+        // 模型少回一題或換個順序，第三題的講評就會出現在第二題底下，
+        // 而那個畫面看起來完全正常，沒有人會發現。
         let local = grade_choices(questions, input);
+        feedback.items = align_comments(&feedback.items, local.items);
         feedback.score = local.score;
 
         // 解析裡的生字與片語由本地字典查，不佔 token 也不用等模型
@@ -1417,14 +1421,55 @@ fn shuffle_seed(now: OffsetDateTime) -> u64 {
 /// 而重排選項是我們自己就做得到的事，做完還測得出來。
 fn shuffle_answers(items: &mut [ChoiceItem], seed: u64) {
     for (i, item) in items.iter_mut().enumerate() {
+        // 壞資料原樣放過：洗牌只會讓錯誤更難查
+        if item.options.len() < 2 || item.answer_index >= item.options.len() {
+            continue;
+        }
+
         // 每一題各自的亂源。同一份裡共用一個 seed 的話，
         // 每題的選項會被搬到一模一樣的位置。
         let per_item = seed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let (options, answer_index) =
-            practice::shuffle_options(&item.options, item.answer_index, per_item);
-        item.options = options;
-        item.answer_index = answer_index;
+        let order = practice::shuffle_order(item.options.len(), per_item);
+
+        item.options = practice::reorder(&item.options, &order);
+        // 每個選項的解說跟選項是平行陣列，**一定要用同一個排列一起搬**。
+        // 只搬其中一個的話每個選項會配到別人的解說，而那個畫面
+        // 看起來完全合理，不會有人發現。
+        if !item.option_notes.is_empty() {
+            item.option_notes = practice::reorder(&item.option_notes, &order);
+        }
+        item.answer_index = order
+            .iter()
+            .position(|&k| k == item.answer_index)
+            .unwrap_or(item.answer_index);
     }
+}
+
+/// 把模型寫的逐題講評掛回本地判分的結果上。
+///
+/// 對錯與參考答案一律用本地的（那是算出來的，不是猜的），
+/// 只有 `comment` 採用模型的。
+///
+/// 對應靠模型自己給的 `index`（1 起算），不是陣列位置：它很常少回
+/// 一題或換個順序，照位置貼的話第三題的講評會出現在第二題底下——
+/// 而那個畫面看起來完全正常。`index` 整份都缺（全是預設的 0）時
+/// 才退回照位置對，那是還有救的最後手段。
+fn align_comments(from_model: &[ItemResult], mut local: Vec<ItemResult>) -> Vec<ItemResult> {
+    let numbered = from_model.iter().any(|r| r.index > 0);
+
+    for (i, item) in local.iter_mut().enumerate() {
+        let matched = if numbered {
+            from_model.iter().find(|r| r.index == i + 1)
+        } else {
+            from_model.get(i)
+        };
+        if let Some(m) = matched
+            && m.comment.as_deref().is_some_and(|c| !c.trim().is_empty())
+        {
+            item.comment = m.comment.clone();
+        }
+    }
+    local
 }
 
 /// 選擇題可以在本地判分，不必浪費一次 LLM 呼叫。

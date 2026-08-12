@@ -1923,3 +1923,119 @@ async fn blanks_written_out_of_order_are_renumbered_not_rejected() {
         "題目沒有跟著空格的順序重排"
     );
 }
+
+/// 每個選項各自的解說必須跟著它的選項一起被搬動。
+///
+/// 這條測試存在的理由是它壞掉的樣子看起來完全正常：洗牌只搬 options
+/// 不搬 option_notes 的話，每個選項會配到別人的解說——畫面上依然是
+/// 「你選了 X：某段說明」，只是那段說明講的是另一個選項。
+#[tokio::test]
+async fn each_option_keeps_its_own_note_through_the_shuffle() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[
+             {"prompt":"I ___ yesterday",
+              "options":["went","go","gone","going"],
+              "option_notes":["note-went","note-go","note-gone","note-going"],
+              "answer_index":0,"grammar_point":"tense"}
+           ]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+        panic!("該是選擇題");
+    };
+    let item = &items[0];
+
+    assert_eq!(item.option_notes.len(), item.options.len());
+    for (option, note) in item.options.iter().zip(&item.option_notes) {
+        assert_eq!(
+            note,
+            &format!("note-{option}"),
+            "「{option}」配到了別的選項的解說：{:?} / {:?}",
+            item.options,
+            item.option_notes
+        );
+    }
+
+    // 洗過之後正確答案仍該指向 went
+    assert_eq!(item.options[item.answer_index], "went");
+}
+
+/// 模型沒給 option_notes 時不能壞掉——舊的練習紀錄裡也沒有這個欄位。
+#[tokio::test]
+async fn missing_option_notes_are_tolerated() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm =
+        FakeLlm::new(&[r#"{"items":[{"prompt":"a","options":["x","y","z"],"answer_index":0}]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+        panic!("該是選擇題");
+    };
+    assert!(items[0].option_notes.is_empty());
+    assert_eq!(items[0].options.len(), 3, "沒有 notes 也要照常洗牌");
+}
+
+/// 模型寫的逐題講評要照它自己給的 index 對回題號。
+///
+/// 這條測試存在的理由是它壞掉的樣子看起來完全正常：照陣列位置貼的話，
+/// 模型少回一題或換個順序，第三題的講評就會出現在第二題底下。
+#[tokio::test]
+async fn per_question_comments_follow_the_index_not_the_position() {
+    let (db, profile) = setup(&["the", "cat", "sat"]).await;
+    set_vocabulary(&db, profile, 2_000).await;
+
+    let passage = r#"{"title":"T","passage":"The cat sat.",
+        "questions":[
+          {"question":"Q1","options":["a","b"],"answer_index":0},
+          {"question":"Q2","options":["a","b"],"answer_index":0},
+          {"question":"Q3","options":["a","b"],"answer_index":0}
+        ]}"#;
+    // 模型回的順序是 3、1，而且漏了第 2 題
+    let graded = r#"{"score":0,"items":[
+          {"index":3,"correct":false,"comment":"第三題的講評"},
+          {"index":1,"correct":false,"comment":"第一題的講評"}
+        ],"unknown_words":[]}"#;
+
+    let llm = FakeLlm::new(&[passage, graded]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: answer(&exercise, &[Some(false); 3]),
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(feedback.items.len(), 3, "本地判分的三題都要在");
+    assert_eq!(feedback.items[0].comment.as_deref(), Some("第一題的講評"));
+    assert_eq!(
+        feedback.items[1].comment.as_deref(),
+        None,
+        "模型沒講第二題，就不該把別題的講評貼上來"
+    );
+    assert_eq!(feedback.items[2].comment.as_deref(), Some("第三題的講評"));
+}
