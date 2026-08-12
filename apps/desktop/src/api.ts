@@ -456,6 +456,8 @@ export interface StudySettings {
   max_reviews_per_day: number;
   /** FSRS 的目標記憶留存率 0.70~0.97 */
   desired_retention: number;
+  /** 閱讀文章要有多少比例是你看得懂的字 0.80~0.99 */
+  reading_coverage: number;
 }
 
 export function getStudySettings(profileId = DEFAULT_PROFILE_ID): Promise<StudySettings> {

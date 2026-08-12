@@ -106,7 +106,9 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
          2. 學習者不認識的詞元不可超過 {budget} 個，也就是已知詞覆蓋率至少 {cov:.0}%。\n\
          3. 唯一允許出現的新詞是下列白名單：{targets}\n\
             每個新詞請自然地出現 {repeats} 次以上，並讓上下文足以推敲其意思。\n\
-            **白名單裡的字全部都要用到**——少用一個，這篇就少教一個字。\n\
+            **白名單裡的字盡量全部用到**——少用一個，這篇就少教一個字。\n\
+            唯一的例外：某個字如果粗俗、冒犯，或明顯不適合出現在\n\
+            學習教材裡，就跳過它，不要為了湊數硬寫進去。\n\
          4. 白名單以外，不要使用專有名詞、縮寫、俚語或罕見字。\n\
          5. 文章要有完整的起承轉合，不要像單字例句的拼貼。\n\n",
         words = spec.word_count,
@@ -552,8 +554,13 @@ mod tests {
         assert!(text.contains("apple"));
         assert!(text.contains("順便複習"), "{text}");
         assert!(
-            text.contains("全部都要用到"),
+            text.contains("盡量全部用到"),
             "新詞要講明必須全用，不然模型會挑著用：{text}"
+        );
+        assert!(
+            text.contains("粗俗"),
+            "字典的 register 標不出粗話（實測 bitch 只標了 colloquial），\
+             所以只能請模型自己跳過：{text}"
         );
 
         // 沒有複習字時整段不該出現

@@ -180,42 +180,68 @@ pub struct NewWord {
 /// 大多是名詞，而學習者需要的是能組成句子的各種詞類。動詞尤其重要，
 /// 一篇文章沒有新動詞就只是在換主題，句型不會有變化。
 ///
-/// 順序就是優先順序：候選不足時，排在前面的先被滿足。
+/// 這個樣式會循環使用：要 14 個字的話就跑兩輪多。
 pub const DESIRED_POS: &[&str] = &["verb", "noun", "adj", "verb", "noun", "adv"];
 
-/// 從候選裡挑出詞性分散的新詞。
+/// 從候選裡挑出詞性分散、難度也分散的新詞。
 ///
-/// 一個字可以有多個詞性，所以這是個指派問題。用貪婪法：依 `desired`
-/// 的順序，每一格挑「還沒被選、且具備這個詞性、詞頻最前面」的字。
-/// 填不滿的格子最後用剩下的候選補，寧可詞性偏一點也不要少給新詞——
-/// 生詞太少的話文章會太簡單，那是目前實測到的問題。
+/// ## 兩個要顧的維度
+///
+/// **詞性**：一個字可以有多個詞性，所以這是個指派問題。依 `desired`
+/// 的順序（不夠長就循環），每一格挑一個具備該詞性的字。
+///
+/// **難度**：候選是照詞頻排序的，直接取前 N 個會全部擠在同一小段。
+/// 實測要 14 個字時挑出來的全落在 rank 5201～5217——讀起來像在背
+/// 同一頁單字表。所以把候選切成 `budget` 段，第 k 格優先從第 k 段挑，
+/// 找不到才放寬到整個池子。
+///
+/// 兩者都湊不齊時用剩下的補滿：生詞太少會讓文章太簡單，那才是
+/// 真正要避免的事。
 pub fn balance_by_pos(candidates: &[NewWord], desired: &[&str], budget: usize) -> Vec<NewWord> {
+    if budget == 0 || candidates.is_empty() || desired.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted: Vec<&NewWord> = candidates.iter().collect();
+    sorted.sort_by_key(|c| (c.freq_rank, c.lemma_id));
+
     let mut picked: Vec<NewWord> = Vec::new();
     let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    for want in desired.iter().take(budget) {
-        let found = candidates
-            .iter()
-            .filter(|c| !used.contains(&c.lemma_id))
-            .filter(|c| c.pos.iter().any(|p| p == want))
-            .min_by_key(|c| c.freq_rank);
+    // 每一格對應候選池的一段，讓選出來的字難度分散開
+    let slice = sorted.len().div_ceil(budget).max(1);
 
-        if let Some(c) = found {
+    for slot in 0..budget {
+        let want = desired[slot % desired.len()];
+        let from = slot * slice;
+
+        // 先在自己那一段裡找，找不到再放寬到整個池子
+        let in_slice = sorted
+            .iter()
+            .skip(from)
+            .take(slice)
+            .find(|c| !used.contains(&c.lemma_id) && c.pos.iter().any(|p| p == want));
+        let anywhere = || {
+            sorted
+                .iter()
+                .find(|c| !used.contains(&c.lemma_id) && c.pos.iter().any(|p| p == want))
+        };
+
+        if let Some(c) = in_slice.or_else(anywhere) {
             used.insert(c.lemma_id);
-            picked.push(c.clone());
+            picked.push((*c).clone());
         }
     }
 
     // 詞性湊不齊時用剩下的補滿，常用的優先
     if picked.len() < budget {
-        let mut rest: Vec<&NewWord> = candidates
+        let rest: Vec<&NewWord> = sorted
             .iter()
             .filter(|c| !used.contains(&c.lemma_id))
+            .take(budget - picked.len())
+            .copied()
             .collect();
-        rest.sort_by_key(|c| c.freq_rank);
-        for c in rest.into_iter().take(budget - picked.len()) {
-            picked.push(c.clone());
-        }
+        picked.extend(rest.into_iter().cloned());
     }
 
     picked
@@ -395,6 +421,50 @@ mod tests {
         let picked = balance_by_pos(&candidates, DESIRED_POS, 3);
         let ids: std::collections::HashSet<i64> = picked.iter().map(|w| w.lemma_id).collect();
         assert_eq!(ids.len(), 3, "重複選了同一個字：{picked:?}");
+    }
+
+    /// 要的字比詞性樣式長時，樣式要循環，不能後面全變成照詞頻挑。
+    #[test]
+    fn the_pos_pattern_repeats_for_larger_budgets() {
+        let mut candidates = Vec::new();
+        for i in 0..40i64 {
+            let pos = match i % 4 {
+                0 => "verb",
+                1 => "noun",
+                2 => "adj",
+                _ => "adv",
+            };
+            candidates.push(word(i + 1, &format!("w{i}"), &[pos], 5_000 + i));
+        }
+
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 12);
+        let verbs = picked.iter().filter(|w| w.pos[0] == "verb").count();
+        assert_eq!(picked.len(), 12);
+        assert!(verbs >= 3, "循環之後動詞還是要夠多：{picked:?}");
+    }
+
+    /// 全部擠在同一小段的話，讀起來像在背同一頁單字表。
+    #[test]
+    fn picks_spread_across_the_difficulty_range() {
+        let mut candidates = Vec::new();
+        for i in 0..100i64 {
+            candidates.push(word(
+                i + 1,
+                &format!("w{i}"),
+                &["noun", "verb"],
+                5_000 + i * 10,
+            ));
+        }
+
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 10);
+        let ranks: Vec<i64> = picked.iter().map(|w| w.freq_rank).collect();
+        let spread = ranks.iter().max().unwrap() - ranks.iter().min().unwrap();
+
+        assert_eq!(picked.len(), 10);
+        assert!(
+            spread > 500,
+            "難度沒有分散，全落在 {spread} 的範圍內：{ranks:?}"
+        );
     }
 
     /// 詞性湊不齊時要補滿——生詞太少會讓文章太簡單，那才是真正的問題。

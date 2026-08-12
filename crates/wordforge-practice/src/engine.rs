@@ -9,7 +9,7 @@ use wordforge_db::exercises::{self, ExerciseId, NewExercise};
 use wordforge_db::grammar;
 use wordforge_db::llm_usage;
 use wordforge_db::material::{self, MaterialId};
-use wordforge_db::repo::{cards, lemmas};
+use wordforge_db::repo::{cards, lemmas, profiles};
 use wordforge_llm::{LlmProvider, prompts};
 
 use crate::payload::*;
@@ -53,7 +53,12 @@ const KNOWN_SAMPLE: i64 = 60;
 const SAMPLE_BANDS: i64 = 4;
 
 /// 閱讀理解的目標覆蓋率。生詞控制在 4% 左右。
-const READING_COVERAGE: f64 = 0.96;
+/// 實際覆蓋率比目標低多少才算「太難、要重寫」。
+///
+/// 需要一段寬容：模型不可能剛好命中目標，而且每差一次就多燒一次呼叫。
+/// 六個百分點大約是一個難度帶的寬度——目標 96% 時低於 90% 才重寫，
+/// 跟原本寫死的行為一致。
+const COVERAGE_TOLERANCE: f64 = 0.06;
 
 /// 覆蓋率不合格時最多重試幾次。
 ///
@@ -83,6 +88,12 @@ const NEW_WORD_REACH: f64 = 1.5;
 /// 先撈幾個候選再做詞性平衡。要夠多才湊得齊各種詞性，
 /// 但這是一次有索引的查詢，多撈幾百個不影響。
 const NEW_WORD_POOL: i64 = 400;
+
+/// 一篇文章帶進幾個「快忘掉」的字。
+///
+/// 這些不佔生詞預算，但塞太多會把文章綁死——模型得同時滿足新詞白名單
+/// 與這一批，句子會開始像清單。六個是能自然寫進一篇短文的量。
+const REVIEW_WORDS: i64 = 6;
 
 const TOPIC_MEMORY: i64 = 6;
 
@@ -315,10 +326,16 @@ impl<'a> PracticeEngine<'a> {
         let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
         let word_count = practice::reading_length(learner.vocabulary);
 
-        // 新詞預算由覆蓋率目標算出來，不是拍腦袋的數字
+        // 覆蓋率目標由使用者設定。90% 是常被引用的數字，但多少最舒服
+        // 因人而異——想讀順一點就調高，想每篇多學幾個字就調低。
+        let target_coverage = profiles::study_settings(self.db, ProfileId(profile_id))
+            .await?
+            .reading_coverage;
+
+        // 新詞數量由覆蓋率目標反推，不是拍腦袋的數字
         let budget = wordforge_core::coverage::new_word_budget(
             word_count,
-            READING_COVERAGE,
+            target_coverage,
             prompts::ReadingSpec::REPEATS_PER_NEW_WORD,
         );
 
@@ -339,8 +356,19 @@ impl<'a> PracticeEngine<'a> {
                 .map(|w| w.text)
                 .collect();
 
-        // 到期的字改成「順便複習」：他已經會，不佔生詞預算
-        let review_words = self.due_words(profile_id, 6, now).await?;
+        // 「順便複習」用的是**快忘掉的字**而不是「今天到期的字」。
+        //
+        // 到期只看有沒有跨過門檻；快忘掉看的是衰退到什麼程度。逾期三週的
+        // 字和剛好今天到期的字，前者在文章裡再遇到一次的價值高得多。
+        // 這些字他學過，所以不佔生詞預算，等於免費的強化。
+        let review_words = cards::shaky_words(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            now,
+            REVIEW_WORDS,
+        )
+        .await?;
 
         // 主題輪換：不指定的話模型永遠寫校園生活與天氣，
         // 十篇讀起來像同一篇。用時間戳當 seed，同一批候選也不會每次都給同一個。
@@ -359,7 +387,7 @@ impl<'a> PracticeEngine<'a> {
             target_lang: self.target_name(),
             native_lang: self.native_name(),
             word_count,
-            target_coverage: READING_COVERAGE,
+            target_coverage,
             known_word_count: learner.vocabulary as usize,
             cefr: None,
             known_sample: &known_sample,
@@ -404,7 +432,9 @@ impl<'a> PracticeEngine<'a> {
                 tracing::warn!("沒有任何已知詞資料，跳過覆蓋率驗收（建議先做分級測驗）");
             }
 
-            let too_hard = coverage.band() == wordforge_core::coverage::CoverageBand::TooHard;
+            // 「太難」要跟著設定走。原本用寫死的難度帶（<90% 才算太難），
+            // 使用者把目標設成 98% 的話那個判斷完全不會生效。
+            let too_hard = coverage.ratio() < target_coverage - COVERAGE_TOLERANCE;
             let acceptable = !too_hard || no_baseline || attempt == COVERAGE_RETRIES;
             if acceptable {
                 let questions: Vec<ChoiceItem> = value
@@ -465,7 +495,7 @@ impl<'a> PracticeEngine<'a> {
             );
             req.messages.push(prompts::coverage_retry(
                 coverage.ratio(),
-                READING_COVERAGE,
+                target_coverage,
                 &offenders,
                 &passage,
             ));

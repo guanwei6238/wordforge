@@ -82,6 +82,13 @@ pub mod profiles {
         pub max_reviews_per_day: i64,
         /// FSRS 的目標記憶留存率。調高記得更牢但複習量大增。
         pub desired_retention: f64,
+        /// 閱讀文章要有多少比例是你看得懂的字。
+        ///
+        /// 這是「90% 法則」的那個數字，但實際上多少最好因人而異：
+        /// 想輕鬆讀順的人設高一點，想每篇都學到東西的人設低一點。
+        /// 生詞的數量由這個值反推——設 0.90 的話 300 字的文章
+        /// 會有約 30 個生詞詞元，設 0.96 只有 12 個。
+        pub reading_coverage: f64,
     }
 
     impl Default for StudySettings {
@@ -92,6 +99,8 @@ pub mod profiles {
                 // 長假回來不要被幾百張淹沒
                 max_reviews_per_day: 200,
                 desired_retention: 0.9,
+                // 0.96 落在「最適」區間中央：讀得動，又每篇都有幾個新字
+                reading_coverage: 0.96,
             }
         }
     }
@@ -106,27 +115,32 @@ pub mod profiles {
                 new_per_day: self.new_per_day.clamp(0, 500),
                 max_reviews_per_day: self.max_reviews_per_day.clamp(10, 9_999),
                 desired_retention: self.desired_retention.clamp(0.70, 0.97),
+                // 低於 0.80 就不是「可理解輸入」而是查字典；
+                // 高於 0.99 等於整篇都會，讀了學不到東西
+                reading_coverage: self.reading_coverage.clamp(0.80, 0.99),
             }
         }
     }
 
     pub async fn study_settings(db: &Db, profile_id: ProfileId) -> Result<StudySettings> {
-        let row: (Option<i64>, Option<i64>, Option<f64>) = sqlx::query_as(
+        let row: (Option<i64>, Option<i64>, Option<f64>, Option<f64>) = sqlx::query_as(
             "SELECT CAST(json_extract(settings_json, '$.new_per_day') AS INTEGER),
                     CAST(json_extract(settings_json, '$.max_reviews_per_day') AS INTEGER),
-                    CAST(json_extract(settings_json, '$.desired_retention') AS REAL)
+                    CAST(json_extract(settings_json, '$.desired_retention') AS REAL),
+                    CAST(json_extract(settings_json, '$.reading_coverage') AS REAL)
              FROM profile WHERE id = ? AND json_valid(settings_json)",
         )
         .bind(profile_id.0)
         .fetch_optional(db.pool())
         .await?
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None));
 
         let d = StudySettings::default();
         Ok(StudySettings {
             new_per_day: row.0.unwrap_or(d.new_per_day),
             max_reviews_per_day: row.1.unwrap_or(d.max_reviews_per_day),
             desired_retention: row.2.unwrap_or(d.desired_retention),
+            reading_coverage: row.3.unwrap_or(d.reading_coverage),
         }
         .clamped())
     }
@@ -144,12 +158,14 @@ pub mod profiles {
                      CASE WHEN json_valid(settings_json) THEN settings_json ELSE '{}' END,
                      '$.new_per_day', ?,
                      '$.max_reviews_per_day', ?,
-                     '$.desired_retention', ?)
+                     '$.desired_retention', ?,
+                     '$.reading_coverage', ?)
              WHERE id = ?",
         )
         .bind(s.new_per_day)
         .bind(s.max_reviews_per_day)
         .bind(s.desired_retention)
+        .bind(s.reading_coverage)
         .bind(profile_id.0)
         .execute(db.pool())
         .await?;
@@ -441,6 +457,15 @@ pub mod lemmas {
                    SELECT 1 FROM card c
                    WHERE c.profile_id = ?4 AND c.lemma_id = l.id
                )
+               -- 變化形不算「新字」：教 `established` 沒有意義，
+               -- 該教的是 `establish`。實測不擋的話 supporting / visiting
+               -- 這類會佔掉一半的名額。
+               AND NOT EXISTS (
+                   SELECT 1 FROM surface_form sf
+                   JOIN lemma base ON base.id = sf.lemma_id
+                   WHERE sf.lang = l.lang AND sf.normalized = l.normalized
+                     AND base.normalized <> l.normalized
+               )
              ORDER BY l.freq_rank
              LIMIT ?5",
         )
@@ -469,9 +494,19 @@ pub mod lemmas {
                     freq_rank,
                 }
             })
-            // 專有名詞學了沒用，但只有 name 這一個詞性的才排除——
-            // `march`（三月／行進）不該因為也能當專有名詞就被丟掉
-            .filter(|w| !(w.pos.len() == 1 && w.pos[0] == "name"))
+            // 詞性表裡出現 `name` 就整個排掉。
+            //
+            // 原本只排除「只有 name」的字，結果 `gould`（姓氏，詞性被標成
+            // adj,noun,name）混進了學習者的生詞清單。維基詞典對專有名詞
+            // 常常同時標上普通詞性，所以「只有 name」這條線攔不住。
+            //
+            // 代價是 `comet`（noun,name）這種好字也會被丟掉。可以接受：
+            // 候選池有幾百個字而一篇只要幾個，寧可少幾個好字，
+            // 也不要讓學習者背一個姓氏。
+            .filter(|w| !w.pos.iter().any(|p| p == "name"))
+            // 詞性完全查不到的也跳過——那多半是縮寫或雜訊，
+            // 而且沒有詞性就沒辦法做配比
+            .filter(|w| !w.pos.is_empty())
             .collect())
     }
 
@@ -874,6 +909,56 @@ pub mod cards {
         .fetch_one(db.pool())
         .await?;
         Ok(n)
+    }
+
+    /// 學過但快忘掉的字——「不熟」的那批。
+    ///
+    /// ## 為什麼要單獨挑這些
+    ///
+    /// 閱讀文章原本只放兩種字：他很熟的（撐起覆蓋率）和全新的（要教的）。
+    /// 中間那批——學過、但記憶正在衰退——反而沒被用到，而那正是
+    /// 讀文章最有價值的地方：在上下文裡再遇到一次，比抽卡複習更接近
+    /// 真正的使用場景，也更容易記住。
+    ///
+    /// ## 怎麼定義「不熟」
+    ///
+    /// FSRS 的可提取性 R 是「現在能想起來的機率」：
+    ///
+    /// ```text
+    /// R = (1 + FACTOR * 距上次複習天數 / stability) ^ DECAY     DECAY < 0
+    /// ```
+    ///
+    /// R 越低越不熟。這裡**不用真的算 R**——`DECAY` 是負的，所以 R 對
+    /// `距上次複習天數 / stability` 單調遞減，直接照那個比值由大到小排
+    /// 就是同一個順序。省掉一個 SQLite 不一定有的 `pow()`。
+    ///
+    /// 跟「今天到期」不一樣：到期只看有沒有跨過門檻，這裡看的是衰退到
+    /// 什麼程度。逾期三週的字和剛好今天到期的字，前者急迫得多。
+    pub async fn shaky_words(
+        db: &Db,
+        profile_id: ProfileId,
+        lang: &str,
+        now: OffsetDateTime,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let words: Vec<String> = sqlx::query_scalar(
+            "SELECT l.text
+             FROM card c JOIN lemma l ON l.id = c.lemma_id
+             WHERE c.profile_id = ?1 AND c.suspended = 0
+               AND l.lang = ?2
+               AND c.state IN ('review', 'relearning')
+               AND c.stability > 0 AND c.last_review IS NOT NULL
+             ORDER BY (julianday(?3) - julianday(c.last_review)) / c.stability DESC
+             LIMIT ?4",
+        )
+        .bind(profile_id.0)
+        .bind(lang)
+        .bind(ts::to_sql(now))
+        .bind(limit)
+        .fetch_all(db.pool())
+        .await?;
+
+        Ok(words)
     }
 
     /// 把一張卡藏到明天。
@@ -1975,6 +2060,7 @@ mod tests {
                 new_per_day: 40,
                 max_reviews_per_day: 300,
                 desired_retention: 0.85,
+                ..d
             },
         )
         .await
@@ -1998,6 +2084,7 @@ mod tests {
                 new_per_day: -5,
                 max_reviews_per_day: 0,
                 desired_retention: 1.5,
+                reading_coverage: 2.0,
             },
         )
         .await
@@ -2006,6 +2093,7 @@ mod tests {
         assert_eq!(s.new_per_day, 0, "0 是合法的（今天先不學新字）");
         assert_eq!(s.max_reviews_per_day, 10);
         assert!((s.desired_retention - 0.97).abs() < 1e-9);
+        assert!((s.reading_coverage - 0.99).abs() < 1e-9);
 
         // 存進去的也必須是夾過的值，不能只在回傳時夾
         assert_eq!(profiles::study_settings(&db, profile).await.unwrap(), s);
@@ -2701,5 +2789,134 @@ mod tests {
                 .unwrap()
         );
         assert!(!cards::suspend(&db, other, card.id.unwrap()).await.unwrap());
+    }
+
+    /// 「不熟」看的是衰退到什麼程度，不是有沒有到期。
+    ///
+    /// 逾期三週的字跟剛好今天到期的字，前者在文章裡再遇到一次的價值高得多。
+    #[tokio::test]
+    async fn shaky_words_rank_by_how_far_memory_has_decayed() {
+        let (db, profile) = setup().await;
+
+        // 三個字，stability 相同但距上次複習差很多
+        for (i, days_ago) in [("fresh", 1.0), ("fading", 10.0), ("almost_gone", 60.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let (text, ago) = days_ago;
+            let lemma = add_word(&db, text, i as i64 + 1).await;
+            let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE card SET state='review', stability=20.0, difficulty=5.0,
+                                 reps=3, last_review=? WHERE id=?",
+            )
+            .bind(ts::to_sql(
+                t0() - Duration::seconds((ago * 86_400.0) as i64),
+            ))
+            .bind(card.id.unwrap().0)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let shaky = cards::shaky_words(&db, profile, "en", t0(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            shaky,
+            vec!["almost_gone", "fading", "fresh"],
+            "最快忘掉的要排最前面"
+        );
+    }
+
+    /// stability 高的字撐得比較久，同樣隔了三十天也沒那麼急。
+    #[tokio::test]
+    async fn a_stronger_memory_is_less_shaky_at_the_same_age() {
+        let (db, profile) = setup().await;
+
+        for (i, (text, stability)) in [("weak", 5.0), ("strong", 200.0)].into_iter().enumerate() {
+            let lemma = add_word(&db, text, i as i64 + 1).await;
+            let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE card SET state='review', stability=?, difficulty=5.0,
+                                 reps=3, last_review=? WHERE id=?",
+            )
+            .bind(stability)
+            .bind(ts::to_sql(t0() - Duration::days(30)))
+            .bind(card.id.unwrap().0)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let shaky = cards::shaky_words(&db, profile, "en", t0(), 10)
+            .await
+            .unwrap();
+        assert_eq!(shaky, vec!["weak", "strong"]);
+    }
+
+    /// 沒學過的新卡不算「不熟」——那是「不會」，屬於生詞白名單那條路。
+    #[tokio::test]
+    async fn brand_new_cards_are_not_shaky_words() {
+        let (db, profile) = setup().await;
+        let lemma = add_word(&db, "unseen", 1).await;
+        cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+            .await
+            .unwrap();
+
+        assert!(
+            cards::shaky_words(&db, profile, "en", t0(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 覆蓋率目標是使用者設定，而且要夾在有意義的範圍內。
+    #[tokio::test]
+    async fn reading_coverage_is_a_setting_with_sane_bounds() {
+        let (db, profile) = setup().await;
+
+        let d = profiles::study_settings(&db, profile).await.unwrap();
+        assert_eq!(d.reading_coverage, 0.96, "預設落在最適區間");
+
+        let saved = profiles::update_study_settings(
+            &db,
+            profile,
+            profiles::StudySettings {
+                reading_coverage: 0.90,
+                ..d
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.reading_coverage, 0.90);
+        assert_eq!(
+            profiles::study_settings(&db, profile)
+                .await
+                .unwrap()
+                .reading_coverage,
+            0.90,
+            "要真的存進去"
+        );
+
+        // 低於 0.8 是查字典不是閱讀；高於 0.99 等於整篇都會
+        for (input, want) in [(0.10, 0.80), (1.00, 0.99)] {
+            let s = profiles::update_study_settings(
+                &db,
+                profile,
+                profiles::StudySettings {
+                    reading_coverage: input,
+                    ..d
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(s.reading_coverage, want);
+        }
     }
 }

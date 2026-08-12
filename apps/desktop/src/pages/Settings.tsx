@@ -5,6 +5,13 @@ import MaterialManager from "../components/MaterialManager";
 import UsageStats from "../components/UsageStats";
 import LlmSetup from "../components/LlmSetup";
 
+/** 閱讀覆蓋率的選項。 */
+const COVERAGE_CHOICES = [
+  { value: 0.9, label: "90%", hint: "每篇都有不少生字，讀起來要花力氣但學得多" },
+  { value: 0.96, label: "96%", hint: "平衡點：讀得動，又每篇都有幾個新字" },
+  { value: 0.98, label: "98%", hint: "幾乎全部看得懂，適合想練流暢度而不是擴充詞彙" },
+];
+
 /** 目標留存率的選項。數字背後的意義比數字本身重要，所以每個都附說明。 */
 const RETENTION_CHOICES = [
   { value: 0.85, label: "85%", hint: "複習量少，但忘記的字會明顯變多" },
@@ -115,6 +122,34 @@ export default function Settings() {
             ?.hint ?? "自訂值"}
           。這個數字直接決定 FSRS 排出來的間隔——調高不是「學得更好」，
           而是拿更多複習時間換更少的遺忘。考試前調高、長期維持調低。
+        </p>
+      </section>
+
+      <section className="panel">
+        <h2>閱讀難度</h2>
+        <label>
+          文章裡你看得懂的字要占
+          <select
+            value={settings.reading_coverage}
+            onChange={(e) => save({ ...settings, reading_coverage: Number(e.target.value) })}
+          >
+            {COVERAGE_CHOICES.map((c) => (
+              <option key={c.value} value={c.value}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <p className="muted hint">
+          {COVERAGE_CHOICES.find((c) => Math.abs(c.value - settings.reading_coverage) < 0.001)
+            ?.hint ?? "自訂值"}
+          。生詞的數量由這個值反推：300 字的文章設 96% 大約放 6 個新字，
+          設 90% 會放 15 個左右。
+        </p>
+        <p className="muted hint">
+          文章裡還會另外帶進幾個你<strong>學過但快忘掉</strong>的字（依 FSRS
+          算出來的遺忘程度挑）。那些不算生詞，是免費的複習——在句子裡再遇到一次，
+          比抽卡更接近真正的使用場景。
         </p>
       </section>
 
