@@ -926,3 +926,17 @@ button.link {
 button.link:hover {
   color: var(--text);
 }
+
+/* 試跑失敗的原始訊息：要能整段讀，但不該撐破版面 */
+.probe-error {
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 12rem;
+  overflow-y: auto;
+}

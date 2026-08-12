@@ -773,6 +773,19 @@ type UsageReport = (
     Vec<(String, i64, i64)>,
 );
 
+/// 試跑一個模型，回報它在這台機器上能不能用。
+///
+/// 兩個 CLI 都沒有可以程式化查詢模型清單的方式，所以清單一定會過期。
+/// 直接送一個最小 prompt 過去，成敗就是不會過期的答案。
+#[tauri::command]
+async fn probe_model(app: AppHandle, model: String) -> CmdResult<wordforge_llm::ModelProbe> {
+    let settings = LlmSettings::load(&settings_dir(&app)?);
+    let cli = settings
+        .cli
+        .ok_or_else(|| CommandError::new("目前的後端不是本機 CLI，沒有模型可以試"))?;
+    Ok(wordforge_llm::probe_model(cli, &model).await)
+}
+
 /// LLM 用量：今天與最近七天。
 #[tauri::command]
 async fn llm_usage(state: tauri::State<'_, AppState>, profile_id: i64) -> CmdResult<UsageReport> {
@@ -1327,6 +1340,7 @@ pub fn run() {
             set_profile_languages,
             suspend_other_language_cards,
             dictionary_languages,
+            probe_model,
             llm_usage,
             bury_card,
             suspend_card,

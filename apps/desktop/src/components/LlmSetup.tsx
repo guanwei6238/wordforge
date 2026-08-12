@@ -7,6 +7,8 @@ import {
   errorMessage,
   getLlmSettings,
   type LlmSettings,
+  type ModelProbe,
+  probeModel,
   testLlm,
   updateLlmSettings,
 } from "../api";
@@ -34,7 +36,7 @@ const CLI_SPECS: Record<
     modelFlag: "--model",
     model: "sonnet",
     effortStyle: { kind: "flag", value: "--effort" },
-    effort: "low",
+    effort: "medium",
   },
   codex: {
     // 資料目錄不是 git repo，不加這個會直接拒絕執行
@@ -45,7 +47,7 @@ const CLI_SPECS: Record<
     model: "",
     // codex 沒有獨立的 effort 旗標
     effortStyle: { kind: "config", value: { flag: "-c", key: "model_reasoning_effort" } },
-    effort: "low",
+    effort: "medium",
   },
 };
 
@@ -139,6 +141,8 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
   const [settings, setSettings] = useState<LlmSettings | null>(null);
   const [detected, setDetected] = useState<CliAvailability[]>([]);
   const [testing, setTesting] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [probe, setProbe] = useState<ModelProbe | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -178,6 +182,18 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
       setError(errorMessage(e));
     } finally {
       setTesting(false);
+    }
+  }
+
+  async function runProbe() {
+    setProbing(true);
+    setProbe(null);
+    try {
+      setProbe(await probeModel(settings?.cli.model ?? ""));
+    } catch (e) {
+      setProbe({ usable: false, detail: errorMessage(e) });
+    } finally {
+      setProbing(false);
     }
   }
 
@@ -278,12 +294,30 @@ export default function LlmSetup({ onChanged }: { onChanged?: () => void }) {
             value={current.cli.model}
             options={models}
             emptyLabel="（CLI 預設）"
-            onChange={(model) => save({ ...current, cli: { ...current.cli, model } })}
+            onChange={(model) => {
+              setProbe(null);
+              void save({ ...current, cli: { ...current.cli, model } });
+            }}
           />
+          <div className="row">
+            <button onClick={runProbe} disabled={probing}>
+              {probing ? "試跑中…" : "試跑這個模型"}
+            </button>
+            {probe && (
+              <span className={probe.usable ? "ok" : "error"}>
+                {probe.usable ? "可以用" : "不能用"}
+              </span>
+            )}
+          </div>
+          {probe && !probe.usable && <pre className="probe-error">{probe.detail}</pre>}
           <p className="muted hint">
             出題與批改是「照著明確規格產生結構化輸出」，中等模型就夠用，
             而且快得多、也比較不會撞到訂閱的速率限制。
-            清單是已知可用的選項，會隨各家改版過期——選「自訂」可以自己打。
+          </p>
+          <p className="muted hint">
+            清單是已知可用的選項，<strong>一定會過期</strong>——兩個 CLI
+            都沒有可以查詢模型清單的指令，所以沒辦法自動更新。 選「自訂…」可以自己打，按「試跑」會實際送一個最小
+            prompt 過去，成敗就是答案。
           </p>
 
           {efforts.length > 0 && (

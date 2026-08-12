@@ -27,8 +27,8 @@ pub mod prompts;
 mod shell_path;
 
 pub use cli::{
-    CliAvailability, CliConfig, CliLlm, CliOptions, CliPreset, EffortStyle, cli_options,
-    detect_backends,
+    CliAvailability, CliConfig, CliLlm, CliOptions, CliPreset, EffortStyle, ModelProbe,
+    cli_options, detect_backends, probe_model,
 };
 pub use client::{HttpLlm, LlmProvider};
 

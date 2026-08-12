@@ -676,6 +676,22 @@ export function updateLlmSettings(settings: LlmSettings): Promise<LlmSettings> {
   return invoke("update_llm_settings", { settings });
 }
 
+export interface ModelProbe {
+  usable: boolean;
+  /** 不能用的原因 */
+  detail: string;
+}
+
+/**
+ * 試跑一個模型看它能不能用。
+ *
+ * 兩個 CLI 都沒有可以程式化查詢模型清單的方式，所以下拉選單的清單一定會
+ * 過期。直接送一個最小 prompt 過去，成敗就是不會過期的答案。要幾秒鐘。
+ */
+export function probeModel(model: string): Promise<ModelProbe> {
+  return invoke("probe_model", { model });
+}
+
 /** 送一個極短的 prompt 確認後端真的能用 */
 export function testLlm(): Promise<string> {
   return invoke("test_llm");

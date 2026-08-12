@@ -118,8 +118,8 @@ impl CliConfig {
             // 出題不需要最強的模型，預設用中等的那個
             model: "sonnet".into(),
             effort_style: EffortStyle::Flag("--effort".into()),
-            // 出題是照規格產出結構化內容，不太需要深度推理
-            effort: "low".into(),
+            // 出題是照規格產出結構化內容，中等就夠
+            effort: "medium".into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -145,7 +145,7 @@ impl CliConfig {
                 flag: "-c".into(),
                 key: "model_reasoning_effort".into(),
             },
-            effort: "low".into(),
+            effort: "medium".into(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -185,6 +185,77 @@ pub struct CliOptions {
     pub efforts: Vec<String>,
 }
 
+/// 試跑一個模型，回報它在這台機器上能不能用。
+///
+/// ## 為什麼是試跑而不是列清單
+///
+/// 兩個 CLI 都**沒有**可以程式化取得模型清單的方式：
+///
+/// ```text
+/// codex models              不是子指令，會落回互動模式
+/// codex completion bash     產出的補全腳本裡沒有模型名
+/// claude models             被當成 prompt，開起互動 session
+/// ```
+///
+/// 而且就算列得出來，「帳號方案支不支援」「CLI 版本夠不夠新」還是另一回事
+/// ——`gpt-5.6-luna` 在 codex-cli 0.142.5 上會被拒絕，但它確實是個真模型。
+///
+/// 直接送一個最小 prompt 過去，成敗就是答案。代價是幾秒鐘與一點點額度，
+/// 換來的是不會過期的正確答案。
+pub async fn probe_model(mut config: CliConfig, model: &str) -> ModelProbe {
+    config.model = model.trim().to_string();
+    // 試跑不需要等一篇文章那麼久
+    config.timeout_secs = config.timeout_secs.min(90);
+
+    let llm = match CliLlm::new(config) {
+        Ok(llm) => llm,
+        Err(e) => {
+            return ModelProbe {
+                usable: false,
+                detail: e.to_string(),
+            };
+        }
+    };
+
+    let req = ChatRequest {
+        system: None,
+        messages: vec![crate::Message::user("只輸出這個 JSON：{\"ok\":1}")],
+        json_only: false,
+    };
+
+    match llm.chat(&req).await {
+        Ok(_) => ModelProbe {
+            usable: true,
+            detail: String::new(),
+        },
+        Err(e) => ModelProbe {
+            usable: false,
+            detail: model_error_hint(&e.to_string()),
+        },
+    }
+}
+
+/// 試跑一個模型的結果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelProbe {
+    pub usable: bool,
+    /// 不能用的原因。能翻成人話的就翻，翻不了的原樣附上。
+    pub detail: String,
+}
+
+/// 把模型相關的錯誤翻成使用者知道下一步該做什麼的話。
+fn model_error_hint(raw: &str) -> String {
+    if raw.contains("requires a newer version") {
+        return format!(
+            "這個模型需要更新版的 CLI。跑 `codex update` 之後再試。\n\n原始訊息：{raw}"
+        );
+    }
+    if raw.contains("model_not_found") || raw.contains("Unknown model") {
+        return format!("找不到這個模型，可能是名稱打錯或你的方案沒有。\n\n原始訊息：{raw}");
+    }
+    raw.to_string()
+}
+
 /// 各 CLI 的模型與推理強度選項。
 ///
 /// 值取自各 CLI 的 `--help`，不是猜的：
@@ -201,6 +272,10 @@ pub struct CliOptions {
 ///
 /// Claude 這邊刻意用**別名**而不是完整型號：別名永遠指向該級別的最新模型，
 /// 完整型號會在下一次改版時失效，而這份清單沒有人會記得回來更新。
+///
+/// 這份清單**一定會過期**，而且沒辦法自動更新——兩個 CLI 都不提供可以
+/// 程式化查詢的模型清單（細節見 [`probe_model`]）。所以 UI 必須允許
+/// 自己輸入，並且提供「試跑看看」來取得不會過期的答案。
 pub fn cli_options(preset: CliPreset) -> CliOptions {
     let (models, efforts): (&[&str], &[&str]) = match preset {
         CliPreset::ClaudeCode => (
@@ -676,6 +751,37 @@ mod tests {
         assert_eq!(cfg.model, "sonnet");
         assert_eq!(cfg.effort, "");
         assert_eq!(cfg.effort_style, EffortStyle::Unsupported);
+    }
+
+    /// 試跑失敗時要說得出下一步，不能只丟原始訊息。
+    ///
+    /// `gpt-5.6-luna` 在 codex-cli 0.142.5 上就是這個情況：模型是真的，
+    /// 但 CLI 太舊。使用者需要知道的是「去升級 codex」，不是那串 JSON。
+    #[test]
+    fn a_too_old_cli_is_explained_not_just_echoed() {
+        let raw = r#"{"type":"error","status":400,"error":{"message":"The 'gpt-5.6-luna' model requires a newer version of Codex."}}"#;
+        let hint = model_error_hint(raw);
+        assert!(hint.contains("codex update"), "{hint}");
+        assert!(hint.contains(raw), "原始訊息要留著：{hint}");
+    }
+
+    /// 認不出來的錯誤原樣傳回去，不要猜。
+    #[test]
+    fn an_unrecognised_error_is_passed_through() {
+        assert_eq!(
+            model_error_hint("rate limit exceeded"),
+            "rate limit exceeded"
+        );
+    }
+
+    /// 試跑不該讓使用者等一篇文章那麼久。
+    #[tokio::test]
+    async fn probing_a_broken_program_fails_fast() {
+        let mut cfg = CliConfig::codex();
+        cfg.program = "definitely-not-a-real-program-xyz".into();
+        let result = probe_model(cfg, "whatever").await;
+        assert!(!result.usable);
+        assert!(result.detail.contains("找不到指令"), "{}", result.detail);
     }
 
     /// 偵測要看「跑不跑得起來」而不是「PATH 裡有沒有」——
