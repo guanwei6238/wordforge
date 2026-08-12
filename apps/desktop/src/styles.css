@@ -718,12 +718,28 @@ button.link {
   align-items: start;
 }
 
-/* 文章比題目長，讓它自己捲，右欄的題目才不會被推到看不見的地方 */
-.passage-pane {
+/* 批改之後多一欄全文翻譯，就排在原文旁邊。
+   翻譯擺在最下面的話，對照原文得一直上下捲——那正是它沒用的原因。 */
+.reading-layout.three {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+}
+
+/* 文章與翻譯都比題目長，各自捲，右欄的題目才不會被推到看不見的地方。
+   兩欄並排捲動時，行高一致才對得上段落。 */
+.passage-pane,
+.translation-pane {
   position: sticky;
   top: 1rem;
   max-height: calc(100vh - 3rem);
   overflow-y: auto;
+}
+
+.translation-pane h2 {
+  margin-bottom: 0.5rem;
+}
+
+.translation-pane .passage {
+  white-space: pre-wrap;
 }
 
 .answer-pane {
@@ -739,13 +755,22 @@ button.link {
     margin-right: 0;
   }
 
-  .reading-layout {
+  .reading-layout,
+  .reading-layout.three {
     grid-template-columns: 1fr;
   }
 
-  .passage-pane {
+  .passage-pane,
+  .translation-pane {
     position: static;
     max-height: none;
+  }
+}
+
+/* 三欄比兩欄再寬一點才不會每欄都變窄長條 */
+@media (min-width: 1400px) {
+  .practice.wide {
+    --wide: min(1560px, 100vw - 3rem);
   }
 }
 
@@ -802,8 +827,17 @@ button.link {
   border: 1px solid var(--accent);
   border-radius: 8px;
   padding: 0.6rem 0.8rem;
-  margin-bottom: 1rem;
   background: var(--bg);
+}
+
+/* 釘在題目欄的最上面。捲到第四題時點一個字，解釋要當場看得到——
+   不然又變成要往上滑才對得起原文與翻譯。 */
+.answer-pane .word-notes {
+  position: sticky;
+  top: 1rem;
+  z-index: 1;
+  background: var(--surface);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 12%);
 }
 
 .word-notes .title-row {
@@ -916,6 +950,50 @@ button.link {
   color: var(--accent);
 }
 
+/* ---------------------------------------------------------------- 克漏字 */
+
+/* 空格要一眼看得出來，而且看得出是第幾格——右邊的選項靠編號對回來 */
+.blank {
+  border-bottom: 2px solid var(--border);
+  padding: 0 0.25rem;
+  white-space: nowrap;
+}
+
+.blank sup {
+  font-size: 0.65em;
+  color: var(--muted);
+  margin-right: 0.15rem;
+}
+
+.blank.filled {
+  border-bottom-color: var(--accent);
+}
+
+.blank.right {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
+.blank.wrong {
+  border-bottom-color: var(--error);
+  color: var(--error);
+}
+
+.blank-no {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.questions.blanks {
+  list-style: none;
+  padding-left: 0;
+}
+
+.submit-row {
+  align-items: center;
+  gap: 0.75rem;
+}
+
 /* ------------------------------------------------------------- 練習紀錄 */
 
 .history {
@@ -955,9 +1033,23 @@ button.link {
   font-size: 0.8rem;
 }
 
-.history li button {
+.history-actions {
   grid-row: 1 / 3;
   grid-column: 2;
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+/* 正在做的那一份標出來，才知道刪掉會影響什麼 */
+.history li.current {
+  border-color: var(--accent);
+}
+
+.pager {
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
 }
 
 /* --------------------------------------------------------------- 重置 */

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  BLANK_PATTERN,
   currentLanguages,
+  deleteExercise,
   DIFFICULTY_LABELS,
   errorMessage,
   exerciseLabels,
@@ -26,9 +28,12 @@ import LlmSetup from "../components/LlmSetup";
 import SpeakButton from "../components/SpeakButton";
 
 /** 一步調幾 px。太細要按很多次，太粗會跳過剛好的那一級。 */
-const FONT_STEP = 2;
+const FONT_STEP = 1;
 const FONT_MIN = 12;
 const FONT_MAX = 32;
+
+/** 練習紀錄一頁幾筆。一頁塞太多就等於沒有分頁。 */
+const HISTORY_PAGE = 10;
 
 /**
  * AI 練習頁。
@@ -58,9 +63,11 @@ export default function Practice() {
   const [materials, setMaterials] = useState<Material[]>([]);
   const [materialId, setMaterialId] = useState<number | null>(null);
   // 文章字級。存在 profile 裡，換一台電腦也還在
-  const [fontSize, setFontSize] = useState(18);
+  const [fontSize, setFontSize] = useState(16);
   // 練習紀錄。做過的題目可以整份叫回來重做
   const [history, setHistory] = useState<ExerciseSummary[]>([]);
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyPage, setHistoryPage] = useState(0);
   const [showHistory, setShowHistory] = useState(false);
   // 解析階段點到的字，顯示釋義用
   const [lookup, setLookup] = useState<string | null>(null);
@@ -73,9 +80,16 @@ export default function Practice() {
     }
   }, []);
 
-  const refreshHistory = useCallback(async () => {
+  const refreshHistory = useCallback(async (page: number) => {
     try {
-      setHistory(await listExercises());
+      const got = await listExercises(HISTORY_PAGE, page * HISTORY_PAGE);
+      // 刪到某一頁只剩空的時候要退回上一頁，不然畫面是一片空白
+      if (got.items.length === 0 && page > 0) {
+        setHistoryPage(page - 1);
+        return;
+      }
+      setHistory(got.items);
+      setHistoryTotal(got.total);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -83,7 +97,6 @@ export default function Practice() {
 
   useEffect(() => {
     void refresh();
-    void refreshHistory();
     void currentLanguages().then(setLangs).catch(() => {});
     void listMaterials()
       .then(setMaterials)
@@ -91,7 +104,11 @@ export default function Practice() {
     void getStudySettings()
       .then((s) => setFontSize(s.reading_font_size))
       .catch(() => {});
-  }, [refresh, refreshHistory]);
+  }, [refresh]);
+
+  useEffect(() => {
+    void refreshHistory(historyPage);
+  }, [refreshHistory, historyPage]);
 
   /** 把一份題目擺上畫面，順便把上一份的作答與批改清乾淨。 */
   function present(ex: ExerciseView | null) {
@@ -103,7 +120,7 @@ export default function Practice() {
     setChoices(
       ex?.body.kind === "reading"
         ? ex.body.questions.map(() => null)
-        : ex?.body.kind === "choices"
+        : ex?.body.kind === "choices" || ex?.body.kind === "cloze"
           ? ex.body.items.map(() => null)
           : [],
     );
@@ -113,11 +130,14 @@ export default function Practice() {
     // 先清空。留著上一題的話，等模型的那幾十秒裡畫面顯示的是
     // 已經作廢的內容，而且捲到一半送出還會送到舊的 exercise_id。
     present(null);
+    // 紀錄與題目擇一顯示：兩個都攤在同一頁時，出了新題目卻還看得到
+    // 一整排舊的，很難分辨現在在做哪一份
+    setShowHistory(false);
     setBusy("generating");
     setError(null);
     try {
       present(await generateExercise(kind, materialId));
-      await refreshHistory();
+      await refreshHistory(historyPage);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -140,6 +160,21 @@ export default function Practice() {
     }
   }
 
+  async function remove(exerciseId: number) {
+    setError(null);
+    try {
+      await deleteExercise(exerciseId);
+      // 刪掉的剛好是正在做的那份時，畫面上那份已經沒有對應的紀錄了，
+      // 送出會找不到 exercise_id，所以一起收掉
+      if (exercise?.exercise_id === exerciseId) {
+        present(null);
+      }
+      await refreshHistory(historyPage);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+
   async function submit() {
     if (!exercise) return;
     setBusy("grading");
@@ -154,7 +189,7 @@ export default function Practice() {
         }),
       );
       await refresh();
-      await refreshHistory();
+      await refreshHistory(historyPage);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -204,9 +239,20 @@ export default function Practice() {
   }
 
   const reading = exercise?.body.kind === "reading" ? exercise.body : null;
+  const cloze = exercise?.body.kind === "cloze" ? exercise.body : null;
+  // 有文章的題型才用寬版；而且紀錄攤開時要收回窄版，
+  // 不然一張清單被拉到 1300px 寬會很難讀
+  const wide = (reading || cloze) && !showHistory;
+
+  // 沒作答的題數。全部答完才讓送出——漏掉一題送出去，
+  // 批改會把它算成答錯，而那不是他的本意。
+  const unanswered =
+    exercise?.body.kind === "translation"
+      ? answers.filter((a) => !a.trim()).length
+      : choices.filter((c) => c == null).length;
 
   return (
-    <div className={reading ? "practice wide" : "practice"}>
+    <div className={wide ? "practice wide" : "practice"}>
       {status && (
         <section className="panel">
           <div className="row">
@@ -240,7 +286,7 @@ export default function Practice() {
               {busy === "generating" ? "出題中…" : exercise ? "換一題" : "開始練習"}
             </button>
             <button onClick={() => setShowHistory((v) => !v)} disabled={busy !== null}>
-              練習紀錄{history.length > 0 ? `（${history.length}）` : ""}
+              {showHistory ? "回到題目" : `練習紀錄${historyTotal > 0 ? `（${historyTotal}）` : ""}`}
             </button>
           </div>
           <p className="muted hint">
@@ -263,213 +309,273 @@ export default function Practice() {
         </section>
       )}
 
-      {showHistory && (
-        <History
-          items={history}
-          labels={labels}
-          disabled={busy !== null}
-          onRedo={redo}
-        />
-      )}
-
       {error && <p className="error">{error}</p>}
 
-      {/* 閱讀測驗：文章在左、題目與解析在右。
-          兩欄是刻意的——對照文章回答本來就要來回看，
-          上下排的話每答一題都要捲回去。 */}
-      {exercise && reading && (
-        <div className="reading-layout">
-          <section className="panel exercise passage-pane">
-            <div className="row title-row">
-              <h2>{reading.title}</h2>
-              <span className="font-size">
-                <button
-                  onClick={() => changeFontSize(fontSize - FONT_STEP)}
-                  disabled={fontSize <= FONT_MIN}
-                  title="縮小文章字級"
-                >
-                  A−
-                </button>
-                <span className="muted">{fontSize}px</span>
-                <button
-                  onClick={() => changeFontSize(fontSize + FONT_STEP)}
-                  disabled={fontSize >= FONT_MAX}
-                  title="放大文章字級"
-                >
-                  A+
-                </button>
-              </span>
+      {/* 紀錄與題目擇一顯示。兩個都攤在同一頁時，看不出現在在做哪一份 */}
+      {showHistory ? (
+        <History
+          items={history}
+          total={historyTotal}
+          page={historyPage}
+          labels={labels}
+          disabled={busy !== null}
+          currentId={exercise?.exercise_id ?? null}
+          onPage={setHistoryPage}
+          onRedo={redo}
+          onDelete={remove}
+        />
+      ) : (
+        <>
+          {/* 閱讀測驗：文章在左、題目在右；批改完再插入一欄全文翻譯。
+              翻譯排在原文旁邊才對照得起來，擺在最下面等於要一直上下捲。 */}
+          {exercise && reading && (
+            <div className={feedback && reading.translation ? "reading-layout three" : "reading-layout"}>
+              <section className="panel exercise passage-pane">
+                <PassageHeader
+                  title={reading.title}
+                  fontSize={fontSize}
+                  onFontSize={changeFontSize}
+                />
+                <p className="muted hint">
+                  {feedback
+                    ? "點文章裡的任何一個字可以查它的意思。"
+                    : "點任何一個字可以標記「我不會」，送出後會排進複習。"}
+                  {exercise.coverage != null &&
+                    `　這篇有 ${Math.round(exercise.coverage * 100)}% 的字你已經學過。`}
+                </p>
+
+                <p className="passage" style={{ fontSize: `${fontSize}px` }}>
+                  {reading.passage.split(/(\s+)/).map((chunk, i) => {
+                    if (!chunk.trim()) return chunk;
+                    const word = normalizeWord(chunk);
+                    const isMarked = marked.some((w) => w.toLowerCase() === word);
+                    return (
+                      <span
+                        key={i}
+                        className={[
+                          "word",
+                          isMarked ? "marked" : "",
+                          feedback && lookup === word ? "looking" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onClick={() =>
+                          feedback
+                            ? setLookup((cur) => (cur === word ? null : word))
+                            : toggleMarked(chunk)
+                        }
+                      >
+                        {chunk}
+                      </span>
+                    );
+                  })}
+                </p>
+
+                {marked.length > 0 && !feedback && (
+                  <p className="muted">標記為不會的字：{marked.join("、")}</p>
+                )}
+
+                {reading.new_words.length > 0 && (
+                  <ul className="new-words">
+                    {reading.new_words.map((w) => (
+                      <li key={w.word}>
+                        <strong>{w.word}</strong>
+                        <SpeakButton text={w.word} />
+                        <span className="muted"> {w.gloss}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+
+              {/* 全文翻譯獨立一欄，跟原文並排。只在批改之後出現——
+                  作答前給等於直接送答案。 */}
+              {feedback && reading.translation && (
+                <section className="panel translation-pane">
+                  <h2>全文翻譯</h2>
+                  <p className="passage" style={{ fontSize: `${fontSize}px` }}>
+                    {reading.translation}
+                  </p>
+                </section>
+              )}
+
+              <div className="answer-pane">
+                {/* 點到的字的釋義自成一塊，而且釘在最上面：
+                    夾在題目中間的話，看完要往回捲才找得到原文與翻譯。 */}
+                {feedback && lookup && (
+                  <WordNotes
+                    term={lookup}
+                    glossary={feedback.glossary ?? []}
+                    onClose={() => setLookup(null)}
+                  />
+                )}
+
+                <section className="panel exercise">
+                  <Choices
+                    items={reading.questions}
+                    choices={choices}
+                    setChoices={setChoices}
+                    feedback={feedback}
+                  />
+                  {!feedback && (
+                    <SubmitRow
+                      unanswered={unanswered}
+                      busy={busy}
+                      onSubmit={submit}
+                      what="題"
+                    />
+                  )}
+                </section>
+
+                {feedback && (
+                  <FeedbackPanel
+                    feedback={feedback}
+                    materials={materials}
+                    materialId={materialId}
+                    setMaterialId={setMaterialId}
+                    busy={busy}
+                    onNext={start}
+                  />
+                )}
+              </div>
             </div>
+          )}
 
-            <p className="muted hint">
-              {feedback
-                ? "點文章裡的任何一個字可以查它的意思。"
-                : "點任何一個字可以標記「我不會」，送出後會排進複習。"}
-              {exercise.coverage != null &&
-                `　這篇有 ${Math.round(exercise.coverage * 100)}% 的字你已經學過。`}
-            </p>
+          {/* 克漏字：短文在左、每一格的選項在右 */}
+          {exercise && cloze && (
+            <div className="reading-layout">
+              <section className="panel exercise passage-pane">
+                <PassageHeader
+                  title={cloze.title}
+                  fontSize={fontSize}
+                  onFontSize={changeFontSize}
+                />
+                <p className="muted hint">
+                  文章裡的每一個空格對應右邊同號的一題。這些字你都學過，
+                  考的是在句子裡想不想得起來。
+                </p>
+                <ClozePassage
+                  passage={cloze.passage}
+                  items={cloze.items}
+                  choices={choices}
+                  feedback={feedback}
+                  fontSize={fontSize}
+                />
+                {feedback && cloze.translation && (
+                  <details className="full-translation" open>
+                    <summary>全文翻譯</summary>
+                    <p>{cloze.translation}</p>
+                  </details>
+                )}
+              </section>
 
-            <p className="passage" style={{ fontSize: `${fontSize}px` }}>
-              {reading.passage.split(/(\s+)/).map((chunk, i) => {
-                if (!chunk.trim()) return chunk;
-                const word = normalizeWord(chunk);
-                const isMarked = marked.some((w) => w.toLowerCase() === word);
-                return (
-                  <span
-                    key={i}
-                    className={[
-                      "word",
-                      isMarked ? "marked" : "",
-                      feedback && lookup === word ? "looking" : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" ")}
-                    onClick={() =>
-                      feedback
-                        ? setLookup((cur) => (cur === word ? null : word))
-                        : toggleMarked(chunk)
-                    }
-                  >
-                    {chunk}
-                  </span>
-                );
-              })}
-            </p>
+              <div className="answer-pane">
+                <section className="panel exercise">
+                  <Choices
+                    items={cloze.items}
+                    choices={choices}
+                    setChoices={setChoices}
+                    feedback={feedback}
+                    numbered
+                  />
+                  {!feedback && (
+                    <SubmitRow
+                      unanswered={unanswered}
+                      busy={busy}
+                      onSubmit={submit}
+                      what="格"
+                    />
+                  )}
+                </section>
+                {feedback && (
+                  <FeedbackPanel
+                    feedback={feedback}
+                    materials={materials}
+                    materialId={materialId}
+                    setMaterialId={setMaterialId}
+                    busy={busy}
+                    onNext={start}
+                  />
+                )}
+              </div>
+            </div>
+          )}
 
-            {feedback && lookup && (
-              <WordNotes
-                term={lookup}
-                glossary={feedback.glossary ?? []}
-                onClose={() => setLookup(null)}
-              />
-            )}
-
-            {marked.length > 0 && !feedback && (
-              <p className="muted">標記為不會的字：{marked.join("、")}</p>
-            )}
-
-            {reading.new_words.length > 0 && (
-              <ul className="new-words">
-                {reading.new_words.map((w) => (
-                  <li key={w.word}>
-                    <strong>{w.word}</strong>
-                    <SpeakButton text={w.word} />
-                    <span className="muted"> {w.gloss}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-
-            {/* 全文翻譯只在解析時給，而且要自己展開——
-                作答前給等於直接送答案，一打開就攤平則會讓人先看翻譯再讀原文 */}
-            {feedback && reading.translation && (
-              <details className="full-translation">
-                <summary>全文翻譯</summary>
-                <p>{reading.translation}</p>
-              </details>
-            )}
-          </section>
-
-          <div className="answer-pane">
+          {exercise && !reading && !cloze && (
             <section className="panel exercise">
-              <Choices
-                items={reading.questions}
-                choices={choices}
-                setChoices={setChoices}
-                feedback={feedback}
-              />
+              {exercise.body.kind === "translation" && (
+                <>
+                  <h2>
+                    {exercise.body.to_target
+                      ? `翻成${languageName(langs.target)}`
+                      : `翻成${languageName(langs.native)}`}
+                  </h2>
+                  {exercise.body.items.map((item, i) => (
+                    <div key={i} className="question">
+                      <p className="prompt">
+                        {i + 1}. {item.source}
+                        {item.target_word && (
+                          <span className="tag" title="這題想讓你用到的字">
+                            {item.target_word}
+                          </span>
+                        )}
+                      </p>
+                      <input
+                        value={answers[i] ?? ""}
+                        onChange={(e) =>
+                          setAnswers((a) => a.map((v, j) => (j === i ? e.target.value : v)))
+                        }
+                        disabled={feedback !== null}
+                        placeholder="你的翻譯…"
+                      />
+                      {feedback?.items[i] && (
+                        <p className={feedback.items[i].correct ? "ok" : "error"}>
+                          {feedback.items[i].correct ? "✓" : "✗"}{" "}
+                          {feedback.items[i].reference && (
+                            <span className="muted">參考：{feedback.items[i].reference}　</span>
+                          )}
+                          {feedback.items[i].comment}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </>
+              )}
+
+              {exercise.body.kind === "choices" && (
+                <>
+                  <h2>文法練習</h2>
+                  <Choices
+                    items={exercise.body.items}
+                    choices={choices}
+                    setChoices={setChoices}
+                    feedback={feedback}
+                  />
+                </>
+              )}
+
               {!feedback && (
-                <button className="primary" onClick={submit} disabled={busy !== null}>
-                  {busy === "grading" ? "批改中…" : "送出"}
-                </button>
+                <SubmitRow
+                  unanswered={unanswered}
+                  busy={busy}
+                  onSubmit={submit}
+                  what="題"
+                />
               )}
             </section>
-            {feedback && (
-              <FeedbackPanel
-                feedback={feedback}
-                materials={materials}
-                materialId={materialId}
-                setMaterialId={setMaterialId}
-                busy={busy}
-                onNext={start}
-              />
-            )}
-          </div>
-        </div>
-      )}
-
-      {exercise && !reading && (
-        <section className="panel exercise">
-          {exercise.body.kind === "translation" && (
-            <>
-              <h2>
-                {exercise.body.to_target
-                  ? `翻成${languageName(langs.target)}`
-                  : `翻成${languageName(langs.native)}`}
-              </h2>
-              {exercise.body.items.map((item, i) => (
-                <div key={i} className="question">
-                  <p className="prompt">
-                    {i + 1}. {item.source}
-                    {item.target_word && (
-                      <span className="tag" title="這題想讓你用到的字">
-                        {item.target_word}
-                      </span>
-                    )}
-                  </p>
-                  <input
-                    value={answers[i] ?? ""}
-                    onChange={(e) =>
-                      setAnswers((a) => a.map((v, j) => (j === i ? e.target.value : v)))
-                    }
-                    disabled={feedback !== null}
-                    placeholder="你的翻譯…"
-                  />
-                  {feedback?.items[i] && (
-                    <p className={feedback.items[i].correct ? "ok" : "error"}>
-                      {feedback.items[i].correct ? "✓" : "✗"}{" "}
-                      {feedback.items[i].reference && (
-                        <span className="muted">參考：{feedback.items[i].reference}　</span>
-                      )}
-                      {feedback.items[i].comment}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </>
           )}
 
-          {exercise.body.kind === "choices" && (
-            <>
-              <h2>文法練習</h2>
-              <Choices
-                items={exercise.body.items}
-                choices={choices}
-                setChoices={setChoices}
-                feedback={feedback}
-              />
-            </>
+          {feedback && !reading && !cloze && (
+            <FeedbackPanel
+              feedback={feedback}
+              materials={materials}
+              materialId={materialId}
+              setMaterialId={setMaterialId}
+              busy={busy}
+              onNext={start}
+            />
           )}
-
-          {!feedback && (
-            <div className="row">
-              <button className="primary" onClick={submit} disabled={busy !== null}>
-                {busy === "grading" ? "批改中…" : "送出"}
-              </button>
-            </div>
-          )}
-        </section>
-      )}
-
-      {feedback && !reading && (
-        <FeedbackPanel
-          feedback={feedback}
-          materials={materials}
-          materialId={materialId}
-          setMaterialId={setMaterialId}
-          busy={busy}
-          onNext={start}
-        />
+        </>
       )}
     </div>
   );
@@ -478,6 +584,125 @@ export default function Practice() {
 /** 跟後端 `wordforge_core::text::normalize` 對得上的比對鍵。 */
 function normalizeWord(raw: string): string {
   return raw.replace(/[^\p{L}\p{N}'-]/gu, "").toLowerCase();
+}
+
+/** 標題與字級調整。閱讀與克漏字共用。 */
+function PassageHeader({
+  title,
+  fontSize,
+  onFontSize,
+}: {
+  title: string;
+  fontSize: number;
+  onFontSize: (next: number) => void;
+}) {
+  return (
+    <div className="row title-row">
+      <h2>{title}</h2>
+      <span className="font-size">
+        <button
+          onClick={() => onFontSize(fontSize - FONT_STEP)}
+          disabled={fontSize <= FONT_MIN}
+          title="縮小文章字級"
+        >
+          A−
+        </button>
+        <span className="muted">{fontSize}px</span>
+        <button
+          onClick={() => onFontSize(fontSize + FONT_STEP)}
+          disabled={fontSize >= FONT_MAX}
+          title="放大文章字級"
+        >
+          A+
+        </button>
+      </span>
+    </div>
+  );
+}
+
+/**
+ * 送出按鈕。全部答完才能按。
+ *
+ * 漏掉一題送出去，批改會把它算成答錯，而那不是他的本意——
+ * 而且錯誤會被記進文法弱點，之後一直出那個文法點的題目。
+ */
+function SubmitRow({
+  unanswered,
+  busy,
+  onSubmit,
+  what,
+}: {
+  unanswered: number;
+  busy: string | null;
+  onSubmit: () => void;
+  what: string;
+}) {
+  return (
+    <div className="row submit-row">
+      <button
+        className="primary"
+        onClick={onSubmit}
+        disabled={busy !== null || unanswered > 0}
+      >
+        {busy === "grading" ? "批改中…" : "送出"}
+      </button>
+      {unanswered > 0 && (
+        <span className="muted">
+          還有 {unanswered} {what}沒作答
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** 克漏字的短文，空格處顯示編號或已填的字。 */
+function ClozePassage({
+  passage,
+  items,
+  choices,
+  feedback,
+  fontSize,
+}: {
+  passage: string;
+  items: { options: string[]; answer_index: number }[];
+  choices: (number | null)[];
+  feedback: Feedback | null;
+  fontSize: number;
+}) {
+  // 依 {{n}} 切開。用 split 保留分隔符，一次走完不必自己算位置。
+  const parts = useMemo(() => passage.split(new RegExp(BLANK_PATTERN.source, "g")), [passage]);
+
+  return (
+    <p className="passage" style={{ fontSize: `${fontSize}px` }}>
+      {parts.map((part, i) => {
+        // split 帶捕獲群組時，奇數索引是空格編號
+        if (i % 2 === 0) return <span key={i}>{part}</span>;
+
+        const n = Number(part);
+        const item = items[n - 1];
+        const picked = choices[n - 1];
+        const correct = item != null && picked === item.answer_index;
+        const filled = item != null && picked != null ? item.options[picked] : null;
+
+        return (
+          <span
+            key={i}
+            className={[
+              "blank",
+              filled ? "filled" : "",
+              feedback ? (correct ? "right" : "wrong") : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
+            <sup>{n}</sup>
+            {/* 批改後直接顯示正確答案，才對得起旁邊的解說 */}
+            {feedback && item ? item.options[item.answer_index] : (filled ?? "＿＿＿")}
+          </span>
+        );
+      })}
+    </p>
+  );
 }
 
 /** 點到的那個字的釋義，以及包含它的片語。 */
@@ -536,16 +761,31 @@ function WordNotes({
 /** 練習紀錄。做過的題目整份叫回來重做，批改照常走一次。 */
 function History({
   items,
+  total,
+  page,
   labels,
   disabled,
+  currentId,
+  onPage,
   onRedo,
+  onDelete,
 }: {
   items: ExerciseSummary[];
+  total: number;
+  page: number;
   labels: Record<ExerciseKind, string>;
   disabled: boolean;
+  currentId: number | null;
+  onPage: (page: number) => void;
   onRedo: (id: number) => void;
+  onDelete: (id: number) => void;
 }) {
-  if (items.length === 0) {
+  // 刪除要二次確認，但不用彈窗——按一下變成「確定刪除」，
+  // 按別的地方或再點一次別份就恢復
+  const [confirming, setConfirming] = useState<number | null>(null);
+  const pages = Math.max(1, Math.ceil(total / HISTORY_PAGE));
+
+  if (total === 0) {
     return (
       <section className="panel">
         <h2>練習紀錄</h2>
@@ -559,26 +799,61 @@ function History({
       <h2>練習紀錄</h2>
       <ul className="history">
         {items.map((it) => (
-          <li key={it.exercise_id}>
+          <li key={it.exercise_id} className={it.exercise_id === currentId ? "current" : ""}>
             <div>
               <span className="tag">{labels[it.kind] ?? it.kind}</span>
               <span className="history-title">{it.title}</span>
             </div>
             <div className="muted history-meta">
               {formatWhen(it.created_at)}
-              {it.score != null && `　·　${Math.round(it.score)} 分`}
-              {it.score == null && "　·　沒作答"}
+              {it.score != null ? `　·　${Math.round(it.score)} 分` : "　·　沒作答"}
               {it.coverage != null && `　·　覆蓋率 ${Math.round(it.coverage * 100)}%`}
             </div>
-            <button onClick={() => onRedo(it.exercise_id)} disabled={disabled}>
-              再做一次
-            </button>
+            <div className="history-actions">
+              <button onClick={() => onRedo(it.exercise_id)} disabled={disabled}>
+                再做一次
+              </button>
+              {confirming === it.exercise_id ? (
+                <>
+                  <button
+                    className="destructive"
+                    onClick={() => {
+                      setConfirming(null);
+                      onDelete(it.exercise_id);
+                    }}
+                    disabled={disabled}
+                  >
+                    確定刪除
+                  </button>
+                  <button onClick={() => setConfirming(null)}>取消</button>
+                </>
+              ) : (
+                <button onClick={() => setConfirming(it.exercise_id)} disabled={disabled}>
+                  刪除
+                </button>
+              )}
+            </div>
           </li>
         ))}
       </ul>
+
+      {pages > 1 && (
+        <div className="row pager">
+          <button onClick={() => onPage(page - 1)} disabled={page === 0 || disabled}>
+            上一頁
+          </button>
+          <span className="muted">
+            第 {page + 1} / {pages} 頁　·　共 {total} 份
+          </span>
+          <button onClick={() => onPage(page + 1)} disabled={page + 1 >= pages || disabled}>
+            下一頁
+          </button>
+        </div>
+      )}
+
       <p className="muted hint">
         重做的是同一份題目，不會再花一次出題的額度；送出後一樣由模型批改，
-        舊的那次批改也留著。
+        舊的那次批改也留著。刪掉的話那份題目與所有作答一起消失，沒有復原。
       </p>
     </section>
   );
@@ -626,7 +901,7 @@ function MaterialPicker({
   );
 }
 
-/** 批改結果。閱讀題擺在右欄，其他題型擺在下面。 */
+/** 批改結果。有文章的題型擺在右欄，其他擺在下面。 */
 function FeedbackPanel({
   feedback,
   materials,
@@ -714,12 +989,13 @@ function FeedbackPanel({
   );
 }
 
-/** 選擇題，閱讀測驗與文法練習共用。 */
+/** 選擇題，閱讀測驗、克漏字與文法練習共用。 */
 function Choices({
   items,
   choices,
   setChoices,
   feedback,
+  numbered = false,
 }: {
   items: {
     question: string;
@@ -731,12 +1007,15 @@ function Choices({
   choices: (number | null)[];
   setChoices: (fn: (c: (number | null)[]) => (number | null)[]) => void;
   feedback: Feedback | null;
+  /** 克漏字要標「第 N 格」才對得回文章裡的空格 */
+  numbered?: boolean;
 }) {
   return (
-    <ol className="questions">
+    <ol className={numbered ? "questions blanks" : "questions"}>
       {items.map((q, i) => (
         <li key={i}>
           <p className="prompt">
+            {numbered && <span className="blank-no">第 {i + 1} 格</span>}
             {q.question}
             {q.difficulty && (
               <span className={`tag difficulty ${q.difficulty}`}>

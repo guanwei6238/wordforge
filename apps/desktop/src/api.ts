@@ -800,7 +800,19 @@ export type ExerciseBody =
       new_words: NewWordHint[];
       questions: ChoiceItem[];
     }
+  | {
+      kind: "cloze";
+      title: string;
+      /** 挖好空格的短文，空格是 `{{1}}`、`{{2}}` */
+      passage: string;
+      translation: string | null;
+      /** 第 k 題對應 `{{k}}` 那一格 */
+      items: ChoiceItem[];
+    }
   | { kind: "choices"; items: ChoiceItem[] };
+
+/** 克漏字空格的標記，與 `wordforge_core::practice` 那一份對應。 */
+export const BLANK_PATTERN = /\{\{\s*(\d+)\s*\}\}/g;
 
 export interface ExerciseView {
   exercise_id: number;
@@ -891,11 +903,26 @@ export interface ExerciseSummary {
   title: string;
 }
 
+export interface ExercisePage {
+  items: ExerciseSummary[];
+  /** 全部有幾份，用來算頁數。少了它說不出「第 2 頁 / 共 7 頁」 */
+  total: number;
+}
+
 export function listExercises(
-  limit = 30,
+  limit = 10,
+  offset = 0,
   profileId = DEFAULT_PROFILE_ID,
-): Promise<ExerciseSummary[]> {
-  return invoke("list_exercises", { profileId, limit });
+): Promise<ExercisePage> {
+  return invoke("list_exercises", { profileId, limit, offset });
+}
+
+/** 刪掉一份練習紀錄，連同它的作答。回傳有沒有真的刪到。 */
+export function deleteExercise(
+  exerciseId: number,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<boolean> {
+  return invoke("delete_exercise", { profileId, exerciseId });
 }
 
 /** 取回一份做過的練習，原封不動再做一次。送出後照常由 LLM 批改。 */

@@ -214,6 +214,119 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
     }
 }
 
+/// 產生克漏字的規格。
+///
+/// 跟 `ReadingSpec` 一樣做成結構而不是一長串參數：這種
+/// 「六個 &str 加兩個 Option」的簽章，呼叫端很容易把兩個語言傳反，
+/// 而傳反的樣子是「題目語言不對」，跑起來完全不會報錯。
+#[derive(Debug, Clone, Copy)]
+pub struct ClozeSpec<'a> {
+    /// 學習的目標語言，如 "English"
+    pub target_lang: &'a str,
+    /// 學習者母語，用於解說與翻譯
+    pub native_lang: &'a str,
+    /// 短文長度（詞數）
+    pub word_count: usize,
+    /// 學習者的已知詞總量，讓模型抓得到程度
+    pub known_word_count: usize,
+    /// 已知詞抽樣，讓模型感受實際用字範圍
+    pub known_sample: &'a [String],
+    /// 要挖成空格的字。這些是他**已經學過**的字，不是生詞——
+    /// 克漏字考的是想不想得起來，放生詞會變成考閱讀。
+    pub blank_words: &'a [String],
+    pub topic: Option<&'a str>,
+    /// 自訂教材摘錄。有值時模型只能用這份材料的內容與用字。
+    pub material_excerpt: Option<&'a str>,
+}
+
+/// 克漏字出題。
+///
+/// ## 跟閱讀測驗的分工
+///
+/// 閱讀測驗是**輸入**：讀一篇有生詞的文章，考的是看不看得懂。
+/// 克漏字是**取用**：文章用他已經會的字寫，把該複習的字挖掉，
+/// 考的是在情境裡想不想得起來那個字。所以這裡不放生詞，
+/// 挖掉的都是今天該複習的字——填對一次就等於複習了一次。
+///
+/// 先前選「克漏字」拿到的是閱讀測驗，連存進資料庫的題型都寫成 reading。
+pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
+    let ClozeSpec {
+        target_lang,
+        native_lang,
+        word_count,
+        known_word_count,
+        known_sample,
+        blank_words,
+        topic,
+        material_excerpt,
+    } = *spec;
+
+    let system = format!(
+        "你是一位{target}教師，正在出克漏字練習。\n\
+         你只輸出 JSON，不輸出任何其他文字。",
+        target = target_lang
+    );
+
+    let n = blank_words.len();
+    let mut prompt = format!(
+        "# 學習者程度\n\
+         - 已掌握約 {known} 個{target}單字\n\
+         - 已知詞抽樣（僅供你感受用字範圍）：{sample}\n\n\
+         # 硬性要求\n\
+         1. 寫一篇約 {words} 個詞的{target}短文，內容連貫、有頭有尾。\n\
+         2. 除了要挖掉的字以外，**只用學習者已經會的字**。\n\
+            克漏字考的是「想不想得起來這個字」，不是「看不看得懂這篇」；\n\
+            旁邊出現生詞的話，答不出來就分不清是哪個原因。\n\
+         3. 下面這 {n} 個字各在文章裡用剛好一次，並且把它挖成空格：\n{words_list}\n\
+            空格寫成 {{{{1}}}}、{{{{2}}}}… 依序編號，編號要跟 items 的順序一致。\n\
+            **不要跳號、不要重複，也不要出現沒有對應題目的空格。**\n\
+         4. 每一格的空缺處要有足夠線索能推出答案：前後文、搭配詞、時態。\n\
+            四個選項都要是同一個詞類、看起來都放得進去，只有一個真的對。\n\
+            拿另外三個要挖的字互相當選項是不行的——那樣一格答錯會連累好幾格。\n\n",
+        known = known_word_count,
+        target = target_lang,
+        sample = known_sample.join("、"),
+        words = word_count,
+        n = n,
+        words_list = blank_words.join("、"),
+    );
+
+    if let Some(topic) = topic {
+        prompt.push_str(&format!("# 主題\n{topic}\n\n"));
+    }
+
+    if let Some(excerpt) = material_excerpt {
+        prompt.push_str(&format!(
+            "# 指定教材\n\
+             短文的情境、用字與句型**只能**取材自以下內容：\n---\n{excerpt}\n---\n\n"
+        ));
+    }
+
+    prompt.push_str(&format!(
+        "# 輸出格式\n\
+         只輸出這個 JSON 物件：\n\
+         {{\n\
+         \x20 \"title\": \"標題（用{target}）\",\n\
+         \x20 \"passage\": \"挖好空格的短文\",\n\
+         \x20 \"translation\": \"整篇的{native}翻譯，空格處填上正確答案再翻\",\n\
+         \x20 \"items\": [{{\"options\": [\"四個{target}選項\"], \"answer_index\": 0, \
+         \"explanation\": \"用{native}說明為什麼是這個字，以及其他選項為什麼放不進去\"}}]\n\
+         }}\n\
+         items 要剛好 {n} 題，第 k 題對應 {{{{k}}}} 那一格。\n\
+         explanation 提到別的選項時要引用它的內容，不要寫「選項 B」或「第二個」——\n\
+         選項的順序會被系統重新排過，那樣寫出來會對不上。",
+        target = target_lang,
+        native = native_lang,
+        n = n,
+    ));
+
+    ChatRequest {
+        system: Some(system),
+        messages: vec![Message::user(prompt)],
+        json_only: true,
+    }
+}
+
 /// AI 對話練習的 system prompt。
 ///
 /// 重點在「不要用學習者看不懂的字」與「糾錯但不打斷對話」之間取得平衡。
@@ -592,6 +705,24 @@ mod tests {
         }
     }
 
+    fn cloze_spec<'a>(
+        blank_words: &'a [String],
+        known_sample: &'a [String],
+        topic: Option<&'a str>,
+        excerpt: Option<&'a str>,
+    ) -> ClozeSpec<'a> {
+        ClozeSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            word_count: 120,
+            known_word_count: 2_000,
+            known_sample,
+            blank_words,
+            topic,
+            material_excerpt: excerpt,
+        }
+    }
+
     #[test]
     fn reading_prompt_states_a_concrete_unknown_budget() {
         let targets = sample_words();
@@ -791,6 +922,47 @@ mod tests {
         let text = &req.messages[0].content;
         assert!(text.contains("Lesson 3: My Family"));
         assert!(text.contains("不可引入教材以外的知識點"));
+    }
+
+    /// 這條測試存在的理由：選「克漏字」從來沒有真的出過克漏字——
+    /// `generate` 直接轉去閱讀測驗，連存進資料庫的題型都寫成 reading。
+    #[test]
+    fn cloze_blanks_the_words_that_are_due() {
+        let due = vec!["borrow".to_string(), "return".to_string()];
+        let known = sample_words();
+        let req = cloze_passage(&cloze_spec(&due, &known, None, None));
+        let text = &req.messages[0].content;
+
+        assert!(text.contains("borrow"));
+        assert!(text.contains("這 2 個字"), "{text}");
+        assert!(text.contains("{{1}}"), "沒有講清楚空格怎麼寫：{text}");
+        assert!(text.contains("剛好 2 題"), "題數要對得上空格數：{text}");
+        assert!(
+            text.contains("只用學習者已經會的字"),
+            "克漏字考的是想不想得起來，不是看不看得懂：{text}"
+        );
+        assert!(req.json_only);
+    }
+
+    #[test]
+    fn cloze_can_be_confined_to_a_material_and_a_topic() {
+        let due = vec!["weather".to_string()];
+        let known = sample_words();
+        let req = cloze_passage(&cloze_spec(
+            &due,
+            &known,
+            Some("旅行"),
+            Some("Lesson 3: At the market."),
+        ));
+        let text = &req.messages[0].content;
+        assert!(text.contains("旅行"));
+        assert!(text.contains("At the market."));
+
+        // 沒指定時整段不該出現，否則模型會看到一個空的「指定教材」
+        let free = cloze_passage(&cloze_spec(&due, &known, None, None));
+        let text = &free.messages[0].content;
+        assert!(!text.contains("指定教材"));
+        assert!(!text.contains("# 主題"));
     }
 
     #[test]

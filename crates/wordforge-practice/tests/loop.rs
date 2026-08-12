@@ -86,7 +86,7 @@ fn answer(
     use wordforge_practice::payload::ExerciseBody;
 
     let items = match &exercise.body {
-        ExerciseBody::Choices { items } => items,
+        ExerciseBody::Choices { items } | ExerciseBody::Cloze { items, .. } => items,
         ExerciseBody::Reading { questions, .. } => questions,
         ExerciseBody::Translation { .. } => panic!("翻譯題沒有選項可以挑"),
     };
@@ -1642,4 +1642,203 @@ async fn the_full_translation_is_kept_when_the_model_gives_one() {
         panic!("該是閱讀題");
     };
     assert_eq!(translation.as_deref(), None);
+}
+
+/// 這條測試存在的理由是它曾經整條是假的：選「克漏字」時
+/// `generate` 直接轉去 `generate_reading`，出來的是閱讀測驗，
+/// 連存進資料庫的 kind 都寫成 reading——練習紀錄於是也跟著說謊。
+#[tokio::test]
+async fn choosing_cloze_actually_produces_a_cloze() {
+    let (db, profile) = setup(&["borrow", "return", "weather"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for lemma in 1..=3 {
+        put_in_deck(&db, profile, lemma).await;
+    }
+
+    let llm = FakeLlm::new(&[r#"{"title":"A Rainy Day",
+        "passage":"I had to {{1}} an umbrella because the {{2}} was bad.",
+        "translation":"因為天氣很差，我得借一把傘。",
+        "items":[
+          {"options":["borrow","lend","buy","sell"],"answer_index":0,
+           "explanation":"跟別人借用 borrow"},
+          {"options":["weather","water","winter","wonder"],"answer_index":0,
+           "explanation":"講的是天氣"}
+        ]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Cloze), t0())
+        .await
+        .unwrap();
+
+    assert_eq!(exercise.kind, ExerciseKind::Cloze, "存進去的題型不對");
+
+    let wordforge_practice::payload::ExerciseBody::Cloze {
+        passage,
+        items,
+        translation,
+        ..
+    } = &exercise.body
+    else {
+        panic!("選了克漏字卻拿到別的題型：{:?}", exercise.body);
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(translation.as_deref(), Some("因為天氣很差，我得借一把傘。"));
+    assert_eq!(
+        wordforge_core::practice::blank_numbers(passage),
+        vec![1, 2],
+        "文章裡要真的有挖空"
+    );
+
+    // 出題的 prompt 要說清楚挖的是哪些字
+    let prompt = llm.last_prompt();
+    assert!(prompt.contains("borrow"), "{prompt}");
+    assert!(prompt.contains("只用學習者已經會的字"), "{prompt}");
+
+    // 資料庫裡存的 kind 也要是 cloze，練習紀錄才不會說謊
+    let kinds = wordforge_db::exercises::recent_kinds(&db, ProfileId(profile), 5)
+        .await
+        .unwrap();
+    assert_eq!(kinds, vec!["cloze"]);
+}
+
+/// 克漏字在本地判分，一次模型都不用打；答錯的那格的正確答案要排回複習。
+#[tokio::test]
+async fn a_missed_blank_goes_back_into_the_deck() {
+    let (db, profile) = setup(&["borrow", "return", "weather"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for lemma in 1..=3 {
+        put_in_deck(&db, profile, lemma).await;
+    }
+
+    let llm = FakeLlm::new(&[r#"{"title":"T",
+        "passage":"I had to {{1}} an umbrella because the {{2}} was bad.",
+        "items":[
+          {"options":["borrow","lend","buy","sell"],"answer_index":0},
+          {"options":["weather","water","winter","wonder"],"answer_index":0}
+        ]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Cloze), t0())
+        .await
+        .unwrap();
+
+    // 第一格對、第二格錯
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: answer(&exercise, &[Some(true), Some(false)]),
+                marked_unknown: vec![],
+            },
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 1, "批改克漏字不該再呼叫模型");
+    assert_eq!(feedback.score, Some(50.0));
+    assert_eq!(
+        feedback.unknown_words,
+        vec!["weather"],
+        "答錯的那格的正確答案該被當成「還沒真的會」"
+    );
+    assert!(
+        feedback.taught_words.is_empty(),
+        "挖空的是複習字，不是這篇新教的字"
+    );
+}
+
+/// 模型會跳號、會多給一題。空格與題目對不上時要截到共同的長度，
+/// 不然使用者會看到「有題目卻沒有空格」，而且判分照跑、錯得無聲無息。
+#[tokio::test]
+async fn extra_cloze_questions_without_a_blank_are_dropped() {
+    let (db, profile) = setup(&["borrow", "return"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for lemma in 1..=2 {
+        put_in_deck(&db, profile, lemma).await;
+    }
+
+    let llm = FakeLlm::new(&[r#"{"title":"T","passage":"Please {{1}} it back.",
+        "items":[
+          {"options":["return","borrow"],"answer_index":0},
+          {"options":["a","b"],"answer_index":0},
+          {"options":["c","d"],"answer_index":0}
+        ]}"#]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Cloze), t0())
+        .await
+        .unwrap();
+
+    let wordforge_practice::payload::ExerciseBody::Cloze { items, .. } = &exercise.body else {
+        panic!("該是克漏字");
+    };
+    assert_eq!(items.len(), 1, "只有一個空格，就只該留一題");
+}
+
+/// 克漏字不能把閱讀的生詞記憶沖掉。
+///
+/// 它的 target_words 是挖掉的**複習字**——那些他已經會了，本來就不在
+/// 生詞候選池裡，排除它們沒有任何作用，卻會佔掉記憶名額。
+/// 做幾題克漏字之後，下一篇閱讀就會拿回同一批生詞。
+#[tokio::test]
+async fn cloze_does_not_flush_the_reading_word_history() {
+    // 候選池要夠大，第二篇才有別的字可挑——池子被掏空時會走
+    // 「寧可重複也不能沒有生詞」那條退路，那樣就測不到記憶視窗了
+    let mut words = vec!["the", "cat", "sat", "borrow"];
+    let rare: Vec<String> = (0..12).map(|i| format!("rare{i:02}")).collect();
+    words.extend(rare.iter().map(|s| s.as_str()));
+
+    let (db, profile) = setup(&words).await;
+    set_vocabulary(&db, profile, 3_000).await;
+    for i in 0..12 {
+        make_rare(&db, 5 + i, 3_500 + i).await;
+    }
+    put_in_deck(&db, profile, 4).await;
+
+    let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat.",
+        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let cloze = r#"{"title":"C","passage":"Please {{1}} it.",
+        "items":[{"options":["borrow","lend"],"answer_index":0}]}"#;
+
+    let llm = FakeLlm::new(&[passage, cloze, cloze, cloze, cloze, cloze, passage]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let first = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+
+    // 中間穿插五題克漏字，剛好等於 NEW_WORD_MEMORY 的視窗
+    for i in 1..=5 {
+        engine
+            .generate(
+                profile,
+                Some(ExerciseKind::Cloze),
+                t0() + Duration::minutes(i),
+            )
+            .await
+            .unwrap();
+    }
+
+    let second = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::Reading),
+            t0() + Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+
+    for word in &second.target_words {
+        assert!(
+            !first.target_words.contains(word),
+            "{word} 上一篇才教過，克漏字把閱讀的歷史沖掉了"
+        );
+    }
 }

@@ -252,6 +252,37 @@ pub fn translation_count(vocabulary: i64) -> usize {
     if vocabulary < 500 { 3 } else { 5 }
 }
 
+// ------------------------------------------------------------------ 克漏字
+
+/// 克漏字挖空的標記。模型照這個格式寫，`{{1}}` 是第一格。
+///
+/// 用雙大括號而不是底線或 `___`：文章裡本來就可能有破折號或底線，
+/// 而且要知道「這一格是第幾題」才對得回選項。
+pub const BLANK_OPEN: &str = "{{";
+pub const BLANK_CLOSE: &str = "}}";
+
+/// 找出文章裡的挖空編號，依出現順序。
+///
+/// 模型常常漏掉一格、或編號從 0 開始、或跳號。呼叫端要拿這個結果去
+/// 對照題目數量——挖了三格卻給五題選項的話，多出來的兩題永遠答不到，
+/// 而使用者只會看到「怎麼有兩題沒有空格」。
+pub fn blank_numbers(passage: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut rest = passage;
+
+    while let Some(start) = rest.find(BLANK_OPEN) {
+        let after = &rest[start + BLANK_OPEN.len()..];
+        let Some(end) = after.find(BLANK_CLOSE) else {
+            break;
+        };
+        if let Ok(n) = after[..end].trim().parse::<usize>() {
+            out.push(n);
+        }
+        rest = &after[end + BLANK_CLOSE.len()..];
+    }
+    out
+}
+
 // ------------------------------------------------------------------ 選項洗牌
 
 /// 偽亂數（SplitMix64）。
@@ -550,6 +581,29 @@ mod tests {
     fn beginners_get_fewer_translation_items() {
         assert_eq!(translation_count(100), 3);
         assert_eq!(translation_count(3_000), 5);
+    }
+
+    #[test]
+    fn blanks_are_found_in_order() {
+        assert_eq!(blank_numbers("I {{1}} to the {{2}} yesterday."), vec![1, 2]);
+        assert_eq!(blank_numbers("沒有空格"), Vec::<usize>::new());
+    }
+
+    /// 模型會跳號、會漏掉、會多給。這裡只負責誠實回報看到什麼，
+    /// 要不要接受由呼叫端決定——自己偷偷補號會讓選項對到錯的空格。
+    #[test]
+    fn broken_numbering_is_reported_as_is() {
+        assert_eq!(blank_numbers("a {{1}} b {{3}} c"), vec![1, 3]);
+        assert_eq!(blank_numbers("a {{2}} b {{1}}"), vec![2, 1]);
+        assert_eq!(blank_numbers("a {{ 1 }} b"), vec![1], "容忍空白");
+    }
+
+    /// 沒收尾的標記不能讓解析卡住或吃掉後面的內容。
+    #[test]
+    fn an_unclosed_blank_does_not_hang() {
+        assert_eq!(blank_numbers("a {{1}} b {{2"), vec![1]);
+        assert_eq!(blank_numbers("{{}}"), Vec::<usize>::new());
+        assert_eq!(blank_numbers("{{abc}} {{2}}"), vec![2], "非數字略過");
     }
 
     fn options(xs: &[&str]) -> Vec<String> {

@@ -104,6 +104,12 @@ const NEW_WORD_MEMORY: i64 = 5;
 
 const TOPIC_MEMORY: i64 = 6;
 
+/// 一篇克漏字挖幾格。
+///
+/// 比閱讀的生詞多一點：這些字他已經會，挖八格不會讓文章變成謎語。
+/// 再多的話一篇短文會被打成蜂窩，前後文的線索反而不夠推出答案。
+const CLOZE_BLANKS: i64 = 8;
+
 pub struct PracticeEngine<'a> {
     db: &'a Db,
     llm: &'a dyn LlmProvider,
@@ -249,9 +255,8 @@ impl<'a> PracticeEngine<'a> {
                 self.generate_translation(profile_id, kind, &learner, now)
                     .await
             }
-            ExerciseKind::Reading | ExerciseKind::Cloze => {
-                self.generate_reading(profile_id, &learner, now).await
-            }
+            ExerciseKind::Reading => self.generate_reading(profile_id, &learner, now).await,
+            ExerciseKind::Cloze => self.generate_cloze(profile_id, &learner, now).await,
             ExerciseKind::Grammar => self.generate_grammar(profile_id, &learner, now).await,
         }
     }
@@ -363,10 +368,15 @@ impl<'a> PracticeEngine<'a> {
         let recent =
             // 只看會注入生詞的題型。不限的話中間穿插的文法題與翻譯題
             // 會佔掉記憶名額，把閱讀的歷史沖掉。
+            //
+            // **克漏字也不算**。它的 target_words 是挖掉的複習字——那些他
+            // 已經會了，本來就不在生詞候選池裡，排除它們沒有任何作用，
+            // 卻會佔掉五個記憶名額。做五題克漏字之後，下一篇閱讀就會
+            // 拿回六篇前的同一批生詞。
             exercises::recent_target_words(
                 self.db,
                 ProfileId(profile_id),
-                &[ExerciseKind::Reading.as_str(), ExerciseKind::Cloze.as_str()],
+                &[ExerciseKind::Reading.as_str()],
                 NEW_WORD_MEMORY,
             )
             .await?;
@@ -547,6 +557,130 @@ impl<'a> PracticeEngine<'a> {
         Err(PracticeError::BadResponse("重試後覆蓋率仍不合格".into()))
     }
 
+    /// 克漏字：用他已經會的字寫一篇短文，把今天該複習的字挖掉。
+    ///
+    /// 跟閱讀測驗相反——閱讀刻意放生詞考「看不看得懂」，
+    /// 克漏字整篇都是已知詞，考的是「在情境裡想不想得起來那個字」。
+    /// 所以這裡不做覆蓋率驗收（沒有生詞可驗），改成驗空格與題目對不對得上。
+    async fn generate_cloze(
+        &self,
+        profile_id: i64,
+        learner: &LearnerProfile,
+        now: OffsetDateTime,
+    ) -> Result<ExerciseView> {
+        // 挖「快忘掉的字」優先，補不夠再拿今天到期的。
+        // 逾期三週的字在句子裡再想起來一次，價值比剛好今天到期的高。
+        let mut blanks = cards::shaky_words(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            now,
+            CLOZE_BLANKS,
+        )
+        .await?;
+        for word in self.due_words(profile_id, CLOZE_BLANKS, now).await? {
+            if blanks.len() >= CLOZE_BLANKS as usize {
+                break;
+            }
+            if !blanks.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
+                blanks.push(word);
+            }
+        }
+
+        if blanks.is_empty() {
+            return Err(PracticeError::BadResponse(
+                "牌組裡還沒有可以拿來挖空的字，先去複習頁學幾個字再回來".into(),
+            ));
+        }
+
+        let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
+        let excerpt = self
+            .material_excerpt(&blanks, now.unix_timestamp() as u64)
+            .await?;
+
+        let recent_topics =
+            exercises::recent_topics(self.db, ProfileId(profile_id), TOPIC_MEMORY).await?;
+        let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
+        // 指定教材時取材範圍由課本決定，主題輪換就不該再插手
+        let topic = if excerpt.is_some() { "" } else { topic };
+
+        let req = prompts::cloze_passage(&prompts::ClozeSpec {
+            target_lang: self.target_name(),
+            native_lang: self.native_name(),
+            word_count: practice::reading_length(learner.vocabulary),
+            known_word_count: learner.vocabulary as usize,
+            known_sample: &known_sample,
+            blank_words: &blanks,
+            topic: (!topic.is_empty()).then_some(topic),
+            material_excerpt: excerpt.as_deref(),
+        });
+        let value = self.ask_json(profile_id, "generate", &req).await?;
+
+        let passage = value
+            .get("passage")
+            .and_then(|p| p.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let mut items: Vec<ChoiceItem> = value
+            .get("items")
+            .and_then(|i| i.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|i| serde_json::from_value(i.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 空格與題目一定要對得上。模型會跳號、會多給一題、會忘了挖空——
+        // 不檢查的話使用者會看到「有題目卻沒有空格」或反過來，
+        // 而且送出之後判分還是照跑，錯得無聲無息。
+        let numbers = practice::blank_numbers(&passage);
+        if numbers.is_empty() || items.is_empty() {
+            return Err(PracticeError::BadResponse("沒有產出挖空的文章".into()));
+        }
+        let usable = numbers.len().min(items.len());
+        if numbers != (1..=usable).collect::<Vec<_>>() || items.len() != usable {
+            tracing::warn!(
+                ?numbers,
+                items = items.len(),
+                "克漏字的空格與題目對不上，截到共同的長度"
+            );
+        }
+        items.truncate(usable);
+
+        shuffle_answers(&mut items, shuffle_seed(now));
+
+        let body = ExerciseBody::Cloze {
+            title: value
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("Cloze")
+                .to_string(),
+            passage,
+            translation: value
+                .get("translation")
+                .and_then(|t| t.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+            items,
+        };
+
+        // target_words 存的是挖掉的複習字，不是新教的字——
+        // 批改時 `injects_new_words` 因此不能把克漏字算進去。
+        self.store(
+            profile_id,
+            ExerciseKind::Cloze,
+            body,
+            blanks,
+            None,
+            Some(topic),
+            now,
+        )
+        .await
+    }
+
     async fn generate_grammar(
         &self,
         profile_id: i64,
@@ -624,6 +758,14 @@ impl<'a> PracticeEngine<'a> {
             } => {
                 self.grade_reading(profile_id, passage, questions, input)
                     .await?
+            }
+            // 克漏字在本地判分就夠了：答案是選出來的，對錯沒有模糊空間。
+            // 答錯的那幾個字要排回複習——挖空的本來就是他該複習的字，
+            // 填不出來就是「還沒真的會」，比到期時間更直接的證據。
+            ExerciseBody::Cloze { items, .. } => {
+                let mut fb = grade_choices(items, input);
+                fb.unknown_words = missed_words(items, input);
+                fb
             }
             ExerciseBody::Choices { items } => grade_choices(items, input),
         };
@@ -887,6 +1029,7 @@ impl<'a> PracticeEngine<'a> {
             // 這類題目的 corrections 是本地判分產生的，內容與 items 重複，
             // 兩邊都記會讓同一次錯誤算成兩次。
             ExerciseBody::Choices { items }
+            | ExerciseBody::Cloze { items, .. }
             | ExerciseBody::Reading {
                 questions: items, ..
             } => {
@@ -1196,6 +1339,19 @@ impl<'a> PracticeEngine<'a> {
             coverage,
         })
     }
+}
+
+/// 克漏字答錯的那幾格，正確答案是哪個字。
+///
+/// 這些字會被排回複習：挖空的本來就是他該複習的字，填不出來就是
+/// 「還沒真的會」——比排程算出來的到期時間更直接的證據。
+fn missed_words(items: &[ChoiceItem], input: &GradeInput) -> Vec<String> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, item)| input.choices.get(*i).copied().flatten() != Some(item.answer_index))
+        .filter_map(|(_, item)| item.options.get(item.answer_index).cloned())
+        .collect()
 }
 
 /// 洗牌的亂源。

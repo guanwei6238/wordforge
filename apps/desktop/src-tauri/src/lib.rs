@@ -1164,7 +1164,7 @@ fn summarize(payload_json: &str) -> String {
 
     use wordforge_practice::payload::ExerciseBody::*;
     let raw = match &body {
-        Reading { title, .. } => title.clone(),
+        Reading { title, .. } | Cloze { title, .. } => title.clone(),
         Choices { items } => items
             .first()
             .map(|i| i.question.clone())
@@ -1186,32 +1186,61 @@ fn summarize(payload_json: &str) -> String {
     }
 }
 
-/// 做過的練習，新的在前。
+/// 一頁的練習紀錄。
+///
+/// 帶著 `total` 一起回傳：少了它，UI 只知道「這頁有幾筆」，
+/// 說不出「第 2 頁 / 共 7 頁」，也不知道最後一頁是不是到了。
+#[derive(Debug, Serialize)]
+pub struct ExercisePage {
+    pub items: Vec<ExerciseSummary>,
+    pub total: i64,
+}
+
+/// 做過的練習，新的在前。`offset` 用來翻頁。
 #[tauri::command]
 async fn list_exercises(
     state: tauri::State<'_, AppState>,
     profile_id: i64,
     limit: i64,
-) -> CmdResult<Vec<ExerciseSummary>> {
+    offset: i64,
+) -> CmdResult<ExercisePage> {
+    let pid = ProfileId(profile_id);
     let records =
-        wordforge_db::exercises::recent(&state.db, ProfileId(profile_id), limit.clamp(1, 200))
-            .await?;
+        wordforge_db::exercises::recent(&state.db, pid, limit.clamp(1, 200), offset.max(0)).await?;
 
-    Ok(records
-        .into_iter()
-        .map(|r| ExerciseSummary {
-            exercise_id: r.id,
-            kind: r.kind,
-            created_at: r.created_at,
-            coverage: r.coverage,
-            score: r
-                .feedback_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                .and_then(|v| v.get("score").and_then(|s| s.as_f64())),
-            title: summarize(&r.payload_json),
-        })
-        .collect())
+    Ok(ExercisePage {
+        items: records
+            .into_iter()
+            .map(|r| ExerciseSummary {
+                exercise_id: r.id,
+                kind: r.kind,
+                created_at: r.created_at,
+                coverage: r.coverage,
+                score: r
+                    .feedback_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                    .and_then(|v| v.get("score").and_then(|s| s.as_f64())),
+                title: summarize(&r.payload_json),
+            })
+            .collect(),
+        total: wordforge_db::exercises::count(&state.db, pid).await?,
+    })
+}
+
+/// 刪掉一份練習紀錄，連同它的作答。回傳有沒有真的刪到。
+#[tauri::command]
+async fn delete_exercise(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    exercise_id: i64,
+) -> CmdResult<bool> {
+    Ok(wordforge_db::exercises::delete(
+        &state.db,
+        ProfileId(profile_id),
+        wordforge_db::exercises::ExerciseId(exercise_id),
+    )
+    .await?)
 }
 
 /// 取回一份做過的練習，原封不動地再做一次。
@@ -1474,6 +1503,7 @@ pub fn run() {
             generate_exercise,
             grade_exercise,
             list_exercises,
+            delete_exercise,
             load_exercise,
             reset_progress,
             search_words,

@@ -23,7 +23,8 @@ pub struct TranslationItem {
 /// 一題選擇題（閱讀理解與文法練習共用）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChoiceItem {
-    #[serde(alias = "prompt")]
+    /// 題目。克漏字沒有題幹（題目就是那個空格），所以可以是空的。
+    #[serde(alias = "prompt", default)]
     pub question: String,
     pub options: Vec<String>,
     pub answer_index: usize,
@@ -66,6 +67,20 @@ pub enum ExerciseBody {
         #[serde(default)]
         new_words: Vec<NewWord>,
         questions: Vec<ChoiceItem>,
+    },
+    /// 克漏字：一篇用已知詞寫的短文，把該複習的字挖掉。
+    ///
+    /// 跟 `Reading` 分開而不是共用：兩者考的東西相反——閱讀考「看不看得懂」，
+    /// 克漏字考「想不想得起來」，所以文章的用字原則、要不要放生詞、
+    /// 怎麼批改都不一樣。共用一個型別只會讓每個分支都在問「這是哪一種」。
+    Cloze {
+        title: String,
+        /// 挖好空格的短文，空格是 `{{1}}`、`{{2}}`
+        passage: String,
+        #[serde(default)]
+        translation: Option<String>,
+        /// 第 k 題對應 `{{k}}` 那一格
+        items: Vec<ChoiceItem>,
     },
     Choices {
         items: Vec<ChoiceItem>,

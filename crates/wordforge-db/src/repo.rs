@@ -107,8 +107,9 @@ pub mod profiles {
                 desired_retention: 0.9,
                 // 0.96 落在「最適」區間中央：讀得動，又每篇都有幾個新字
                 reading_coverage: 0.96,
-                // 內文預設 16px，文章要盯著看比較久，放大一級
-                reading_font_size: 18,
+                // 跟介面其他文字一樣大。兩欄版面下再放大會讓一行放不了
+                // 幾個字，要一直換行反而更累；想大想小都自己按 A± 調。
+                reading_font_size: 16,
             }
         }
     }

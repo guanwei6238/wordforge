@@ -97,16 +97,47 @@ pub async fn get(db: &Db, id: ExerciseId) -> Result<Option<ExerciseRecord>> {
     Ok(row.as_ref().map(row_to_record))
 }
 
-/// 最近做過的練習，新的在前。
-pub async fn recent(db: &Db, profile_id: ProfileId, limit: i64) -> Result<Vec<ExerciseRecord>> {
+/// 最近做過的練習，新的在前。`offset` 用來翻頁。
+pub async fn recent(
+    db: &Db,
+    profile_id: ProfileId,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ExerciseRecord>> {
     let rows = sqlx::query(&format!(
-        "{SELECT_EXERCISE} WHERE e.profile_id = ? ORDER BY e.created_at DESC LIMIT ?"
+        "{SELECT_EXERCISE} WHERE e.profile_id = ?
+         ORDER BY e.created_at DESC, e.id DESC LIMIT ? OFFSET ?"
     ))
     .bind(profile_id.0)
     .bind(limit)
+    .bind(offset.max(0))
     .fetch_all(db.pool())
     .await?;
     Ok(rows.iter().map(row_to_record).collect())
+}
+
+/// 一共有幾份練習。分頁要靠它才說得出「第 2 頁 / 共 7 頁」。
+pub async fn count(db: &Db, profile_id: ProfileId) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT COUNT(*) FROM exercise WHERE profile_id = ?")
+            .bind(profile_id.0)
+            .fetch_one(db.pool())
+            .await?,
+    )
+}
+
+/// 刪掉一份練習，連同它的作答紀錄（`attempt` 會 CASCADE）。
+///
+/// 綁 `profile_id` 而不是只用 id：這個參數從前端傳進來，
+/// 少了這個條件就能刪到別人的練習。回傳有沒有真的刪到。
+pub async fn delete(db: &Db, profile_id: ProfileId, id: ExerciseId) -> Result<bool> {
+    let affected = sqlx::query("DELETE FROM exercise WHERE id = ? AND profile_id = ?")
+        .bind(id.0)
+        .bind(profile_id.0)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+    Ok(affected > 0)
 }
 
 /// 最近用過的情境主題，新的在後。用來輪換，避免每篇文章都在講校園生活。
@@ -482,7 +513,66 @@ mod tests {
     async fn a_fresh_profile_has_no_history() {
         let (db, profile) = setup().await;
         assert!(recent_kinds(&db, profile, 5).await.unwrap().is_empty());
-        assert!(recent(&db, profile, 5).await.unwrap().is_empty());
+        assert!(recent(&db, profile, 5, 0).await.unwrap().is_empty());
         assert!(recent_topics(&db, profile, 5).await.unwrap().is_empty());
+        assert_eq!(count(&db, profile).await.unwrap(), 0);
+    }
+
+    /// 分頁不能重複也不能漏掉。同一秒建立的練習用 id 當第二排序鍵，
+    /// 否則 SQLite 的順序不保證穩定，翻頁時同一份會出現兩次。
+    #[tokio::test]
+    async fn paging_walks_every_exercise_exactly_once() {
+        let (db, profile) = setup().await;
+        for _ in 0..7 {
+            add(&db, profile, "reading", t0()).await;
+        }
+
+        assert_eq!(count(&db, profile).await.unwrap(), 7);
+
+        let mut seen = Vec::new();
+        for page in 0..3 {
+            let ids: Vec<i64> = recent(&db, profile, 3, page * 3)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            seen.extend(ids);
+        }
+
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 7, "翻頁時有練習重複或漏掉");
+    }
+
+    /// 刪練習要連作答一起走，而且不能刪到別的 profile 的。
+    #[tokio::test]
+    async fn deleting_an_exercise_takes_its_attempts_with_it() {
+        let (db, profile) = setup().await;
+        let id = add(&db, profile, "reading", t0()).await;
+        record_attempt(&db, id, "{}", Some(80.0), "{}", t0())
+            .await
+            .unwrap();
+
+        let other = profiles::create(&db, "別人", "zh-TW", "en", t0())
+            .await
+            .unwrap();
+        assert!(
+            !delete(&db, other, id).await.unwrap(),
+            "別的 profile 不該刪得掉"
+        );
+        assert!(get(&db, id).await.unwrap().is_some());
+
+        assert!(delete(&db, profile, id).await.unwrap());
+        assert!(get(&db, id).await.unwrap().is_none());
+
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attempt")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(attempts, 0, "作答紀錄應該隨著練習一起 CASCADE");
+
+        // 已經不存在的再刪一次不該報錯，只要說「沒刪到」
+        assert!(!delete(&db, profile, id).await.unwrap());
     }
 }
