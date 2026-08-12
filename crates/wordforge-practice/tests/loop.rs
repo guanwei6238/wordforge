@@ -1267,3 +1267,89 @@ async fn a_baseline_still_enforces_the_coverage_rule() {
 
     assert_eq!(llm.call_count(), 3, "有基準就該重試到上限");
 }
+
+/// 連續出兩篇文章，生詞不能一模一樣。
+///
+/// 生詞是照詞頻決定性挑出來的，而且**不會自動進牌組**——使用者讀完
+/// 從上下文看懂了、沒標記任何字，那些字就留在候選池裡。沒有輪換的話
+/// 第二篇會拿到完全相同的六個字。
+#[tokio::test]
+async fn consecutive_articles_teach_different_new_words() {
+    let mut words: Vec<String> = vec!["the".into(), "cat".into(), "sat".into()];
+    // 一批夠大的候選，讓輪換有東西可換
+    for i in 0..60 {
+        words.push(format!("newword{i}"));
+    }
+    let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    let (db, profile) = setup(&refs).await;
+    set_vocabulary(&db, profile, 3_000).await;
+
+    // 前三個當已知詞，其餘推到詞彙量之外當生詞候選
+    for i in 4..=words.len() as i64 {
+        make_rare(&db, i, 3_500 + i).await;
+    }
+
+    let passage = r#"{"title":"T","passage":"The cat sat.",
+        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let llm = FakeLlm::new(&[passage, passage, passage, passage, passage, passage]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let first = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap()
+        .target_words;
+    let second = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::Reading),
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .target_words;
+
+    assert!(!first.is_empty(), "第一篇要有生詞");
+    let overlap: Vec<&String> = second.iter().filter(|w| first.contains(w)).collect();
+    assert!(
+        overlap.is_empty(),
+        "第二篇又教了同樣的字：{overlap:?}\n第一篇 {first:?}\n第二篇 {second:?}"
+    );
+}
+
+/// 候選被排光時寧可重複，也不能一個生詞都不給。
+///
+/// 沒有生詞的文章覆蓋率會衝到 99%，那就回到當初「整篇沒東西可學」的問題。
+#[tokio::test]
+async fn a_drained_pool_repeats_rather_than_giving_none() {
+    let (db, profile) = setup(&["the", "cat", "sat", "solitary"]).await;
+    set_vocabulary(&db, profile, 3_000).await;
+    make_rare(&db, 4, 3_500).await;
+
+    let passage = r#"{"title":"T","passage":"The cat sat.",
+        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let llm = FakeLlm::new(&[passage, passage, passage, passage, passage, passage]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let first = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap()
+        .target_words;
+    let second = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::Reading),
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .target_words;
+
+    assert_eq!(first, vec!["solitary"]);
+    assert_eq!(
+        second,
+        vec!["solitary"],
+        "只有一個候選時要重複給，不能給空的"
+    );
+}

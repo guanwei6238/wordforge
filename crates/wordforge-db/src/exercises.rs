@@ -123,6 +123,38 @@ pub async fn recent_topics(db: &Db, profile_id: ProfileId, limit: i64) -> Result
     Ok(rows.into_iter().rev().collect())
 }
 
+/// 最近幾次出題教過的生詞。
+///
+/// ## 為什麼需要這個
+///
+/// 生詞是照詞頻決定性地挑出來的，而且**不會自動進牌組**——使用者讀完
+/// 文章、從上下文看懂了、沒有標記任何字，那些字就永遠留在候選池裡。
+/// 下一篇文章於是拿到一模一樣的六個字。
+///
+/// 排除最近教過的就會自然輪換。用歷史而不是亂數：亂數可能連續兩篇
+/// 抽到同一個字，而且「教過的字隔幾篇再出現一次」本來就是我們要的
+/// ——那是間隔重複，不是缺陷。
+pub async fn recent_target_words(
+    db: &Db,
+    profile_id: ProfileId,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT target_lemmas_json FROM exercise
+         WHERE profile_id = ? ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(profile_id.0)
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .flatten()
+        .collect())
+}
+
 /// 最近做過的題型，用來避免連續出同一種。
 pub async fn recent_kinds(db: &Db, profile_id: ProfileId, limit: i64) -> Result<Vec<String>> {
     let rows: Vec<String> = sqlx::query_scalar(
@@ -205,6 +237,43 @@ mod tests {
         assert_eq!(got.target_words, vec!["apple"]);
         assert_eq!(got.coverage, Some(0.96));
         assert_eq!(got.feedback_json, None, "還沒作答");
+    }
+
+    /// 生詞是決定性挑出來的，而且不會自動進牌組——沒有這個查詢的話
+    /// 每一篇文章都會拿到一模一樣的字。
+    #[tokio::test]
+    async fn recent_target_words_come_back_across_exercises() {
+        let (db, profile) = setup().await;
+
+        for (i, words) in [vec!["alpha", "beta"], vec!["gamma"]]
+            .into_iter()
+            .enumerate()
+        {
+            create(
+                &db,
+                NewExercise {
+                    profile_id: profile,
+                    kind: "reading",
+                    payload_json: "{}",
+                    target_words: &words.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+                    coverage: None,
+                    model: None,
+                    material_id: None,
+                    topic: None,
+                },
+                t0() + time::Duration::minutes(i as i64),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut recent = recent_target_words(&db, profile, 5).await.unwrap();
+        recent.sort();
+        assert_eq!(recent, vec!["alpha", "beta", "gamma"]);
+
+        // 只看最近一篇時，更早的字要能重新被挑到
+        let latest = recent_target_words(&db, profile, 1).await.unwrap();
+        assert_eq!(latest, vec!["gamma"]);
     }
 
     #[tokio::test]

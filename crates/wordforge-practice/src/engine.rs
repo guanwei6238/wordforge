@@ -95,6 +95,13 @@ const NEW_WORD_POOL: i64 = 400;
 /// 與這一批，句子會開始像清單。六個是能自然寫進一篇短文的量。
 const REVIEW_WORDS: i64 = 6;
 
+/// 挑生詞時要避開最近幾篇教過的字。
+///
+/// 五篇乘上每篇六到十四個字，大約是 30～70 個字的記憶。夠讓輪換看得出來，
+/// 又不會久到把整個候選池鎖死——而且隔幾篇再遇到同一個字是好事，
+/// 那就是間隔重複。
+const NEW_WORD_MEMORY: i64 = 5;
+
 const TOPIC_MEMORY: i64 = 6;
 
 pub struct PracticeEngine<'a> {
@@ -350,8 +357,26 @@ impl<'a> PracticeEngine<'a> {
             NEW_WORD_POOL,
         )
         .await?;
+        // 排掉最近幾篇教過的。生詞不會自動進牌組，所以沒有這一步的話
+        // 每一篇都會拿到一模一樣的字——實測確認過。
+        let recent =
+            exercises::recent_target_words(self.db, ProfileId(profile_id), NEW_WORD_MEMORY).await?;
+        let fresh: Vec<practice::NewWord> = candidates
+            .iter()
+            .filter(|c| !recent.iter().any(|r| r == &c.text))
+            .cloned()
+            .collect();
+
+        // 候選被排光的話寧可重複也不能沒有生詞——沒有生詞的文章
+        // 覆蓋率會衝到 99%，那就回到當初的問題了
+        let pool = if fresh.is_empty() {
+            &candidates
+        } else {
+            &fresh
+        };
+
         let target_words: Vec<String> =
-            practice::balance_by_pos(&candidates, practice::DESIRED_POS, budget)
+            practice::balance_by_pos(pool, practice::DESIRED_POS, budget)
                 .into_iter()
                 .map(|w| w.text)
                 .collect();
