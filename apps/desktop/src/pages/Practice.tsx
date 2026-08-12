@@ -16,7 +16,10 @@ import {
   getStudySettings,
   gradeExercise,
   languageName,
+  type GrammarView,
+  isGrammarKnown,
   listExercises,
+  listGrammar,
   listMaterials,
   loadExercise,
   type Material,
@@ -73,6 +76,9 @@ export default function Practice() {
   const [showHistory, setShowHistory] = useState(false);
   // 解析階段點到的字，顯示釋義用
   const [lookup, setLookup] = useState<string | null>(null);
+  // 文法題要練哪一個點。空字串＝從今天到期的弱點裡挑（隨機）
+  const [grammarPoints, setGrammarPoints] = useState<GrammarView[]>([]);
+  const [grammarFocus, setGrammarFocus] = useState<string>("");
 
   const refresh = useCallback(async () => {
     try {
@@ -105,6 +111,9 @@ export default function Practice() {
       .catch(() => {});
     void getStudySettings()
       .then((s) => setFontSize(s.reading_font_size))
+      .catch(() => {});
+    void listGrammar()
+      .then(setGrammarPoints)
       .catch(() => {});
   }, [refresh]);
 
@@ -156,7 +165,7 @@ export default function Practice() {
     setBusy("generating");
     setError(null);
     try {
-      present(await generateExercise(kind, materialId));
+      present(await generateExercise(kind, materialId, grammarFocus || null));
       await refreshHistory(historyPage);
     } catch (e) {
       setError(errorMessage(e));
@@ -300,6 +309,30 @@ export default function Practice() {
                 ))}
               </select>
             </label>
+            {/* 文法題才有意義：要練哪一個點。
+                「隨機」是讓 FSRS 排程決定，「指定」是使用者自己挑。 */}
+            {(kind === "grammar" ||
+              (kind === "auto" && status.recommended === "grammar")) &&
+              grammarPoints.length > 0 && (
+                <label>
+                  練哪個文法
+                  <select
+                    value={grammarFocus}
+                    onChange={(e) => setGrammarFocus(e.target.value)}
+                    disabled={busy !== null}
+                  >
+                    <option value="">隨機（從該複習的挑）</option>
+                    {grammarPoints
+                      .filter((g) => g.state != null)
+                      .map((g) => (
+                        <option key={g.point} value={g.point}>
+                          {g.name}
+                          {isGrammarKnown(g) ? "（已學會）" : ""}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              )}
             {materials.length > 0 && (
               <MaterialPicker
                 materials={materials}

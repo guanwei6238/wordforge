@@ -21,8 +21,8 @@ use crate::{ChatRequest, Message};
 ///
 /// 沒有清單的語言只能請它自己保持一致。這是誠實的作法：
 /// 硬套英文的 articles、gerund-infinitive 去標日文的錯誤只會產生垃圾資料。
-fn grammar_point_rule(target_lang: &str) -> String {
-    match wordforge_core::grammar_points::prompt_list(target_lang) {
+fn grammar_point_rule(points: &[String]) -> String {
+    match wordforge_core::grammar_points::prompt_list(points) {
         Some(list) => format!(
             "**只能從下面這份清單挑一個**：{list}。\n\
              清單以外的說法一律不接受——這些標籤會累積成長期的弱點紀錄，\n\
@@ -352,6 +352,66 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
     }
 }
 
+/// 講解一個文法點：給學習者看的說明與例句。
+///
+/// ## 為什麼由模型生成
+///
+/// 沒有可以直接匯入的開源文法書——查過的來源要嘛授權不明（資料來自
+/// 商業網站的 GitHub repo），要嘛是標註規範而不是教材（Universal
+/// Dependencies）。所以「教學內容」這一格一開始是空的。
+///
+/// 讓模型當場講解、存進資料庫、之後可以自己編輯，是唯一不需要使用者
+/// 先找到資料才能開始學的做法。生成過一次就存起來，不會每次開頁都重打。
+///
+/// `known_word_count` 讓它把例句控制在學習者讀得懂的範圍——
+/// 用一堆生字寫出來的例句，讀的人根本看不出文法點在哪。
+pub fn grammar_explanation(
+    target_lang: &str,
+    native_lang: &str,
+    point: &str,
+    name: &str,
+    known_word_count: usize,
+    example_count: usize,
+) -> ChatRequest {
+    let system = format!("你是一位{target_lang}教師，正在替學習者講解一個文法點。你只輸出 JSON。");
+
+    let prompt = format!(
+        "# 要講解的文法點\n\
+         識別碼：{point}\n\
+         名稱：{name}\n\n\
+         # 學習者\n\
+         母語是{native_lang}，已掌握約 {known} 個{target_lang}單字。\n\n\
+         # 講解要求\n\
+         - 用{native_lang}講，講給「知道這個文法存在但用不好」的人聽。\n\
+         - 先講**什麼時候用**，再講怎麼構成。規則背得出來卻用不對，\n\
+           通常是因為沒人講過使用時機。\n\
+         - 點出母語是{native_lang}的人最容易在這裡犯的錯，並說為什麼。\n\
+         - 三到五段，不要寫成教科書的條列大綱。\n\
+         - **不要**把整個文法體系搬過來。只講這一個點。\n\n\
+         # 例句要求\n\
+         - {n} 個{target_lang}例句，日常、自然、單獨看也成立。\n\
+         - 用字控制在他讀得懂的範圍：一句話裡有三個生字的話，\n\
+           他會忙著查字典，根本看不出文法點在哪。\n\
+         - 每句附{native_lang}翻譯。\n\
+         - 例句之間要有變化（不同人稱、不同時態、肯定與否定），\n\
+           不要五句都是同一個句型換名詞。\n\n\
+         # 輸出格式\n\
+         只輸出這個 JSON 物件：\n\
+         {{\n\
+         \x20 \"explanation\": \"{native_lang}講解\",\n\
+         \x20 \"examples\": [{{\"text\": \"{target_lang}例句\", \"translation\": \"{native_lang}翻譯\"}}]\n\
+         }}",
+        known = known_word_count,
+        n = example_count,
+    );
+
+    ChatRequest {
+        system: Some(system),
+        messages: vec![Message::user(prompt)],
+        json_only: true,
+    }
+}
+
 /// AI 對話練習的 system prompt。
 ///
 /// 重點在「不要用學習者看不懂的字」與「糾錯但不打斷對話」之間取得平衡。
@@ -391,6 +451,7 @@ pub fn conversation_system(
 pub fn writing_feedback(
     target_lang: &str,
     native_lang: &str,
+    points: &[String],
     task: &str,
     submission: &str,
 ) -> ChatRequest {
@@ -399,7 +460,7 @@ pub fn writing_feedback(
         target = target_lang
     );
 
-    let points = grammar_point_rule(target_lang);
+    let points = grammar_point_rule(points);
     let prompt = format!(
         "# 題目\n{task}\n\n\
          # 學習者的作答\n{submission}\n\n\
@@ -430,6 +491,7 @@ pub fn writing_feedback(
 pub fn grammar_drill(
     target_lang: &str,
     native_lang: &str,
+    points: &[String],
     weak_points: &[String],
     known_sample: &[String],
     question_count: usize,
@@ -470,7 +532,7 @@ pub fn grammar_drill(
          {notes}",
         n = question_count,
         native = native_lang,
-        points = grammar_point_rule(target_lang),
+        points = grammar_point_rule(points),
         notes = option_notes_rule(native_lang),
     ));
 
@@ -492,6 +554,7 @@ pub fn translation_feedback(
     direction_to_target: bool,
     items: &[(String, String)],
     known_weak_points: &[String],
+    points: &[String],
 ) -> ChatRequest {
     let system = format!("你是一位{target_lang}老師，正在批改翻譯練習。你只輸出 JSON。");
 
@@ -527,7 +590,7 @@ pub fn translation_feedback(
         )
     };
 
-    let points = grammar_point_rule(target_lang);
+    let points = grammar_point_rule(points);
     let prompt = format!(
         "# 練習方向\n{direction}\n\n{history}# 作答\n{body}\n\
          # 批改要求\n\
@@ -771,6 +834,14 @@ pub fn coverage_retry(
 mod tests {
     use super::*;
 
+    /// 英文的受控清單。實際使用時來自 `grammar_def` 資料表。
+    fn english_points() -> Vec<String> {
+        wordforge_core::grammar_points::seed_for("en")
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
     fn sample_words() -> Vec<String> {
         ["cat", "run", "happy"]
             .iter()
@@ -990,7 +1061,16 @@ mod tests {
             reading_comprehension(&spec(&targets, &known, None)).messages[0]
                 .content
                 .clone(),
-            grammar_drill("English", "繁體中文", &weak, &known, 5, None).messages[0]
+            grammar_drill(
+                "English",
+                "繁體中文",
+                &english_points(),
+                &weak,
+                &known,
+                5,
+                None,
+            )
+            .messages[0]
                 .content
                 .clone(),
             cloze_passage(&cloze_spec(&due, &known, None, None)).messages[0]
@@ -1114,6 +1194,31 @@ mod tests {
         assert!(!text.contains("# 主題"));
     }
 
+    /// 沒有可以直接匯入的開源文法書，所以講解由模型生成。
+    /// 例句的用字要控制在他讀得懂的範圍——一句話三個生字的話，
+    /// 他會忙著查字典，根本看不出文法點在哪。
+    #[test]
+    fn a_grammar_explanation_is_pitched_at_the_learner() {
+        let req = grammar_explanation("English", "繁體中文", "conditionals", "條件句", 2_000, 4);
+        let text = &req.messages[0].content;
+
+        assert!(text.contains("conditionals"));
+        assert!(text.contains("條件句"));
+        assert!(text.contains("2000 個English單字"), "{text}");
+        assert!(text.contains("4 個English例句"), "{text}");
+        assert!(
+            text.contains("先講**什麼時候用**"),
+            "規則背得出來卻用不對，通常是沒人講過使用時機：{text}"
+        );
+        assert!(
+            text.contains("最容易在這裡犯的錯"),
+            "要針對母語者的難點：{text}"
+        );
+        assert!(text.contains("\"explanation\""));
+        assert!(text.contains("\"examples\""));
+        assert!(req.json_only);
+    }
+
     #[test]
     fn conversation_prompt_caps_vocabulary_and_defines_correction_style() {
         let p = conversation_system("English", "繁體中文", 800, Some("A2"), None);
@@ -1128,6 +1233,7 @@ mod tests {
         let req = writing_feedback(
             "English",
             "繁體中文",
+            &english_points(),
             "描述你的週末",
             "I go to park yesterday.",
         );
@@ -1145,13 +1251,29 @@ mod tests {
     fn grammar_drill_targets_recorded_weaknesses() {
         let weak = vec!["past tense".to_string(), "articles".to_string()];
         let known = sample_words();
-        let req = grammar_drill("English", "繁體中文", &weak, &known, 5, None);
+        let req = grammar_drill(
+            "English",
+            "繁體中文",
+            &english_points(),
+            &weak,
+            &known,
+            5,
+            None,
+        );
         let text = &req.messages[0].content;
         assert!(text.contains("past tense"));
         assert!(text.contains("出 5 題"));
 
         // 沒有弱點紀錄時要有合理的退路
-        let fallback = grammar_drill("English", "繁體中文", &[], &known, 3, None);
+        let fallback = grammar_drill(
+            "English",
+            "繁體中文",
+            &english_points(),
+            &[],
+            &known,
+            3,
+            None,
+        );
         assert!(fallback.messages[0].content.contains("基礎綜合練習"));
     }
 
@@ -1174,7 +1296,7 @@ mod tests {
             ),
             ("他很勤奮".to_string(), String::new()),
         ];
-        let req = translation_feedback("English", "繁體中文", true, &items, &[]);
+        let req = translation_feedback("English", "繁體中文", true, &items, &[], &english_points());
         let text = &req.messages[0].content;
 
         assert!(text.contains("I go to park yesterday"), "要帶上實際作答");
@@ -1188,7 +1310,8 @@ mod tests {
     #[test]
     fn translation_feedback_states_the_other_direction() {
         let items = vec![("The weather is nice".to_string(), "天氣很好".to_string())];
-        let req = translation_feedback("English", "繁體中文", false, &items, &[]);
+        let req =
+            translation_feedback("English", "繁體中文", false, &items, &[], &english_points());
         assert!(req.messages[0].content.contains("English → 繁體中文"));
     }
 
@@ -1198,13 +1321,21 @@ mod tests {
         let items = vec![("我昨天去了公園".to_string(), "I go to park".to_string())];
         let weak = vec!["tense".to_string(), "articles".to_string()];
 
-        let with_history = translation_feedback("English", "繁體中文", true, &items, &weak);
+        let with_history = translation_feedback(
+            "English",
+            "繁體中文",
+            true,
+            &items,
+            &weak,
+            &english_points(),
+        );
         let text = &with_history.messages[0].content;
         assert!(text.contains("tense"), "沒有帶上既有的弱點");
         assert!(text.contains("重複出現"), "沒有要求指出這是老毛病");
 
         // 沒有紀錄時不該憑空生出一段空白的「常犯的錯」
-        let fresh = translation_feedback("English", "繁體中文", true, &items, &[]);
+        let fresh =
+            translation_feedback("English", "繁體中文", true, &items, &[], &english_points());
         assert!(!fresh.messages[0].content.contains("常犯的錯"));
     }
 

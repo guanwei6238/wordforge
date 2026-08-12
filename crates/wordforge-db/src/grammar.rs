@@ -333,3 +333,329 @@ mod tests {
         assert!(all_points(&db, profile).await.unwrap().is_empty());
     }
 }
+
+// ---------------------------------------------------------------- 文法點的定義
+
+/// 一個文法點的定義：名稱、講解、例句。
+///
+/// 跟 [`GrammarPoint`]（掌握狀態）分開：定義是教材，狀態是每個人自己的。
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct GrammarDef {
+    #[serde(default)]
+    pub id: i64,
+    pub lang: String,
+    /// 受控識別碼，與 `grammar_point.point` 對應
+    pub point: String,
+    /// 給使用者看的名稱，用母語寫
+    pub name: String,
+    /// 母語講解。`None` 表示還沒講解過。
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub examples: Vec<GrammarExample>,
+    /// 難度標示，由來源決定（CEFR 的 A2、JLPT 的 N4…）
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub sort_order: i64,
+    /// seed（程式碼種子）/ import（匯入）/ manual（自己加）
+    #[serde(default)]
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct GrammarExample {
+    /// 目標語的例句
+    pub text: String,
+    /// 母語翻譯
+    #[serde(default)]
+    pub translation: Option<String>,
+}
+
+fn row_to_def(row: &sqlx::sqlite::SqliteRow) -> GrammarDef {
+    let examples: String = row.get("examples_json");
+    GrammarDef {
+        id: row.get("id"),
+        lang: row.get("lang"),
+        point: row.get("point"),
+        name: row.get("name"),
+        explanation: row.get("explanation"),
+        // 例句壞掉不該讓整頁打不開——那是附加內容，不是主線
+        examples: serde_json::from_str(&examples).unwrap_or_default(),
+        level: row.get("level"),
+        sort_order: row.get("sort_order"),
+        origin: row.get("origin"),
+    }
+}
+
+const SELECT_DEF: &str = "SELECT id, lang, point, name, explanation, examples_json,
+    level, sort_order, origin FROM grammar_def";
+
+/// 某個語言的全部文法點定義，照 `sort_order` 排。
+pub async fn list_defs(db: &Db, lang: &str) -> Result<Vec<GrammarDef>> {
+    let rows = sqlx::query(&format!(
+        "{SELECT_DEF} WHERE lang = ? ORDER BY sort_order, point"
+    ))
+    .bind(lang)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows.iter().map(row_to_def).collect())
+}
+
+/// 只要識別碼。出題與正規化用得到，不必把講解一起撈出來。
+pub async fn list_points(db: &Db, lang: &str) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT point FROM grammar_def WHERE lang = ? ORDER BY sort_order, point",
+    )
+    .bind(lang)
+    .fetch_all(db.pool())
+    .await?)
+}
+
+pub async fn get_def(db: &Db, lang: &str, point: &str) -> Result<Option<GrammarDef>> {
+    let row = sqlx::query(&format!("{SELECT_DEF} WHERE lang = ? AND point = ?"))
+        .bind(lang)
+        .bind(point)
+        .fetch_optional(db.pool())
+        .await?;
+    Ok(row.as_ref().map(row_to_def))
+}
+
+/// 新增或更新一個定義。回傳它的 id。
+///
+/// `(lang, point)` 是主鍵：同一個識別碼重複匯入會覆蓋，不會長出兩筆。
+/// **講解與例句只在有給的時候才覆蓋**——匯入一份只有名稱的清單，
+/// 不該把使用者辛苦生成的講解洗掉。
+pub async fn upsert_def(db: &Db, def: &GrammarDef, now: OffsetDateTime) -> Result<i64> {
+    let point = def.point.trim();
+    let name = def.name.trim();
+    if point.is_empty() || name.is_empty() {
+        return Err(crate::DbError::Invalid(
+            "文法點的識別碼與名稱不能是空的".into(),
+        ));
+    }
+
+    let examples = serde_json::to_string(&def.examples).unwrap_or_else(|_| "[]".into());
+    let ts = ts::to_sql(now);
+
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO grammar_def
+             (lang, point, name, explanation, examples_json, level, sort_order, origin,
+              created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+         ON CONFLICT (lang, point) DO UPDATE SET
+             name          = excluded.name,
+             -- 只在新的有內容時才覆蓋：匯入一份只有名稱的清單，
+             -- 不該把已經生成好的講解洗掉
+             explanation   = COALESCE(NULLIF(excluded.explanation, ''), grammar_def.explanation),
+             examples_json = CASE WHEN excluded.examples_json = '[]'
+                                  THEN grammar_def.examples_json
+                                  ELSE excluded.examples_json END,
+             level         = COALESCE(excluded.level, grammar_def.level),
+             sort_order    = excluded.sort_order,
+             updated_at    = excluded.updated_at
+         RETURNING id",
+    )
+    .bind(&def.lang)
+    .bind(point)
+    .bind(name)
+    .bind(def.explanation.as_deref())
+    .bind(&examples)
+    .bind(def.level.as_deref())
+    .bind(def.sort_order)
+    .bind(if def.origin.is_empty() {
+        "manual"
+    } else {
+        &def.origin
+    })
+    .bind(&ts)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(id)
+}
+
+/// 刪掉一個定義。**不動掌握狀態**——`grammar_point` 那邊的排程與對錯
+/// 次數是學習歷史，刪掉一份教材不該把它抹掉。
+pub async fn delete_def(db: &Db, lang: &str, point: &str) -> Result<bool> {
+    let affected = sqlx::query("DELETE FROM grammar_def WHERE lang = ? AND point = ?")
+        .bind(lang)
+        .bind(point)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+    Ok(affected > 0)
+}
+
+/// 第一次使用某個語言時，把程式碼裡的種子寫進資料表。
+///
+/// 已經有定義的語言原樣不動——使用者編輯過或匯入過之後，
+/// 再跑一次不該把他的東西蓋掉。回傳這次寫了幾筆。
+///
+/// 沒有種子的語言（日文、法文…）回傳 0，文法頁會是空的並提示匯入。
+/// 那是誠實的：硬套英文的分類只會產生垃圾資料。
+pub async fn seed_defs(db: &Db, lang: &str, now: OffsetDateTime) -> Result<usize> {
+    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grammar_def WHERE lang = ?")
+        .bind(lang)
+        .fetch_one(db.pool())
+        .await?;
+    if existing > 0 {
+        return Ok(0);
+    }
+
+    let seed = wordforge_core::grammar_points::seed_for(lang);
+    for (i, (point, name)) in seed.iter().enumerate() {
+        upsert_def(
+            db,
+            &GrammarDef {
+                id: 0,
+                lang: lang.to_string(),
+                point: (*point).to_string(),
+                name: (*name).to_string(),
+                explanation: None,
+                examples: Vec::new(),
+                level: None,
+                sort_order: i as i64,
+                origin: "seed".into(),
+            },
+            now,
+        )
+        .await?;
+    }
+    Ok(seed.len())
+}
+
+#[cfg(test)]
+mod def_tests {
+    use super::*;
+    use crate::repo::profiles;
+
+    fn t0() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+    }
+
+    async fn setup() -> Db {
+        let db = Db::open_in_memory().await.unwrap();
+        profiles::create(&db, "我", "zh-TW", "en", t0())
+            .await
+            .unwrap();
+        db
+    }
+
+    fn def(point: &str, name: &str) -> GrammarDef {
+        GrammarDef {
+            id: 0,
+            lang: "en".into(),
+            point: point.into(),
+            name: name.into(),
+            explanation: None,
+            examples: Vec::new(),
+            level: None,
+            sort_order: 0,
+            origin: "manual".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn definitions_round_trip_with_their_examples() {
+        let db = setup().await;
+        let mut d = def("conditionals", "條件句");
+        d.explanation = Some("第二類條件句用來講與現在事實相反的假設。".into());
+        d.examples = vec![GrammarExample {
+            text: "If I had more time, I would learn Japanese.".into(),
+            translation: Some("如果我有更多時間，我會學日文。".into()),
+        }];
+        upsert_def(&db, &d, t0()).await.unwrap();
+
+        let got = get_def(&db, "en", "conditionals").await.unwrap().unwrap();
+        assert_eq!(got.name, "條件句");
+        assert_eq!(got.examples.len(), 1);
+        assert_eq!(
+            got.examples[0].translation.as_deref(),
+            Some("如果我有更多時間，我會學日文。")
+        );
+    }
+
+    /// 這條測試存在的理由：匯入一份只有名稱的清單，不該把使用者
+    /// 辛苦生成的講解與例句洗掉。那種資料沒有備份，洗掉就沒了。
+    #[tokio::test]
+    async fn a_bare_import_does_not_wipe_an_existing_explanation() {
+        let db = setup().await;
+
+        let mut rich = def("tense", "時態");
+        rich.explanation = Some("AI 生成的講解".into());
+        rich.examples = vec![GrammarExample {
+            text: "I went there yesterday.".into(),
+            translation: None,
+        }];
+        upsert_def(&db, &rich, t0()).await.unwrap();
+
+        // 之後匯入一份只有名稱的清單
+        let mut bare = def("tense", "時態（新名稱）");
+        bare.origin = "import".into();
+        upsert_def(&db, &bare, t0()).await.unwrap();
+
+        let got = get_def(&db, "en", "tense").await.unwrap().unwrap();
+        assert_eq!(got.name, "時態（新名稱）", "名稱該更新");
+        assert_eq!(
+            got.explanation.as_deref(),
+            Some("AI 生成的講解"),
+            "講解被匯入洗掉了"
+        );
+        assert_eq!(got.examples.len(), 1, "例句被匯入洗掉了");
+    }
+
+    #[tokio::test]
+    async fn seeding_only_happens_once() {
+        let db = setup().await;
+
+        let first = seed_defs(&db, "en", t0()).await.unwrap();
+        assert!(first > 20, "英文種子應該有二十幾項，實際 {first}");
+
+        // 使用者編輯過
+        let mut edited = def("tense", "我自己改的名字");
+        edited.explanation = Some("我自己寫的".into());
+        upsert_def(&db, &edited, t0()).await.unwrap();
+
+        let second = seed_defs(&db, "en", t0()).await.unwrap();
+        assert_eq!(second, 0, "已經有資料就不該再種一次");
+
+        let got = get_def(&db, "en", "tense").await.unwrap().unwrap();
+        assert_eq!(got.name, "我自己改的名字", "使用者的編輯被種子蓋掉了");
+    }
+
+    /// 沒有種子的語言開箱是空的——硬套英文的分類只會產生垃圾資料。
+    #[tokio::test]
+    async fn a_language_without_a_seed_starts_empty() {
+        let db = setup().await;
+        assert_eq!(seed_defs(&db, "ja", t0()).await.unwrap(), 0);
+        assert!(list_defs(&db, "ja").await.unwrap().is_empty());
+    }
+
+    /// 刪掉定義不該抹掉學習歷史——那是使用者練出來的，教材是可替換的。
+    #[tokio::test]
+    async fn deleting_a_definition_keeps_the_learning_history() {
+        let db = setup().await;
+        let profile = ProfileId(1);
+        upsert_def(&db, &def("tense", "時態"), t0()).await.unwrap();
+
+        let scheduler = Scheduler::default();
+        record(&db, profile, "tense", false, &scheduler, t0())
+            .await
+            .unwrap();
+
+        assert!(delete_def(&db, "en", "tense").await.unwrap());
+        assert!(get_def(&db, "en", "tense").await.unwrap().is_none());
+
+        let points = all_points(&db, profile).await.unwrap();
+        assert_eq!(points.len(), 1, "掌握狀態被連帶刪掉了");
+        assert_eq!(points[0].error_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_definition_needs_an_identifier_and_a_name() {
+        let db = setup().await;
+        assert!(upsert_def(&db, &def("  ", "時態"), t0()).await.is_err());
+        assert!(upsert_def(&db, &def("tense", " "), t0()).await.is_err());
+    }
+}

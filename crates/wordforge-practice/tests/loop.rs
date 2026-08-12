@@ -2299,3 +2299,113 @@ async fn a_completely_unusable_response_is_an_error() {
         "錯誤訊息要說得出發生什麼事：{err}"
     );
 }
+
+/// 針對性練習：使用者指定要練哪個文法點時，出題就只練那一個。
+///
+/// 「隨機出目前會的」與「針對性練習」的差別全在這裡——前者讓 FSRS
+/// 排程決定要練什麼，後者由使用者自己挑。
+#[tokio::test]
+async fn a_chosen_grammar_point_is_the_one_that_gets_drilled() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    const ITEMS: &str = r#"{"items":[{"prompt":"a","options":["x","y"],
+        "option_notes":["n1","n2"],"answer_index":0,"grammar_point":"conditionals"}]}"#;
+    let llm = FakeLlm::new(&[ITEMS, ITEMS]);
+
+    // 指定：只練條件句
+    let focused = PracticeEngine::new(&db, &llm).with_grammar_focus(Some("conditionals".into()));
+    focused
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+    let prompt = llm.last_prompt();
+    assert!(
+        prompt.contains("conditionals"),
+        "指定的文法點沒有進 prompt：{prompt}"
+    );
+
+    // 不指定：沒有弱點紀錄時退回基礎綜合練習
+    let random = PracticeEngine::new(&db, &llm);
+    random
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+    assert!(
+        llm.last_prompt().contains("基礎綜合練習"),
+        "沒指定又沒有弱點時該退回綜合練習"
+    );
+}
+
+/// 文法點的受控清單來自資料庫，不是寫死的常數。
+///
+/// 這條測試存在的理由是它曾經是寫死的：學日文的人拿到空清單，
+/// 而且想加一個自己常錯的點沒有地方加。
+#[tokio::test]
+async fn the_controlled_list_comes_from_the_database() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    // 使用者自己加一個內建種子沒有的文法點
+    wordforge_db::grammar::upsert_def(
+        &db,
+        &wordforge_db::grammar::GrammarDef {
+            id: 0,
+            lang: "en".into(),
+            point: "tag-questions".into(),
+            name: "附加問句".into(),
+            explanation: None,
+            examples: Vec::new(),
+            level: None,
+            sort_order: 99,
+            origin: "manual".into(),
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let llm = FakeLlm::new(&[r#"{"items":[{"prompt":"a","options":["x","y"],
+        "option_notes":["n1","n2"],"answer_index":0}]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        prompt.contains("tag-questions"),
+        "使用者自己加的文法點沒有進 prompt 的受控清單：{prompt}"
+    );
+    assert!(prompt.contains("tense"), "種子的項目也要在");
+}
+
+/// 沒有種子的語言開箱是空的，prompt 退回「請自己保持一致」。
+/// 硬套英文的 articles、gerund-infinitive 去標日文只會產生垃圾資料。
+#[tokio::test]
+async fn a_language_without_grammar_definitions_falls_back_gracefully() {
+    let (db, profile) = setup_lang("ja", &["行く"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[{"prompt":"a","options":["x","y"],
+        "option_notes":["n1","n2"],"answer_index":0}]}"#]);
+    // 用 for_profile 讓語言從 profile 流下來，跟實際使用一致
+    let engine = PracticeEngine::for_profile(&db, &llm, profile)
+        .await
+        .unwrap();
+    engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        prompt.contains("請用一致的英文術語命名"),
+        "沒有清單時該退回「請自己保持一致」：{prompt}"
+    );
+    assert!(
+        !prompt.contains("gerund-infinitive"),
+        "英文的分類外洩到日文了：{prompt}"
+    );
+}

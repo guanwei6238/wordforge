@@ -116,6 +116,12 @@ const CLOZE_BLANKS: i64 = 8;
 /// 而且每一次都是一趟完整的呼叫，使用者已經在等了。
 const FORMAT_RETRIES: usize = 1;
 
+/// 講解一個文法點時附幾個例句。
+///
+/// 四個夠涵蓋不同人稱、時態、肯定與否定；再多就變成例句表，
+/// 而使用者是來理解一個規則的，不是來背句子的。
+const GRAMMAR_EXAMPLES: usize = 4;
+
 pub struct PracticeEngine<'a> {
     db: &'a Db,
     llm: &'a dyn LlmProvider,
@@ -131,6 +137,11 @@ pub struct PracticeEngine<'a> {
     /// 這個把模型綁死在使用者的課本上。考試只考課本，
     /// 模型講到課本以外的東西就是干擾。
     pub material_id: Option<MaterialId>,
+    /// 只練這一個文法點。`None` 就用今天到期的弱點。
+    ///
+    /// 「隨機出目前會的」與「針對性練習」的差別就在這裡：前者讓排程
+    /// 決定，後者由使用者指定。
+    pub grammar_focus: Option<String>,
 }
 
 impl<'a> PracticeEngine<'a> {
@@ -142,6 +153,7 @@ impl<'a> PracticeEngine<'a> {
             target_lang: "en".into(),
             native_lang: "zh-TW".into(),
             material_id: None,
+            grammar_focus: None,
         }
     }
 
@@ -164,12 +176,19 @@ impl<'a> PracticeEngine<'a> {
             target_lang: target,
             native_lang: native,
             material_id: None,
+            grammar_focus: None,
         })
     }
 
     /// 出題只能取材自這份教材。
     pub fn with_material(mut self, material_id: Option<i64>) -> Self {
         self.material_id = material_id.map(MaterialId);
+        self
+    }
+
+    /// 文法題只練這一個點。
+    pub fn with_grammar_focus(mut self, point: Option<String>) -> Self {
+        self.grammar_focus = point.filter(|p| !p.trim().is_empty());
         self
     }
 
@@ -729,14 +748,23 @@ impl<'a> PracticeEngine<'a> {
         learner: &LearnerProfile,
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
+        // 使用者指定了要練哪個文法點就練那個；沒指定就用今天到期的弱點
+        let wanted: Vec<String> = match &self.grammar_focus {
+            Some(point) => vec![point.clone()],
+            None => learner.weak_grammar.clone(),
+        };
+        let points = self.grammar_points(now).await?;
+
         let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
         let excerpt = self
-            .material_excerpt(&learner.weak_grammar, now.unix_timestamp() as u64)
+            .material_excerpt(&wanted, now.unix_timestamp() as u64)
             .await?;
+
         let mut req = prompts::grammar_drill(
             self.target_name(),
             self.native_name(),
-            &learner.weak_grammar,
+            &points,
+            &wanted,
             &known_sample,
             GRAMMAR_BATCH as usize,
             excerpt.as_deref(),
@@ -777,6 +805,57 @@ impl<'a> PracticeEngine<'a> {
             now,
         )
         .await
+    }
+
+    /// 請模型講解一個文法點，並把結果存進 `grammar_def`。
+    ///
+    /// ## 為什麼要存起來
+    ///
+    /// 沒有可以直接匯入的開源文法書，所以講解一開始是空的。生成一次就
+    /// 存下來：之後開這一頁不必再等模型，也不會每看一次燒一次額度。
+    /// 存下來還有一個好處——使用者可以自己編輯，模型講得不好就改掉。
+    pub async fn explain_grammar(
+        &self,
+        profile_id: i64,
+        point: &str,
+        now: OffsetDateTime,
+    ) -> Result<wordforge_db::grammar::GrammarDef> {
+        let Some(mut def) = grammar::get_def(self.db, &self.target_lang, point).await? else {
+            return Err(PracticeError::NotFound);
+        };
+
+        let learner = self.learner_profile(profile_id, now).await?;
+        let req = prompts::grammar_explanation(
+            self.target_name(),
+            self.native_name(),
+            &def.point,
+            &def.name,
+            learner.vocabulary as usize,
+            GRAMMAR_EXAMPLES,
+        );
+
+        let value = self.ask_json(profile_id, "explain", &req).await?;
+
+        let explanation = value
+            .get("explanation")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| PracticeError::BadResponse("沒有產出講解".into()))?;
+
+        def.explanation = Some(explanation.to_string());
+        def.examples = value
+            .get("examples")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        grammar::upsert_def(self.db, &def, now).await?;
+        Ok(def)
     }
 
     // ------------------------------------------------------------ 批改
@@ -907,12 +986,14 @@ impl<'a> PracticeEngine<'a> {
             })
             .collect();
 
+        let points = self.grammar_points(OffsetDateTime::now_utc()).await?;
         let req = prompts::translation_feedback(
             self.target_name(),
             self.native_name(),
             to_target,
             &pairs,
             weak_points,
+            &points,
         );
         let value = self.ask_json(profile_id, "grade", &req).await?;
         serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))
@@ -1068,12 +1149,23 @@ impl<'a> PracticeEngine<'a> {
     ///
     /// 模型即使被告知只能從清單挑，還是會偶爾寫成 `past tense` 或 `Articles`。
     /// 沒有這一步的話，同一個文法點會散成好幾個各自排程的標籤。
-    fn normalize_point(&self, raw: &str) -> Option<String> {
-        let normalized = wordforge_core::grammar_points::normalize_point(&self.target_lang, raw);
+    fn normalize_point(&self, points: &[String], raw: &str) -> Option<String> {
+        let normalized = wordforge_core::grammar_points::normalize_point(points, raw);
         if normalized.is_none() && !raw.trim().is_empty() {
             tracing::debug!(raw, "認不出來的文法標籤，略過");
         }
         normalized
+    }
+
+    /// 這個語言目前的受控文法點清單。
+    ///
+    /// 從 `grammar_def` 讀，不是寫死的常數——「匯入什麼就能學什麼」
+    /// 對文法跟對字典是同一個承諾。第一次讀到空的就把種子寫進去，
+    /// 讓英文開箱有東西可用；沒有種子的語言仍然是空的，
+    /// 那時 prompt 會退回「請自己保持一致」。
+    async fn grammar_points(&self, now: OffsetDateTime) -> Result<Vec<String>> {
+        grammar::seed_defs(self.db, &self.target_lang, now).await?;
+        Ok(grammar::list_points(self.db, &self.target_lang).await?)
     }
 
     /// 把這次的文法表現記進 FSRS。
@@ -1089,6 +1181,7 @@ impl<'a> PracticeEngine<'a> {
         now: OffsetDateTime,
     ) -> Result<()> {
         let pid = ProfileId(profile_id);
+        let points = self.grammar_points(now).await?;
 
         match body {
             // 選擇題知道每一題在考什麼，對錯都能記。
@@ -1103,7 +1196,7 @@ impl<'a> PracticeEngine<'a> {
                     let Some(point) = item
                         .grammar_point
                         .as_deref()
-                        .and_then(|p| self.normalize_point(p))
+                        .and_then(|p| self.normalize_point(&points, p))
                     else {
                         continue;
                     };
@@ -1121,7 +1214,7 @@ impl<'a> PracticeEngine<'a> {
                     let Some(point) = correction
                         .grammar_point
                         .as_deref()
-                        .and_then(|p| self.normalize_point(p))
+                        .and_then(|p| self.normalize_point(&points, p))
                     else {
                         continue;
                     };

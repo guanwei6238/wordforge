@@ -888,9 +888,11 @@ export function practiceStatus(profileId = DEFAULT_PROFILE_ID): Promise<Practice
 export function generateExercise(
   kind: ExerciseKind | "auto" = "auto",
   materialId: number | null = null,
+  /** 文法題只練這一個點。null 就用今天到期的弱點 */
+  grammarPoint: string | null = null,
   profileId = DEFAULT_PROFILE_ID,
 ): Promise<ExerciseView> {
-  return invoke("generate_exercise", { profileId, kind, materialId });
+  return invoke("generate_exercise", { profileId, kind, materialId, grammarPoint });
 }
 
 export function gradeExercise(
@@ -936,6 +938,115 @@ export function deleteExercise(
 /** 取回一份做過的練習，原封不動再做一次。送出後照常由 LLM 批改。 */
 export function loadExercise(exerciseId: number): Promise<ExerciseView> {
   return invoke("load_exercise", { exerciseId });
+}
+
+/* -------------------------------------------------------------------- 文法 */
+
+export interface GrammarExample {
+  /** 目標語的例句 */
+  text: string;
+  /** 母語翻譯 */
+  translation: string | null;
+}
+
+/**
+ * 一個文法點：定義加上「你學到哪」。
+ *
+ * 定義存在 `grammar_def`（可匯入、可編輯），掌握狀態存在 `grammar_point`
+ * （FSRS 排程）。兩者分開是刻意的——刪掉一份教材不該抹掉學習歷史。
+ */
+export interface GrammarView {
+  point: string;
+  name: string;
+  /** 還沒講解過就是 null */
+  explanation: string | null;
+  examples: GrammarExample[];
+  level: string | null;
+  /** seed（內建種子）/ import（匯入）/ manual（自己加） */
+  origin: string;
+  /** 還沒開始學就是 null */
+  state: CardState | null;
+  due: string | null;
+  error_count: number;
+  correct_count: number;
+  /** 記憶穩定度（天）。撐得過三週不複習就算「會了」 */
+  stability: number | null;
+}
+
+/** 撐得過這麼多天不複習就算「會了」，與詞彙量的定義一致。 */
+export const GRAMMAR_KNOWN_DAYS = 21;
+
+export function isGrammarKnown(g: GrammarView): boolean {
+  return (g.stability ?? 0) >= GRAMMAR_KNOWN_DAYS;
+}
+
+export function listGrammar(profileId = DEFAULT_PROFILE_ID): Promise<GrammarView[]> {
+  return invoke("list_grammar", { profileId });
+}
+
+/** 新增或編輯一個文法點。語言由 profile 決定，不用傳。 */
+export function saveGrammar(
+  def: {
+    point: string;
+    name: string;
+    explanation?: string | null;
+    examples?: GrammarExample[];
+    level?: string | null;
+    sort_order?: number;
+    origin?: string;
+  },
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<void> {
+  return invoke("save_grammar", {
+    profileId,
+    def: {
+      lang: "",
+      explanation: null,
+      examples: [],
+      level: null,
+      sort_order: 0,
+      origin: "manual",
+      ...def,
+    },
+  });
+}
+
+/** 刪掉一個文法點的定義。**不動掌握狀態**。 */
+export function deleteGrammar(
+  point: string,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<boolean> {
+  return invoke("delete_grammar", { profileId, point });
+}
+
+/** 請模型講解一個文法點，結果存進資料庫。要幾十秒。 */
+export function explainGrammar(
+  point: string,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<{ explanation: string | null; examples: GrammarExample[] }> {
+  return invoke("explain_grammar", { profileId, point });
+}
+
+/**
+ * 標記「我會了」或「還要練」。
+ *
+ * 走的是跟答題一樣的 FSRS 排程，所以自評與實際作答會匯流到同一個進度，
+ * 不會變成兩套互相打架的狀態。
+ */
+export function setGrammarKnown(
+  point: string,
+  known: boolean,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<void> {
+  return invoke("set_grammar_known", { profileId, point, known });
+}
+
+/** 匯入一份文法清單（JSON）。回傳寫進去幾筆。 */
+export function importGrammar(
+  path: string,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<number> {
+  return invoke("import_grammar", { profileId, path });
 }
 
 /* -------------------------------------------------------------------- 重置 */

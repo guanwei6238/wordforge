@@ -1,6 +1,7 @@
 import { useState } from "react";
 import Deck from "./pages/Deck";
 import Dictionary from "./pages/Dictionary";
+import Grammar from "./pages/Grammar";
 import Import from "./pages/Import";
 import Practice from "./pages/Practice";
 import Review from "./pages/Review";
@@ -10,6 +11,7 @@ import Welcome from "./components/Welcome";
 const TABS = [
   { id: "review", label: "複習" },
   { id: "dictionary", label: "字典" },
+  { id: "grammar", label: "文法" },
   { id: "practice", label: "練習" },
   { id: "deck", label: "牌組" },
   { id: "import", label: "匯入" },
@@ -54,6 +56,7 @@ export default function App() {
           </Welcome>
         )}
         {tab === "dictionary" && <Dictionary />}
+        {tab === "grammar" && <Grammar />}
         {practiceVisited && (
           <div hidden={tab !== "practice"}>
             <Practice />
