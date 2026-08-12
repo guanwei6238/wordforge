@@ -1138,6 +1138,124 @@ async fn grade_exercise(
         .await?)
 }
 
+/// 練習紀錄的一列。
+///
+/// 不把整份 payload 送過來：清單上要顯示的只有「什麼時候做了什麼、幾分」，
+/// 一次帶二十篇文章進 WebView 只是白費頻寬。要重做時再用
+/// `load_exercise` 取完整內容。
+#[derive(Debug, Serialize)]
+pub struct ExerciseSummary {
+    pub exercise_id: i64,
+    pub kind: String,
+    pub created_at: String,
+    pub coverage: Option<f64>,
+    /// 做過才有分數。`None` 代表出了題但沒作答（例如出到一半關掉）。
+    pub score: Option<f64>,
+    /// 閱讀題用文章標題，其他題型用第一題的開頭——清單上要認得出是哪一份
+    pub title: String,
+}
+
+/// 從題目內容擠出一個看得懂的標題。
+fn summarize(payload_json: &str) -> String {
+    let Ok(body) = serde_json::from_str::<wordforge_practice::payload::ExerciseBody>(payload_json)
+    else {
+        return "（內容讀不出來）".into();
+    };
+
+    use wordforge_practice::payload::ExerciseBody::*;
+    let raw = match &body {
+        Reading { title, .. } => title.clone(),
+        Choices { items } => items
+            .first()
+            .map(|i| i.question.clone())
+            .unwrap_or_default(),
+        Translation { items, .. } => items.first().map(|i| i.source.clone()).unwrap_or_default(),
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "（沒有標題）".into();
+    }
+    // 太長的一行會把清單撐開。用字元數而不是位元組——中文一個字三個位元組，
+    // 照位元組切會切在半個字中間。
+    let cut: String = trimmed.chars().take(40).collect();
+    if trimmed.chars().count() > 40 {
+        format!("{cut}…")
+    } else {
+        cut
+    }
+}
+
+/// 做過的練習，新的在前。
+#[tauri::command]
+async fn list_exercises(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    limit: i64,
+) -> CmdResult<Vec<ExerciseSummary>> {
+    let records =
+        wordforge_db::exercises::recent(&state.db, ProfileId(profile_id), limit.clamp(1, 200))
+            .await?;
+
+    Ok(records
+        .into_iter()
+        .map(|r| ExerciseSummary {
+            exercise_id: r.id,
+            kind: r.kind,
+            created_at: r.created_at,
+            coverage: r.coverage,
+            score: r
+                .feedback_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                .and_then(|v| v.get("score").and_then(|s| s.as_f64())),
+            title: summarize(&r.payload_json),
+        })
+        .collect())
+}
+
+/// 取回一份做過的練習，原封不動地再做一次。
+///
+/// 不重新出題：重做的價值就在於「同一份題目，這次答得比較好嗎」。
+/// 送出之後照常走批改，`attempt` 會多一筆，舊的那筆留著。
+#[tauri::command]
+async fn load_exercise(
+    state: tauri::State<'_, AppState>,
+    exercise_id: i64,
+) -> CmdResult<ExerciseView> {
+    let record =
+        wordforge_db::exercises::get(&state.db, wordforge_db::exercises::ExerciseId(exercise_id))
+            .await?
+            .ok_or_else(|| CommandError::new("找不到這份練習"))?;
+
+    let body: wordforge_practice::payload::ExerciseBody =
+        serde_json::from_str(&record.payload_json)
+            .map_err(|e| CommandError::new(format!("這份練習的內容讀不出來：{e}")))?;
+
+    Ok(ExerciseView {
+        exercise_id: record.id,
+        kind: parse_exercise_kind(&record.kind)?,
+        body,
+        target_words: record.target_words,
+        coverage: record.coverage,
+    })
+}
+
+/// 把這個 profile 的學習資料清空。
+///
+/// **不刪字典也不刪教材**：那是使用者自己匯入的外部資料，重匯一份
+/// Wiktionary 要好幾分鐘，而且跟「我想重新開始學」是兩件事。
+/// 前端必須先讓使用者確認過才呼叫這個。
+#[tauri::command]
+async fn reset_progress(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+) -> CmdResult<profiles::ResetSummary> {
+    let summary = profiles::reset_progress(&state.db, ProfileId(profile_id)).await?;
+    tracing::warn!(?summary, profile_id, "使用者重置了學習資料");
+    Ok(summary)
+}
+
 fn parse_exercise_kind(s: &str) -> CmdResult<wordforge_core::practice::ExerciseKind> {
     use wordforge_core::practice::ExerciseKind::*;
     Ok(match s {
@@ -1355,6 +1473,9 @@ pub fn run() {
             practice_status,
             generate_exercise,
             grade_exercise,
+            list_exercises,
+            load_exercise,
+            reset_progress,
             search_words,
             word_detail,
             dictionary_stats,

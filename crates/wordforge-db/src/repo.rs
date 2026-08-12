@@ -89,6 +89,12 @@ pub mod profiles {
         /// 生詞的數量由這個值反推——設 0.90 的話 300 字的文章
         /// 會有約 30 個生詞詞元，設 0.96 只有 12 個。
         pub reading_coverage: f64,
+        /// 閱讀測驗的文章字級（px）。
+        ///
+        /// 不做成「小/中/大」三段：合適的字級同時取決於螢幕、距離、
+        /// 視力與語言（漢字要比拉丁字母大才看得清楚筆畫），
+        /// 三段一定有人剛好卡在中間。存成數字，UI 給加減鈕。
+        pub reading_font_size: i64,
     }
 
     impl Default for StudySettings {
@@ -101,6 +107,8 @@ pub mod profiles {
                 desired_retention: 0.9,
                 // 0.96 落在「最適」區間中央：讀得動，又每篇都有幾個新字
                 reading_coverage: 0.96,
+                // 內文預設 16px，文章要盯著看比較久，放大一級
+                reading_font_size: 18,
             }
         }
     }
@@ -118,22 +126,36 @@ pub mod profiles {
                 // 低於 0.80 就不是「可理解輸入」而是查字典；
                 // 高於 0.99 等於整篇都會，讀了學不到東西
                 reading_coverage: self.reading_coverage.clamp(0.80, 0.99),
+                // 小於 12px 標點看不清楚，大於 32px 一行放不了幾個字，
+                // 眼睛要一直換行反而更累
+                reading_font_size: self.reading_font_size.clamp(12, 32),
             }
         }
     }
 
+    /// `study_settings` 從 JSON 撈回來的原始欄位。每個都可能是 NULL：
+    /// 舊的 profile 沒有新加的設定，缺的用預設值補。
+    type SettingsRow = (
+        Option<i64>,
+        Option<i64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i64>,
+    );
+
     pub async fn study_settings(db: &Db, profile_id: ProfileId) -> Result<StudySettings> {
-        let row: (Option<i64>, Option<i64>, Option<f64>, Option<f64>) = sqlx::query_as(
+        let row: SettingsRow = sqlx::query_as(
             "SELECT CAST(json_extract(settings_json, '$.new_per_day') AS INTEGER),
                     CAST(json_extract(settings_json, '$.max_reviews_per_day') AS INTEGER),
                     CAST(json_extract(settings_json, '$.desired_retention') AS REAL),
-                    CAST(json_extract(settings_json, '$.reading_coverage') AS REAL)
+                    CAST(json_extract(settings_json, '$.reading_coverage') AS REAL),
+                    CAST(json_extract(settings_json, '$.reading_font_size') AS INTEGER)
              FROM profile WHERE id = ? AND json_valid(settings_json)",
         )
         .bind(profile_id.0)
         .fetch_optional(db.pool())
         .await?
-        .unwrap_or((None, None, None, None));
+        .unwrap_or((None, None, None, None, None));
 
         let d = StudySettings::default();
         Ok(StudySettings {
@@ -141,6 +163,7 @@ pub mod profiles {
             max_reviews_per_day: row.1.unwrap_or(d.max_reviews_per_day),
             desired_retention: row.2.unwrap_or(d.desired_retention),
             reading_coverage: row.3.unwrap_or(d.reading_coverage),
+            reading_font_size: row.4.unwrap_or(d.reading_font_size),
         }
         .clamped())
     }
@@ -159,17 +182,118 @@ pub mod profiles {
                      '$.new_per_day', ?,
                      '$.max_reviews_per_day', ?,
                      '$.desired_retention', ?,
-                     '$.reading_coverage', ?)
+                     '$.reading_coverage', ?,
+                     '$.reading_font_size', ?)
              WHERE id = ?",
         )
         .bind(s.new_per_day)
         .bind(s.max_reviews_per_day)
         .bind(s.desired_retention)
         .bind(s.reading_coverage)
+        .bind(s.reading_font_size)
         .bind(profile_id.0)
         .execute(db.pool())
         .await?;
         Ok(s)
+    }
+
+    /// 重置清掉了多少東西。UI 要說得出「刪了幾張卡、幾份練習」，
+    /// 不然使用者按完只看到畫面變空，不知道發生了什麼。
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+    pub struct ResetSummary {
+        pub cards: i64,
+        pub reviews: i64,
+        pub exercises: i64,
+        pub attempts: i64,
+        pub grammar_points: i64,
+        pub llm_calls: i64,
+    }
+
+    /// 把這個 profile 的學習資料清空，回到剛安裝的狀態。
+    ///
+    /// ## 刪什麼、不刪什麼
+    ///
+    /// 刪：卡片、複習歷程、練習與批改、文法弱點、用量統計、對話，
+    /// 以及 `settings_json` 裡的一切（含分級測驗估出來的詞彙量）。
+    ///
+    /// **不刪字典，也不刪教材**。那兩樣是使用者自己匯入的外部資料，
+    /// 重匯一份 Wiktionary 要好幾分鐘，而且跟「我想重新開始學」無關。
+    /// 想清掉字典的話那是「重新匯入」，不是「重置進度」。
+    ///
+    /// 在同一個交易裡做完：中途失敗會留下卡片還在但練習沒了的半殘狀態，
+    /// 那比不刪更糟。
+    pub async fn reset_progress(db: &Db, profile_id: ProfileId) -> Result<ResetSummary> {
+        let mut tx = db.pool().begin().await?;
+
+        // 先數再刪。刪完就數不到了，而且 review_log / attempt 是靠
+        // CASCADE 連帶刪掉的，`rows_affected` 根本看不到它們。
+        let cards: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM card WHERE profile_id = ?")
+            .bind(profile_id.0)
+            .fetch_one(&mut *tx)
+            .await?;
+        let reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM review_log r
+             JOIN card c ON c.id = r.card_id WHERE c.profile_id = ?",
+        )
+        .bind(profile_id.0)
+        .fetch_one(&mut *tx)
+        .await?;
+        let exercises: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM exercise WHERE profile_id = ?")
+                .bind(profile_id.0)
+                .fetch_one(&mut *tx)
+                .await?;
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attempt a
+             JOIN exercise e ON e.id = a.exercise_id WHERE e.profile_id = ?",
+        )
+        .bind(profile_id.0)
+        .fetch_one(&mut *tx)
+        .await?;
+        let grammar_points: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM grammar_point WHERE profile_id = ?")
+                .bind(profile_id.0)
+                .fetch_one(&mut *tx)
+                .await?;
+        let llm_calls: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM llm_call WHERE profile_id = ?")
+                .bind(profile_id.0)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        // review_log 隨 card、attempt 隨 exercise、message 隨 conversation
+        // 一起 CASCADE 掉，不必也不該自己刪。
+        for table in [
+            "card",
+            "exercise",
+            "grammar_point",
+            "llm_call",
+            "conversation",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE profile_id = ?"))
+                .bind(profile_id.0)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // 設定整份清掉，包含分級測驗的估計值與每日額度。
+        // 只挑幾個 key 刪的話，之後新加的設定會被漏掉——而漏掉的樣子是
+        // 「重置了但某個舊值還在」，很難查。
+        sqlx::query("UPDATE profile SET settings_json = '{}' WHERE id = ?")
+            .bind(profile_id.0)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(ResetSummary {
+            cards,
+            reviews,
+            exercises,
+            attempts,
+            grammar_points,
+            llm_calls,
+        })
     }
 
     /// 這個 profile 在學什麼語言、母語是什麼。
@@ -2038,6 +2162,95 @@ mod tests {
         assert_eq!(new_today, 3);
     }
 
+    /// 重置要真的把學習資料清乾淨，但**不能碰字典與教材**——
+    /// 那兩樣是使用者自己匯入的外部資料，重匯一份 Wiktionary 要好幾分鐘。
+    #[tokio::test]
+    async fn resetting_clears_the_learning_data_but_spares_the_dictionary() {
+        let (db, profile) = setup().await;
+        seed_new_cards(&db, profile, 3).await;
+
+        // 複習一張，留下 review_log
+        let queue = cards::daily_queue(&db, profile, t0(), t0(), 10, 200)
+            .await
+            .unwrap();
+        let (next, log) = Scheduler::default().review(&queue[0], Rating::Good, t0(), None);
+        cards::record_review(&db, &next, &log).await.unwrap();
+
+        // 一份做過的練習
+        let exercise = crate::exercises::create(
+            &db,
+            crate::exercises::NewExercise {
+                profile_id: profile,
+                kind: "reading",
+                payload_json: "{}",
+                target_words: &[],
+                coverage: None,
+                model: None,
+                material_id: None,
+                topic: None,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+        crate::exercises::record_attempt(&db, exercise, "{}", Some(80.0), "{}", t0())
+            .await
+            .unwrap();
+
+        profiles::update_study_settings(
+            &db,
+            profile,
+            profiles::StudySettings {
+                new_per_day: 42,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let lemmas_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lemma")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        let summary = profiles::reset_progress(&db, profile).await.unwrap();
+        assert_eq!(summary.cards, 3);
+        assert_eq!(summary.reviews, 1, "複習歷程也要數進去");
+        assert_eq!(summary.exercises, 1);
+        assert_eq!(summary.attempts, 1);
+
+        for table in ["card", "exercise", "grammar_point", "llm_call"] {
+            let left: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE profile_id = ?"
+            ))
+            .bind(profile.0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(left, 0, "{table} 沒清乾淨");
+        }
+        // CASCADE 沒生效的話會留下孤兒
+        for table in ["review_log", "attempt"] {
+            let left: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(left, 0, "{table} 應該隨著上層一起被 CASCADE 掉");
+        }
+
+        assert_eq!(
+            profiles::study_settings(&db, profile).await.unwrap(),
+            profiles::StudySettings::default(),
+            "設定要回到預設，包含分級測驗估的詞彙量"
+        );
+
+        let lemmas_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lemma")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(lemmas_after, lemmas_before, "字典被誤刪了");
+    }
+
     #[tokio::test]
     async fn languages_come_from_the_profile() {
         let (db, profile) = setup().await;
@@ -2091,6 +2304,7 @@ mod tests {
                 max_reviews_per_day: 0,
                 desired_retention: 1.5,
                 reading_coverage: 2.0,
+                reading_font_size: 400,
             },
         )
         .await
@@ -2100,6 +2314,7 @@ mod tests {
         assert_eq!(s.max_reviews_per_day, 10);
         assert!((s.desired_retention - 0.97).abs() < 1e-9);
         assert!((s.reading_coverage - 0.99).abs() < 1e-9);
+        assert_eq!(s.reading_font_size, 32, "字級太大一行放不了幾個字");
 
         // 存進去的也必須是夾過的值，不能只在回傳時夾
         assert_eq!(profiles::study_settings(&db, profile).await.unwrap(), s);

@@ -458,6 +458,8 @@ export interface StudySettings {
   desired_retention: number;
   /** 閱讀文章要有多少比例是你看得懂的字 0.80~0.99 */
   reading_coverage: number;
+  /** 閱讀測驗的文章字級（px）12~32 */
+  reading_font_size: number;
 }
 
 export function getStudySettings(profileId = DEFAULT_PROFILE_ID): Promise<StudySettings> {
@@ -771,7 +773,16 @@ export interface ChoiceItem {
   answer_index: number;
   explanation: string | null;
   grammar_point: string | null;
+  /** easy / medium / hard。模型沒給就是 null，不顯示徽章 */
+  difficulty: string | null;
 }
+
+/** 難度標籤。沒收錄的值原樣顯示，總比顯示不出來好。 */
+export const DIFFICULTY_LABELS: Record<string, string> = {
+  easy: "基礎",
+  medium: "進階",
+  hard: "推論",
+};
 
 export interface NewWordHint {
   word: string;
@@ -784,6 +795,8 @@ export type ExerciseBody =
       kind: "reading";
       title: string;
       passage: string;
+      /** 整篇的母語翻譯。作答前不顯示，解析時才展開 */
+      translation: string | null;
       new_words: NewWordHint[];
       questions: ChoiceItem[];
     }
@@ -814,6 +827,9 @@ export interface Correction {
 
 /** 閱讀解析的一條字詞說明。由本地字典查出，不是模型寫的。 */
 export interface GlossaryNote {
+  /** 正規化後的比對鍵。要拿使用者點到的字對這一欄，不是 text */
+  term: string;
+  /** 字典收錄的原形，顯示用 */
   text: string;
   gloss: string | null;
   translation: string | null;
@@ -862,4 +878,48 @@ export function gradeExercise(
   profileId = DEFAULT_PROFILE_ID,
 ): Promise<Feedback> {
   return invoke("grade_exercise", { profileId, input });
+}
+
+/** 練習紀錄的一列。清單上不帶題目內容，重做時再用 loadExercise 取。 */
+export interface ExerciseSummary {
+  exercise_id: number;
+  kind: ExerciseKind;
+  created_at: string;
+  coverage: number | null;
+  /** 做過才有分數。null 代表出了題但沒作答 */
+  score: number | null;
+  title: string;
+}
+
+export function listExercises(
+  limit = 30,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<ExerciseSummary[]> {
+  return invoke("list_exercises", { profileId, limit });
+}
+
+/** 取回一份做過的練習，原封不動再做一次。送出後照常由 LLM 批改。 */
+export function loadExercise(exerciseId: number): Promise<ExerciseView> {
+  return invoke("load_exercise", { exerciseId });
+}
+
+/* -------------------------------------------------------------------- 重置 */
+
+export interface ResetSummary {
+  cards: number;
+  reviews: number;
+  exercises: number;
+  attempts: number;
+  grammar_points: number;
+  llm_calls: number;
+}
+
+/**
+ * 把學習資料清空，回到剛安裝的狀態。
+ *
+ * **不刪字典也不刪教材**——重匯一份 Wiktionary 要好幾分鐘。
+ * 呼叫端必須先讓使用者確認過。
+ */
+export function resetProgress(profileId = DEFAULT_PROFILE_ID): Promise<ResetSummary> {
+  return invoke("reset_progress", { profileId });
 }

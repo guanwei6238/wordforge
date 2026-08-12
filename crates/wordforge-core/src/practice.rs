@@ -252,6 +252,56 @@ pub fn translation_count(vocabulary: i64) -> usize {
     if vocabulary < 500 { 3 } else { 5 }
 }
 
+// ------------------------------------------------------------------ 選項洗牌
+
+/// 偽亂數（SplitMix64）。
+///
+/// 用 seed 驅動而不是拉 `rand`：`wordforge-core` 不碰 I/O 也不碰時鐘，
+/// 亂源由呼叫端傳進來。同一個 seed 給同一串，所以測試跑得動，
+/// 而實際使用時 seed 來自時間戳，每次出題都不一樣。
+fn next_u64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// 原地 Fisher-Yates。
+fn shuffle_in_place<T>(items: &mut [T], state: &mut u64) {
+    for i in (1..items.len()).rev() {
+        let j = (next_u64(state) % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
+/// 洗一題的選項，回傳 `(新的選項順序, 新的正確答案索引)`。
+///
+/// 就是把整組選項洗過，答案落在哪裡就是哪裡——每題各自獨立、
+/// 位置均勻隨機。不去安排「這份四題要剛好用掉四個位置」：
+/// 那種安排本身就是一種規律，而且會讓前面幾題的答案位置洩漏後面的。
+///
+/// `answer_index` 超出範圍時原樣回傳——那是模型給了壞資料，
+/// 洗牌只會讓錯誤更難查。
+pub fn shuffle_options(options: &[String], answer_index: usize, seed: u64) -> (Vec<String>, usize) {
+    if options.len() < 2 || answer_index >= options.len() {
+        return (options.to_vec(), answer_index);
+    }
+
+    let mut state = seed | 1;
+    let mut shuffled = options.to_vec();
+    let answer = options[answer_index].clone();
+    shuffle_in_place(&mut shuffled, &mut state);
+
+    // 用值去找答案的新位置，不追蹤索引：選項字串在同一題裡不會重複，
+    // 而追蹤索引要在 Fisher-Yates 的每一步跟著換，很容易寫錯。
+    let at = shuffled
+        .iter()
+        .position(|o| *o == answer)
+        .unwrap_or(answer_index);
+    (shuffled, at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +550,63 @@ mod tests {
     fn beginners_get_fewer_translation_items() {
         assert_eq!(translation_count(100), 3);
         assert_eq!(translation_count(3_000), 5);
+    }
+
+    fn options(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 洗牌不能弄丟或弄壞答案：新的索引一定指向原本那個正確選項，
+    /// 而且整組選項要一個不多一個不少。
+    #[test]
+    fn shuffling_keeps_pointing_at_the_same_correct_option() {
+        let opts = options(&["went", "go", "gone", "going"]);
+        let mut original = opts.clone();
+        original.sort();
+
+        for seed in 0..200u64 {
+            for answer in 0..opts.len() {
+                let want = &opts[answer];
+                let (shuffled, index) = shuffle_options(&opts, answer, seed);
+                assert_eq!(&shuffled[index], want, "seed {seed} 指到了別的選項");
+
+                let mut sorted = shuffled.clone();
+                sorted.sort();
+                assert_eq!(sorted, original, "選項被弄丟或重複了");
+            }
+        }
+    }
+
+    /// 這條測試存在的理由：模型出的選擇題答案會集中在某一個位置
+    /// （實際看到過一整份都是第一個），使用者不用讀題就會猜。
+    ///
+    /// 驗的是分布而不是「每一份剛好用掉四個位置」——刻意去湊那種均勻
+    /// 本身也是一種規律，而且會讓前面幾題的答案洩漏後面的。
+    #[test]
+    fn the_answer_position_is_uniformly_random() {
+        let opts = options(&["went", "go", "gone", "going"]);
+        let mut counts = [0usize; 4];
+        for seed in 0..4_000u64 {
+            let (_, index) = shuffle_options(&opts, 0, seed);
+            counts[index] += 1;
+        }
+
+        // 期望值 1000，標準差約 27。±30% 的寬容遠大於正常波動，
+        // 但小到足以抓出「偏心」或「根本沒洗」。
+        for (position, n) in counts.iter().enumerate() {
+            assert!(
+                (700..=1_300).contains(n),
+                "位置 {position} 出現 {n} 次，分布歪掉了：{counts:?}"
+            );
+        }
+    }
+
+    /// 模型給了壞的 answer_index 時，洗牌會讓錯誤更難查——原樣放過。
+    #[test]
+    fn a_broken_answer_index_is_left_alone() {
+        let opts = options(&["a", "b"]);
+        let (shuffled, index) = shuffle_options(&opts, 9, 3);
+        assert_eq!(shuffled, opts);
+        assert_eq!(index, 9);
     }
 }

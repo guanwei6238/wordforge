@@ -273,6 +273,7 @@ impl<'a> PracticeEngine<'a> {
         let req = prompts::translation_task(
             self.target_name(),
             self.native_name(),
+            kind == ExerciseKind::TranslationToTarget,
             excerpt.as_deref(),
             &due_words,
             count,
@@ -470,7 +471,7 @@ impl<'a> PracticeEngine<'a> {
             let too_hard = coverage.ratio() < target_coverage - COVERAGE_TOLERANCE;
             let acceptable = !too_hard || no_baseline || attempt == COVERAGE_RETRIES;
             if acceptable {
-                let questions: Vec<ChoiceItem> = value
+                let mut questions: Vec<ChoiceItem> = value
                     .get("questions")
                     .and_then(|q| q.as_array())
                     .map(|arr| {
@@ -479,6 +480,7 @@ impl<'a> PracticeEngine<'a> {
                             .collect()
                     })
                     .unwrap_or_default();
+                shuffle_answers(&mut questions, shuffle_seed(now));
 
                 let new_words: Vec<NewWord> = value
                     .get("new_words")
@@ -497,6 +499,14 @@ impl<'a> PracticeEngine<'a> {
                         .unwrap_or("Reading")
                         .to_string(),
                     passage,
+                    // 沒給就是沒給。硬塞一段空字串的話，UI 會出現一個
+                    // 打開來是空白的「全文翻譯」，比沒有更糟。
+                    translation: value
+                        .get("translation")
+                        .and_then(|t| t.as_str())
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string),
                     new_words,
                     questions,
                 };
@@ -557,7 +567,7 @@ impl<'a> PracticeEngine<'a> {
         );
         let value = self.ask_json(profile_id, "generate", &req).await?;
 
-        let items: Vec<ChoiceItem> = value
+        let mut items: Vec<ChoiceItem> = value
             .get("items")
             .and_then(|i| i.as_array())
             .map(|arr| {
@@ -570,6 +580,7 @@ impl<'a> PracticeEngine<'a> {
         if items.is_empty() {
             return Err(PracticeError::BadResponse("一題都沒產出來".into()));
         }
+        shuffle_answers(&mut items, shuffle_seed(now));
 
         self.store(
             profile_id,
@@ -761,7 +772,7 @@ impl<'a> PracticeEngine<'a> {
         Ok(feedback)
     }
 
-    /// 從文章本身算出解析：哪些字你不會、哪裡有片語。
+    /// 從文章本身算出解析：每個字的意思、哪些你不會、哪裡有片語。
     ///
     /// 全部本地做，一次 LLM 都不呼叫。理由有三個：
     ///
@@ -770,6 +781,13 @@ impl<'a> PracticeEngine<'a> {
     /// 2. **語言無關**。模型對小語種的解釋品質沒有保證，但字典是
     ///    使用者自己匯入的——查得到就是查得到。
     /// 3. **免費且即時**。不佔 token，也不用等 CLI 冷啟動。
+    ///
+    /// ## 為什麼連「已經會的字」也查
+    ///
+    /// 解析階段點文章裡的任何一個字都要看得到翻譯——只查生字的話，
+    /// 點到一個系統以為你會、你其實忘了的字，會什麼都不跳出來，
+    /// 那個互動就顯得壞掉了。`is_unknown` 仍然分得出兩者，
+    /// UI 要挑出「這篇的生字」時看那個欄位就好。
     async fn build_glossary(
         &self,
         passage: &str,
@@ -780,8 +798,9 @@ impl<'a> PracticeEngine<'a> {
             return Ok(Vec::new());
         }
 
-        // 單字：只留「不在已知集合裡」的。已經會的字不需要解釋。
-        let mut unknown_words: Vec<String> = Vec::new();
+        // 實詞全查。虛詞（the、of）跳過——查得到但沒有人需要看。
+        let mut content_words: Vec<String> = Vec::new();
+        let mut unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
         for token in &tokens {
             if !seen.insert(token.clone()) {
@@ -791,8 +810,9 @@ impl<'a> PracticeEngine<'a> {
                 continue;
             }
             if !self.knows_token(token, known).await? {
-                unknown_words.push(token.clone());
+                unknown.insert(token.clone());
             }
+            content_words.push(token.clone());
         }
 
         // 片語：字典裡真的有這個多詞條目才算。整組都是虛詞的排掉
@@ -807,11 +827,12 @@ impl<'a> PracticeEngine<'a> {
                 .collect();
 
         let phrases = dict::glossary(self.db, &self.target_lang, &candidates).await?;
-        let words = dict::glossary(self.db, &self.target_lang, &unknown_words).await?;
+        let words = dict::glossary(self.db, &self.target_lang, &content_words).await?;
 
         let mut notes: Vec<GlossaryNote> = Vec::new();
         for e in phrases {
             notes.push(GlossaryNote {
+                term: e.term,
                 text: e.text,
                 gloss: e.gloss,
                 translation: e.translation,
@@ -820,12 +841,14 @@ impl<'a> PracticeEngine<'a> {
             });
         }
         for e in words {
+            let is_unknown = unknown.contains(&e.term);
             notes.push(GlossaryNote {
+                term: e.term,
                 text: e.text,
                 gloss: e.gloss,
                 translation: e.translation,
                 is_phrase: false,
-                is_unknown: true,
+                is_unknown,
             });
         }
         // 片語排前面：那才是查單字查不到的東西
@@ -1172,6 +1195,34 @@ impl<'a> PracticeEngine<'a> {
             target_words,
             coverage,
         })
+    }
+}
+
+/// 洗牌的亂源。
+///
+/// 用奈秒而不是秒：連續出兩題常常落在同一秒內，秒級的 seed 會讓
+/// 兩份題目的選項被搬到一模一樣的位置。`wordforge-core` 不碰時鐘，
+/// 所以亂源在這一層決定。
+fn shuffle_seed(now: OffsetDateTime) -> u64 {
+    now.unix_timestamp_nanos() as u64
+}
+
+/// 把一份選擇題的選項洗過，答案落在哪裡就是哪裡。
+///
+/// 模型出的題目，答案會集中在某幾個位置——實際看過一整份都是第一個選項。
+/// 使用者不用讀題就猜得到，那份練習就白做了。
+///
+/// 這件事**只能在本地做**：叫模型「請把答案分散」是沒有辦法驗收的請求，
+/// 而重排選項是我們自己就做得到的事，做完還測得出來。
+fn shuffle_answers(items: &mut [ChoiceItem], seed: u64) {
+    for (i, item) in items.iter_mut().enumerate() {
+        // 每一題各自的亂源。同一份裡共用一個 seed 的話，
+        // 每題的選項會被搬到一模一樣的位置。
+        let per_item = seed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let (options, answer_index) =
+            practice::shuffle_options(&item.options, item.answer_index, per_item);
+        item.options = options;
+        item.answer_index = answer_index;
     }
 }
 

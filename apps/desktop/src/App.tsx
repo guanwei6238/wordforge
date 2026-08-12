@@ -20,6 +20,13 @@ type Tab = (typeof TABS)[number]["id"];
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("review");
+  // 練習頁進去過就不再卸載。出一題要幾十秒，中途切去查個字回來
+  // 就發現題目不見了——不是模型被中斷，是 React 把元件連同
+  // 那個還沒 resolve 的 promise 一起丟掉了。
+  const [practiceVisited, setPracticeVisited] = useState(false);
+  if (tab === "practice" && !practiceVisited) {
+    setPracticeVisited(true);
+  }
 
   return (
     <div className="app">
@@ -47,7 +54,11 @@ export default function App() {
           </Welcome>
         )}
         {tab === "dictionary" && <Dictionary />}
-        {tab === "practice" && <Practice />}
+        {practiceVisited && (
+          <div hidden={tab !== "practice"}>
+            <Practice />
+          </div>
+        )}
         {tab === "deck" && <Deck />}
         {tab === "import" && <Import />}
         {tab === "settings" && <Settings />}

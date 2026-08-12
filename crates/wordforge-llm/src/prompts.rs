@@ -75,6 +75,33 @@ impl<'a> ReadingSpec<'a> {
     }
 }
 
+/// 一份閱讀測驗裡各題的難度。
+///
+/// 不指定的話模型會出一整份同一個難度的題目——通常全是「在第幾段找得到」
+/// 的送分題，做完不知道自己讀懂了沒有；偶爾反過來全是推論題，
+/// 那又變成在考智力測驗而不是閱讀。
+///
+/// 循環使用這個樣式：題數多的時候比例維持不變。
+pub const QUESTION_DIFFICULTIES: &[(&str, &str)] = &[
+    ("easy", "答案在文章裡明講了，找到那一句就能答"),
+    (
+        "medium",
+        "要整合兩個以上的地方，或從上下文推出沒有明講的關係",
+    ),
+    ("hard", "要推論作者的態度、言外之意，或把整篇的主旨講出來"),
+    ("medium", "考一個新詞在這個語境裡的意思，選項要像但不對"),
+];
+
+/// 這份測驗每一題各要多難。
+fn difficulty_plan(question_count: usize) -> String {
+    (0..question_count)
+        .map(|i| {
+            let (level, what) = QUESTION_DIFFICULTIES[i % QUESTION_DIFFICULTIES.len()];
+            format!("   第 {} 題：{level}——{what}\n", i + 1)
+        })
+        .collect()
+}
+
 /// 閱讀理解出題。
 pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
     let system = format!(
@@ -110,8 +137,12 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
             唯一的例外：某個字如果粗俗、冒犯，或明顯不適合出現在\n\
             學習教材裡，就跳過它，不要為了湊數硬寫進去。\n\
          4. 白名單以外，不要使用專有名詞、縮寫、俚語或罕見字。\n\
-         5. 文章要有完整的起承轉合，不要像單字例句的拼貼。\n\n",
+         5. 文章要有完整的起承轉合，不要像單字例句的拼貼。\n\
+         6. **題目與選項一律用{target}寫**，因為那是他要練的語言；\n\
+            只有 explanation 與 gloss 用{native}。\n\n",
         words = spec.word_count,
+        target = spec.target_lang,
+        native = spec.native_lang,
         budget = spec.unknown_budget(),
         cov = spec.target_coverage * 100.0,
         targets = if spec.target_words.is_empty() {
@@ -145,17 +176,35 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
     }
 
     prompt.push_str(&format!(
-        "# 輸出格式\n\
+        "# 出題\n\
+         共出 {n} 題選擇題，題目要考理解而不是找關鍵字。\n\
+         **每一題的難度不同**，照這個分配：\n{plan}\n\
+         # 出完題之後，回頭檢查文章\n\
+         為了塞進指定的新詞，文章很容易寫出前後兜不起來的句子。\n\
+         輸出之前一定要自己讀一遍，確認：\n\
+         - 每一段接得上上一段，代名詞找得到它指的是誰\n\
+         - 時態與人稱一致，沒有中途換掉\n\
+         - 沒有只為了用掉某個新詞而硬插進去、拿掉也不影響的句子\n\
+         - 每一題的答案在文章裡真的成立，而且只有一個選項對\n\
+         有任何一項不成立就把文章改好再輸出，不要輸出你自己都覺得卡的版本。\n\n\
+         # 輸出格式\n\
          只輸出這個 JSON 物件：\n\
          {{\n\
-         \x20 \"title\": \"文章標題\",\n\
+         \x20 \"title\": \"文章標題（用{target}）\",\n\
          \x20 \"passage\": \"文章內容\",\n\
+         \x20 \"translation\": \"整篇文章的{native}翻譯，逐段對應，讓他讀完可以自己對照\",\n\
          \x20 \"new_words\": [{{\"word\": \"新詞\", \"gloss\": \"{native}解釋\", \"line_hint\": \"可推敲出意思的那句話\"}}],\n\
-         \x20 \"questions\": [{{\"question\": \"問題\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \"answer_index\": 0, \"explanation\": \"以{native}說明為何是這個答案\"}}]\n\
+         \x20 \"questions\": [{{\"question\": \"問題（用{target}）\", \
+         \"options\": [\"用{target}寫的四個選項\"], \"answer_index\": 0, \
+         \"difficulty\": \"easy｜medium｜hard\", \
+         \"explanation\": \"以{native}說明為何是這個答案，以及其他選項錯在哪\"}}]\n\
          }}\n\
-         共出 {n} 題選擇題，題目要考理解而不是找關鍵字。",
+         explanation 提到別的選項時要引用它的內容，不要寫「選項 B」或「第二個」——\n\
+         選項的順序會被系統重新排過，那樣寫出來會對不上。",
         native = spec.native_lang,
+        target = spec.target_lang,
         n = spec.question_count,
+        plan = difficulty_plan(spec.question_count),
     ));
 
     ChatRequest {
@@ -278,7 +327,9 @@ pub fn grammar_drill(
          \x20 \"items\": [{{\"prompt\": \"題目（含填空）\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \
          \"answer_index\": 0, \"grammar_point\": \"tense\", \"explanation\": \"{native}說明，\
          並解釋為什麼其他選項不對\"}}]\n\
-         }}",
+         }}\n\
+         explanation 提到別的選項時要引用它的內容，不要寫「選項 B」或「第二個」——\n\
+         選項的順序會被系統重新排過，那樣寫出來會對不上。",
         n = question_count,
         native = native_lang,
         points = grammar_point_rule(target_lang),
@@ -415,10 +466,15 @@ pub fn reading_feedback(
     }
 }
 
-/// 翻譯出題：從母語翻成目標語，刻意使用到期複習的單字。
+/// 翻譯出題，刻意使用到期複習的單字。
+///
+/// `direction_to_target` 決定題目句子要用哪個語言寫。**這件事一定要
+/// 講到 prompt 裡**：先前不管哪個方向都說「請出 N 個{母語}句子」，
+/// 於是「英翻中」出來的題目也是中文句子，那個題型等於不存在。
 pub fn translation_task(
     target_lang: &str,
     native_lang: &str,
+    direction_to_target: bool,
     material_excerpt: Option<&str>,
     due_words: &[String],
     count: usize,
@@ -428,14 +484,28 @@ pub fn translation_task(
         target = target_lang
     );
 
+    // 題目句子的語言與作答的語言。兩個都要明講，而且要講「不可以」，
+    // 光說「請出 N 個 X 句子」模型還是會照著它心裡的預設走。
+    let (source_lang, answer_lang) = if direction_to_target {
+        (native_lang, target_lang)
+    } else {
+        (target_lang, native_lang)
+    };
+
     let mut prompt = format!(
         "# 出題要求\n\
-         請出 {count} 個{native}句子，讓學習者翻譯成{target}。\n\
-         每個句子要自然、日常，並且**必須**用到下列其中一個今天該複習的單字\n\
-         （學習者翻譯時就等於複習了這個字）：\n{words}\n\n",
+         練習方向是「{source} → {answer}」：\n\
+         請出 {count} 個**{source}**句子，讓學習者翻譯成{answer}。\n\
+         `source` 欄位一定要是{source}，寫成{answer}就是出錯了，這一題會作廢。\n\
+         每個句子要自然、日常，並且**必須**用到下列其中一個今天該複習的\n\
+         {target}單字（學習者翻譯時就等於複習了這個字）：\n{words}\n\
+         方向是{target} → {native}時，那個字直接出現在題目句子裡；\n\
+         方向是{native} → {target}時，題目句子要寫成翻出來自然會用到它。\n\n",
         count = count,
         native = native_lang,
         target = target_lang,
+        source = source_lang,
+        answer = answer_lang,
         words = due_words.join("、"),
     );
 
@@ -450,10 +520,13 @@ pub fn translation_task(
     prompt.push_str(&format!(
         "# 輸出格式\n\
          {{\n\
-         \x20 \"items\": [{{\"source\": \"{native}句子\", \"target_word\": \"必須用到的字\", \
-         \"reference\": \"參考翻譯\", \"acceptable_variants\": [\"其他可接受的說法\"]}}]\n\
+         \x20 \"items\": [{{\"source\": \"要翻譯的{source}句子\", \
+         \"target_word\": \"必須用到的{target}字\", \
+         \"reference\": \"{answer}參考答案\", \"acceptable_variants\": [\"其他可接受的說法\"]}}]\n\
          }}",
-        native = native_lang,
+        source = source_lang,
+        answer = answer_lang,
+        target = target_lang,
     ));
 
     ChatRequest {
@@ -570,6 +643,74 @@ mod tests {
         assert!(!plain.contains("順便複習"));
     }
 
+    /// 題目寫成母語的話，閱讀測驗就只剩下「讀文章」，題目本身沒在練語言。
+    /// 實際看到過整份題目都是中文的。
+    #[test]
+    fn questions_are_asked_in_the_language_being_learned() {
+        let targets = sample_words();
+        let known = sample_words();
+        let text = reading_comprehension(&spec(&targets, &known, None)).messages[0]
+            .content
+            .clone();
+
+        assert!(
+            text.contains("題目與選項一律用English寫"),
+            "沒有規定題目的語言：{text}"
+        );
+        assert!(
+            text.contains("只有 explanation 與 gloss 用繁體中文"),
+            "解說仍該用母語，不然看不懂為什麼錯：{text}"
+        );
+    }
+
+    /// 解析要能給出全文翻譯，讀完才對照得起來。
+    #[test]
+    fn reading_prompt_asks_for_a_full_translation() {
+        let targets = sample_words();
+        let known = sample_words();
+        let text = reading_comprehension(&spec(&targets, &known, None)).messages[0]
+            .content
+            .clone();
+        assert!(text.contains("\"translation\""), "{text}");
+        assert!(text.contains("整篇文章的繁體中文翻譯"), "{text}");
+    }
+
+    /// 一整份同一個難度的題目，做完不知道自己讀懂了沒有。
+    #[test]
+    fn questions_are_spread_across_difficulties() {
+        let targets = sample_words();
+        let known = sample_words();
+        let mut s = spec(&targets, &known, None);
+        s.question_count = 4;
+        let text = reading_comprehension(&s).messages[0].content.clone();
+
+        for level in ["easy", "medium", "hard"] {
+            assert!(text.contains(level), "難度分配少了 {level}：{text}");
+        }
+        assert!(text.contains("第 4 題"), "四題都要指定難度：{text}");
+
+        // 題數變少時樣式要跟著縮，不能講到不存在的題號
+        s.question_count = 2;
+        let short = reading_comprehension(&s).messages[0].content.clone();
+        assert!(!short.contains("第 3 題"), "{short}");
+    }
+
+    /// 為了塞新詞，文章很容易寫出前後兜不起來的句子。
+    #[test]
+    fn the_model_is_told_to_reread_its_own_article() {
+        let targets = sample_words();
+        let known = sample_words();
+        let text = reading_comprehension(&spec(&targets, &known, None)).messages[0]
+            .content
+            .clone();
+        assert!(text.contains("回頭檢查文章"), "{text}");
+        assert!(text.contains("代名詞找得到它指的是誰"), "{text}");
+        assert!(
+            text.contains("只有一個選項對"),
+            "檢查也要涵蓋題目本身：{text}"
+        );
+    }
+
     #[test]
     fn reading_prompt_whitelists_target_words() {
         let targets = sample_words();
@@ -596,6 +737,7 @@ mod tests {
         let req = translation_task(
             "English",
             "繁體中文",
+            true,
             Some("Lesson 3: At the market."),
             &due,
             3,
@@ -605,8 +747,39 @@ mod tests {
         assert!(text.contains("只能"), "沒有講清楚是硬限制：{text}");
 
         // 沒指定教材時整段不該出現，否則模型會看到一個空的「指定教材」
-        let free = translation_task("English", "繁體中文", None, &due, 3);
+        let free = translation_task("English", "繁體中文", true, None, &due, 3);
         assert!(!free.messages[0].content.contains("指定教材"));
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：不管哪個方向，出題 prompt 都說
+    /// 「請出 N 個{母語}句子」，於是「英翻中」拿到的題目也是中文句子，
+    /// 那個題型等於不存在。方向一定要走進 prompt。
+    #[test]
+    fn the_source_sentence_language_follows_the_direction() {
+        let due = vec!["weather".to_string()];
+
+        let to_target = translation_task("English", "繁體中文", true, None, &due, 3);
+        let text = &to_target.messages[0].content;
+        assert!(
+            text.contains("繁體中文 → English"),
+            "沒有講出練習方向：{text}"
+        );
+        assert!(
+            text.contains("**繁體中文**句子"),
+            "中翻英的題目句子該是中文：{text}"
+        );
+
+        let to_native = translation_task("English", "繁體中文", false, None, &due, 3);
+        let text = &to_native.messages[0].content;
+        assert!(text.contains("English → 繁體中文"), "{text}");
+        assert!(
+            text.contains("**English**句子"),
+            "英翻中的題目句子該是英文：{text}"
+        );
+        assert!(
+            text.contains("寫成繁體中文就是出錯了"),
+            "只說「請出 X 句子」模型還是會照它的預設走，要講「不可以」：{text}"
+        );
     }
 
     /// 指定教材時必須明確限制範圍，否則 AI 會自由發揮到課本以外。
@@ -664,7 +837,7 @@ mod tests {
     #[test]
     fn translation_task_reuses_due_words() {
         let due = vec!["borrow".to_string(), "return".to_string()];
-        let req = translation_task("English", "繁體中文", None, &due, 3);
+        let req = translation_task("English", "繁體中文", true, None, &due, 3);
         let text = &req.messages[0].content;
         assert!(text.contains("borrow"));
         assert!(text.contains("出 3 個"));

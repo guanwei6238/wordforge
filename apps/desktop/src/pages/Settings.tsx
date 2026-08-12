@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { errorMessage, getStudySettings, type StudySettings, updateStudySettings } from "../api";
+import {
+  errorMessage,
+  getStudySettings,
+  resetProgress,
+  type ResetSummary,
+  type StudySettings,
+  updateStudySettings,
+} from "../api";
 import LanguageSettings from "../components/LanguageSettings";
 import MaterialManager from "../components/MaterialManager";
 import UsageStats from "../components/UsageStats";
@@ -151,6 +158,22 @@ export default function Settings() {
           算出來的遺忘程度挑）。那些不算生詞，是免費的複習——在句子裡再遇到一次，
           比抽卡更接近真正的使用場景。
         </p>
+
+        <label>
+          文章字級
+          <input
+            type="number"
+            min={12}
+            max={32}
+            step={1}
+            value={settings.reading_font_size}
+            onChange={(e) => save({ ...settings, reading_font_size: Number(e.target.value) })}
+          />
+          <span className="muted">px</span>
+        </label>
+        <p className="muted hint">
+          讀文章的時候也可以直接在閱讀測驗上按 A− / A+ 調，兩邊改的是同一個值。
+        </p>
       </section>
 
       <MaterialManager />
@@ -159,8 +182,83 @@ export default function Settings() {
 
       <UsageStats />
 
+      <ResetPanel />
+
       {saved && <p className="ok">{saved}</p>}
       {error && <p className="error">{error}</p>}
     </div>
+  );
+}
+
+/**
+ * 重置學習資料。
+ *
+ * 兩段式：第一下只是把「會刪掉什麼」攤開來，第二下才真的執行。
+ * 這件事完全不可逆——沒有備份、沒有復原——所以不能是一顆按下去
+ * 就生效的按鈕。
+ */
+function ResetPanel() {
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<ResetSummary | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function run() {
+    setBusy(true);
+    setError(null);
+    try {
+      setDone(await resetProgress());
+      setArmed(false);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel danger">
+      <h2>重置學習資料</h2>
+      <p className="muted hint">
+        把這個 App 記得的「你」全部忘掉，回到剛安裝的狀態：牌組與複習歷程、
+        所有練習與批改、文法弱點、用量統計、分級測驗估的詞彙量、以及所有設定。
+      </p>
+      <p className="muted hint">
+        <strong>字典與教材不會被刪掉。</strong>
+        那是你自己匯入的東西，重匯一份完整的 Wiktionary 要好幾分鐘，
+        而且跟「想重新開始學」是兩件事。要換字典的話請去匯入頁。
+      </p>
+
+      {!armed && !done && (
+        <button onClick={() => setArmed(true)}>重置…</button>
+      )}
+
+      {armed && (
+        <div className="confirm">
+          <p className="error">
+            這個動作沒有復原，也沒有備份。確定要清掉全部的學習紀錄嗎？
+          </p>
+          <div className="row">
+            <button onClick={() => setArmed(false)} disabled={busy}>
+              取消
+            </button>
+            <button className="destructive" onClick={run} disabled={busy}>
+              {busy ? "清除中…" : "確定重置"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {done && (
+        <p className="ok">
+          已清除：{done.cards} 張卡片、{done.reviews} 筆複習紀錄、
+          {done.exercises} 份練習（{done.attempts} 次作答）、
+          {done.grammar_points} 個文法點、{done.llm_calls} 筆用量紀錄。
+          重新整理一下就會看到空的牌組。
+        </p>
+      )}
+
+      {error && <p className="error">{error}</p>}
+    </section>
   );
 }

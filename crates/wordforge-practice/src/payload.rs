@@ -32,6 +32,10 @@ pub struct ChoiceItem {
     /// 文法題才有：這題在考哪個文法點
     #[serde(default)]
     pub grammar_point: Option<String>,
+    /// easy / medium / hard。一整份同一個難度的話，做完不知道自己讀懂了沒有，
+    /// 所以出題時會指定分配；模型沒給就是 `None`，UI 不顯示徽章。
+    #[serde(default)]
+    pub difficulty: Option<String>,
 }
 
 /// 閱讀理解裡預先標好的生詞。
@@ -55,6 +59,10 @@ pub enum ExerciseBody {
     Reading {
         title: String,
         passage: String,
+        /// 整篇的母語翻譯。作答前不顯示，解析時才展開——
+        /// 逐字翻譯的清單太吵，整篇對照才是讀完之後真正想看的東西。
+        #[serde(default)]
+        translation: Option<String>,
         #[serde(default)]
         new_words: Vec<NewWord>,
         questions: Vec<ChoiceItem>,
@@ -127,6 +135,12 @@ pub struct Correction {
 /// 但字典是使用者自己選的，查得到就是查得到。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GlossaryNote {
+    /// 正規化後的比對鍵（小寫、去標點）。
+    ///
+    /// 前端要拿使用者點到的字去對這一欄，不能對 `text`——`text` 是字典
+    /// 收錄的原形，大小寫不一定跟文章裡的一樣，多詞條目也是。
+    pub term: String,
+    /// 字典收錄的原形，顯示用
     pub text: String,
     pub gloss: Option<String>,
     pub translation: Option<String>,

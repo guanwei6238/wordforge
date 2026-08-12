@@ -74,6 +74,33 @@ fn t0() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
 }
 
+/// 依「這題要不要答對」組出作答的選項索引。
+///
+/// **不能寫死索引**：出題時會把正確答案的位置打散，寫死 `Some(0)` 的話
+/// 測試驗到的是洗牌的結果，不是判分邏輯。`Some(true)` 是答對、
+/// `Some(false)` 是隨便挑一個錯的、`None` 是沒作答。
+fn answer(
+    exercise: &wordforge_practice::ExerciseView,
+    plan: &[Option<bool>],
+) -> Vec<Option<usize>> {
+    use wordforge_practice::payload::ExerciseBody;
+
+    let items = match &exercise.body {
+        ExerciseBody::Choices { items } => items,
+        ExerciseBody::Reading { questions, .. } => questions,
+        ExerciseBody::Translation { .. } => panic!("翻譯題沒有選項可以挑"),
+    };
+
+    plan.iter()
+        .zip(items)
+        .map(|(want, item)| match want {
+            Some(true) => Some(item.answer_index),
+            Some(false) => Some((item.answer_index + 1) % item.options.len().max(1)),
+            None => None,
+        })
+        .collect()
+}
+
 /// 建一個有字典、有牌組的資料庫。
 async fn setup(words: &[&str]) -> (Db, i64) {
     setup_lang("en", words).await
@@ -371,7 +398,7 @@ async fn grammar_choices_are_graded_locally() {
             &GradeInput {
                 exercise_id: exercise.exercise_id,
                 answers: vec![],
-                choices: vec![Some(1), Some(0)],
+                choices: answer(&exercise, &[Some(true), Some(false)]),
                 marked_unknown: vec![],
             },
             t0(),
@@ -416,7 +443,7 @@ async fn wrong_grammar_answers_become_recorded_weak_points() {
             &GradeInput {
                 exercise_id: exercise.exercise_id,
                 answers: vec![],
-                choices: vec![Some(1), Some(0), None],
+                choices: answer(&exercise, &[Some(true), Some(false), None]),
                 marked_unknown: vec![],
             },
             t0(),
@@ -845,7 +872,7 @@ async fn grammar_labels_are_normalized_to_one_point() {
             &GradeInput {
                 exercise_id: exercise.exercise_id,
                 answers: vec![],
-                choices: vec![Some(1), Some(1), Some(1)],
+                choices: answer(&exercise, &[Some(false); 3]),
                 marked_unknown: vec![],
             },
             t0(),
@@ -883,7 +910,7 @@ async fn unrecognised_grammar_labels_are_dropped() {
             &GradeInput {
                 exercise_id: exercise.exercise_id,
                 answers: vec![],
-                choices: vec![Some(1), Some(1)],
+                choices: answer(&exercise, &[Some(false); 2]),
                 marked_unknown: vec![],
             },
             t0(),
@@ -1022,6 +1049,21 @@ async fn the_reading_glossary_comes_from_the_dictionary_not_the_model() {
     );
     // 模型完全沒提供 glossary，這些全是本地查出來的
     assert!(!feedback.glossary.is_empty());
+
+    // 解析時點文章裡的任何一個字都要查得到，所以已經會的字也要在裡面，
+    // 但 is_unknown 要分得出來——UI 要挑「這篇的生字」時看的是那一欄。
+    let known = feedback
+        .glossary
+        .iter()
+        .find(|g| g.text == "key")
+        .expect("已經會的實詞也要能查到釋義，否則點下去什麼都不會跳出來");
+    assert!(!known.is_unknown, "學過的字不該被標成生字");
+    let unknown = feedback
+        .glossary
+        .iter()
+        .find(|g| g.text == "diligent")
+        .unwrap();
+    assert!(unknown.is_unknown);
 }
 
 /// 片語偵測不能只對有空格的語言成立。
@@ -1469,4 +1511,135 @@ async fn a_word_already_taught_is_never_offered_as_new_again() {
             "{word} 已經教過也進牌組了，不該再當生詞"
         );
     }
+}
+
+/// 模型出的題目，正確答案會集中在同一個位置——實際看過一整份都是
+/// 第一個選項。使用者不用讀題就猜得到，那份練習就白做了。
+///
+/// 這件事只能在本地做：「請把答案分散」是驗收不了的請求。
+#[tokio::test]
+async fn the_correct_answer_does_not_always_sit_in_the_same_slot() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    // 每一份都是四題，而且模型每次都把答案放在第一個
+    const ITEMS: &str = r#"{"items":[
+             {"prompt":"a","options":["A1","A2","A3","A4"],"answer_index":0},
+             {"prompt":"b","options":["B1","B2","B3","B4"],"answer_index":0},
+             {"prompt":"c","options":["C1","C2","C3","C4"],"answer_index":0},
+             {"prompt":"d","options":["D1","D2","D3","D4"],"answer_index":0}
+           ]}"#;
+    const ROUNDS: i64 = 10;
+
+    let llm = FakeLlm::new(&[ITEMS; ROUNDS as usize]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let mut seen = std::collections::HashSet::new();
+    for round in 0..ROUNDS {
+        // 出題時間不同，洗出來的順序就不同
+        let exercise = engine
+            .generate(
+                profile,
+                Some(ExerciseKind::Grammar),
+                t0() + Duration::minutes(round),
+            )
+            .await
+            .unwrap();
+
+        let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+            panic!("文法題該是選擇題");
+        };
+
+        for (i, item) in items.iter().enumerate() {
+            seen.insert(item.answer_index);
+
+            // 洗牌不能把答案本身弄丟：正確選項仍該是模型指定的那一個
+            let expected = format!("{}1", ["A", "B", "C", "D"][i]);
+            assert_eq!(
+                item.options[item.answer_index],
+                expected,
+                "第 {} 題洗完之後指到了別的選項",
+                i + 1
+            );
+            assert_eq!(item.options.len(), 4, "選項被弄丟了");
+        }
+    }
+
+    assert_eq!(seen.len(), 4, "答案只落在 {seen:?} 這幾個位置，等於沒有洗");
+}
+
+/// 這條測試存在的理由是它曾經是錯的：不管中翻英還是英翻中，
+/// 出題 prompt 都說「請出 N 個{母語}句子」，於是「英翻中」拿到的題目
+/// 也是中文句子——那個題型等於不存在。
+#[tokio::test]
+async fn the_translation_direction_reaches_the_prompt() {
+    let (db, profile) = setup(&["park"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    put_in_deck(&db, profile, 1).await;
+
+    let items = r#"{"items":[{"source":"S","target_word":"park","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items, items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    engine
+        .generate(profile, Some(ExerciseKind::TranslationToNative), t0())
+        .await
+        .unwrap();
+    let to_native = llm.last_prompt();
+    assert!(
+        to_native.contains("English → 繁體中文"),
+        "英翻中沒有把方向寫進 prompt：{to_native}"
+    );
+    assert!(
+        to_native.contains("**English**句子"),
+        "英翻中的題目句子該是英文：{to_native}"
+    );
+
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+    let to_target = llm.last_prompt();
+    assert!(to_target.contains("繁體中文 → English"), "{to_target}");
+    assert!(to_target.contains("**繁體中文**句子"), "{to_target}");
+}
+
+/// 解析要能給出全文翻譯；模型沒給的時候不能變成一段空白。
+#[tokio::test]
+async fn the_full_translation_is_kept_when_the_model_gives_one() {
+    let (db, profile) = setup(&["the", "cat", "sat"]).await;
+    set_vocabulary(&db, profile, 2_000).await;
+
+    let with = r#"{"title":"T","passage":"The cat sat.","translation":"貓坐下了。",
+        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let llm = FakeLlm::new(&[with]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+    let wordforge_practice::payload::ExerciseBody::Reading { translation, .. } = &exercise.body
+    else {
+        panic!("該是閱讀題");
+    };
+    assert_eq!(translation.as_deref(), Some("貓坐下了。"));
+
+    // 只給空字串的話要當成沒給——UI 會出現一個打開來是空白的「全文翻譯」
+    let blank = r#"{"title":"T","passage":"The cat sat.","translation":"   ",
+        "questions":[{"question":"Q","options":["A","B"],"answer_index":0}]}"#;
+    let llm = FakeLlm::new(&[blank]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Reading), t0())
+        .await
+        .unwrap();
+    let wordforge_practice::payload::ExerciseBody::Reading { translation, .. } = &exercise.body
+    else {
+        panic!("該是閱讀題");
+    };
+    assert_eq!(translation.as_deref(), None);
 }
