@@ -10,6 +10,7 @@ pub mod exercises;
 pub mod grammar;
 pub mod llm_usage;
 pub mod material;
+pub mod meta;
 pub mod repo;
 pub(crate) mod ts;
 

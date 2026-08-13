@@ -863,7 +863,7 @@ mod tests {
     fn english_points() -> Vec<String> {
         wordforge_core::grammar_points::seed_for("en")
             .iter()
-            .map(|(id, _)| id.to_string())
+            .map(|(id, _, _)| id.to_string())
             .collect()
     }
 

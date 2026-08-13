@@ -33,43 +33,94 @@
 /// 切太細（現在完成進行式 vs 過去完成式）會讓每個標籤都只有一兩筆紀錄，
 /// 排程失去意義；切太粗（grammar）則練不到重點。
 ///
+/// ## 排列方式
+///
+/// 照一般文法教材的順序分組（名詞與限定詞 → 動詞 → 情態與語氣 →
+/// 句型 → 子句 → 非限定動詞 → 修飾與比較 → 搭配 → 書寫規範），
+/// 陣列順序就是 `sort_order`。原本的排法沒有依據，文法頁讀起來
+/// 像一份隨手列的清單，看不出先學什麼。
+///
+/// `level` 是 CEFR 等級。這個欄位資料表一直都有，只是從來沒填過——
+/// 填了之後才有辦法說「這個點你現在還用不到」。等級是**大致**的：
+/// 同一個點在不同教材會落在相鄰的級別，這裡取常見的那個。
+///
+/// ## 這份清單同時服務兩件事
+///
+/// 它既是**批改時的錯誤標籤**，也是**文法頁的學習主題**。兩者要的
+/// 粒度不一樣：學習想要細（分詞構句該獨立成一課），標籤想要粗
+/// （細了就每個標籤各錯一次，FSRS 排不動）。
+///
+/// 這一版往「學習」偏了一點——多出來的十四個點多半是 B1 以上，
+/// 初學者本來就不太會踩到，所以對標籤稀釋的影響有限。真的稀釋得
+/// 太嚴重的話，要退的是這裡而不是排程。
+///
 /// **這份種子只有英文。** 日文的助詞、法文的性數一致、西班牙文的虛擬式
 /// 都不在這裡——那些語言請匯入或自己編輯，見 [`seed_for`]。
-pub const ENGLISH_POINTS: &[(&str, &str)] = &[
-    ("tense", "時態"),
-    ("aspect", "動貌（進行 / 完成）"),
-    ("subject-verb-agreement", "主詞動詞一致"),
-    ("articles", "冠詞 a / an / the"),
-    ("plural", "單複數"),
-    ("countable-uncountable", "可數與不可數"),
-    ("prepositions", "介系詞"),
-    ("pronouns", "代名詞"),
-    ("possessives", "所有格"),
-    ("word-order", "語序"),
-    ("question-formation", "疑問句"),
-    ("negation", "否定句"),
-    ("modals", "情態助動詞"),
-    ("conditionals", "條件句"),
-    ("passive-voice", "被動語態"),
-    ("gerund-infinitive", "動名詞與不定詞"),
-    ("relative-clauses", "關係子句"),
-    ("conjunctions", "連接詞"),
-    ("comparatives", "比較級與最高級"),
-    ("adverb-placement", "副詞位置"),
-    ("phrasal-verbs", "片語動詞"),
-    ("collocation", "搭配詞"),
-    ("word-choice", "用字選擇"),
-    ("punctuation", "標點"),
-    ("capitalization", "大小寫"),
-    ("spelling", "拼字"),
+pub const ENGLISH_POINTS: &[(&str, &str, &str)] = &[
+    // 名詞與限定詞
+    ("articles", "冠詞 a / an / the", "A1"),
+    ("plural", "名詞單複數", "A1"),
+    ("countable-uncountable", "可數與不可數", "A2"),
+    ("quantifiers", "數量詞 some / any / much / many", "A2"),
+    ("pronouns", "代名詞", "A1"),
+    ("possessives", "所有格", "A1"),
+    // 動詞：時態與動貌
+    ("subject-verb-agreement", "主詞動詞一致", "A1"),
+    ("there-be", "there is / there are", "A1"),
+    ("tense", "時態", "A1"),
+    ("future-forms", "未來的表達 will / be going to", "A2"),
+    ("used-to", "used to / would 表過去習慣", "A2"),
+    ("aspect", "動貌（進行 / 完成）", "B1"),
+    // 情態與語氣
+    ("modals", "情態助動詞", "A2"),
+    ("conditionals", "條件句", "B1"),
+    ("subjunctive-wish", "假設語氣與 wish", "B2"),
+    ("causative", "使役 have / get something done", "B2"),
+    // 句型
+    ("word-order", "語序", "A1"),
+    ("question-formation", "疑問句", "A1"),
+    ("negation", "否定句", "A1"),
+    ("question-tags", "附加問句", "A2"),
+    ("passive-voice", "被動語態", "B1"),
+    ("inversion", "倒裝", "C1"),
+    // 子句與連接
+    ("conjunctions", "連接詞", "A2"),
+    ("relative-clauses", "關係子句", "B1"),
+    ("adverbial-clauses", "副詞子句（時間、原因、讓步）", "B1"),
+    ("reported-speech", "間接引語", "B1"),
+    ("noun-clauses", "名詞子句 that / whether / wh-", "B2"),
+    ("participle-clauses", "分詞構句", "C1"),
+    // 非限定動詞
+    ("gerund-infinitive", "動名詞與不定詞", "B1"),
+    // 修飾與比較
+    ("comparatives", "比較級與最高級", "A2"),
+    ("adjective-order", "形容詞排序", "B1"),
+    ("adverb-placement", "副詞位置", "B1"),
+    ("degree-result", "程度與結果 so / such / too / enough", "B1"),
+    // 搭配
+    ("prepositions", "介系詞", "A2"),
+    ("phrasal-verbs", "片語動詞", "B1"),
+    ("collocation", "搭配詞", "B2"),
+    ("word-choice", "用字選擇", "B1"),
+    // 書寫規範
+    ("capitalization", "大小寫", "A1"),
+    ("spelling", "拼字", "A1"),
+    ("punctuation", "標點", "A2"),
 ];
+
+/// 種子清單的版本。**改動 [`ENGLISH_POINTS`] 就要加一。**
+///
+/// `grammar_def` 只在第一次啟動時填，所以清單改了之後，早就用過的
+/// 資料庫永遠看不到新的點——這個版號讓補齊只跑一次。
+/// 只跑一次是重點：每次啟動都補的話，使用者刪掉的點會一直復活。
+pub const SEED_VERSION: i64 = 2;
 
 /// 某個語言的種子清單，第一次啟動時用來填 `grammar_def`。
 ///
 /// 沒有種子的語言回傳空陣列，而**不是**硬套英文那一份——拿
 /// `articles`、`gerund-infinitive` 去標日文的錯誤只會產生垃圾資料。
 /// 那些語言開箱是空的，由使用者匯入或自己加。
-pub fn seed_for(lang: &str) -> &'static [(&'static str, &'static str)] {
+pub fn seed_for(lang: &str) -> &'static [(&'static str, &'static str, &'static str)] {
     match language_key(lang) {
         Some("en") => ENGLISH_POINTS,
         _ => &[],
@@ -147,6 +198,47 @@ const ALIASES: &[(&str, &str)] = &[
     ("word usage", "word-choice"),
     ("diction", "word-choice"),
     ("lexical choice", "word-choice"),
+    // 以下對應 SEED_VERSION 2 新增的點。沒有別名的話，模型照自己的
+    // 習慣寫（"indirect speech"、"tag questions"）就會被丟掉——
+    // normalize_point 認不出來時是回 None，那個錯誤不會有人發現。
+    ("quantifier", "quantifiers"),
+    ("determiners of quantity", "quantifiers"),
+    ("much many", "quantifiers"),
+    ("some any", "quantifiers"),
+    ("there is", "there-be"),
+    ("there are", "there-be"),
+    ("existential there", "there-be"),
+    ("future", "future-forms"),
+    ("future tense forms", "future-forms"),
+    ("will be going to", "future-forms"),
+    ("past habits", "used-to"),
+    ("used to", "used-to"),
+    ("subjunctive", "subjunctive-wish"),
+    ("wish", "subjunctive-wish"),
+    ("unreal past", "subjunctive-wish"),
+    ("causatives", "causative"),
+    ("have something done", "causative"),
+    ("tag questions", "question-tags"),
+    ("tag question", "question-tags"),
+    ("inverted word order", "inversion"),
+    ("reported speech", "reported-speech"),
+    ("indirect speech", "reported-speech"),
+    ("reported statements", "reported-speech"),
+    ("backshift", "reported-speech"),
+    ("noun clause", "noun-clauses"),
+    ("that clauses", "noun-clauses"),
+    ("nominal clauses", "noun-clauses"),
+    ("adverbial clause", "adverbial-clauses"),
+    ("subordinate clauses", "adverbial-clauses"),
+    ("subordination", "adverbial-clauses"),
+    ("participle clause", "participle-clauses"),
+    ("participial phrases", "participle-clauses"),
+    ("reduced clauses", "participle-clauses"),
+    ("adjective ordering", "adjective-order"),
+    ("order of adjectives", "adjective-order"),
+    ("so such", "degree-result"),
+    ("too enough", "degree-result"),
+    ("result clauses", "degree-result"),
 ];
 
 /// 把模型回傳的標籤正規化到給定的受控清單。
@@ -240,13 +332,13 @@ mod tests {
     fn english() -> Vec<String> {
         seed_for("en")
             .iter()
-            .map(|(id, _)| id.to_string())
+            .map(|(id, _, _)| id.to_string())
             .collect()
     }
 
     #[test]
     fn canonical_ids_pass_through() {
-        for (id, _) in seed_for("en") {
+        for (id, _, _) in seed_for("en") {
             assert_eq!(
                 normalize_point(&english(), id).as_deref(),
                 Some(*id),
@@ -338,7 +430,7 @@ mod tests {
     /// 種子的每一項都要有母語名稱——那是使用者在文法頁上看到的字。
     #[test]
     fn every_seeded_point_has_a_name() {
-        for (id, name) in seed_for("en") {
+        for (id, name, _) in seed_for("en") {
             assert!(!name.is_empty(), "{id} 沒有中文名稱");
         }
     }
@@ -346,7 +438,7 @@ mod tests {
     #[test]
     fn ids_are_unique_and_lowercase() {
         let mut seen = std::collections::HashSet::new();
-        for (id, _) in seed_for("en") {
+        for (id, _, _) in seed_for("en") {
             assert!(seen.insert(*id), "重複的識別碼：{id}");
             assert_eq!(*id, id.to_lowercase(), "識別碼要小寫：{id}");
             assert!(!id.contains(' '), "識別碼用連字號不用空白：{id}");
@@ -358,7 +450,7 @@ mod tests {
     fn aliases_point_at_real_ids() {
         for (alias, target) in ALIASES {
             assert!(
-                seed_for("en").iter().any(|(id, _)| id == target),
+                seed_for("en").iter().any(|(id, _, _)| id == target),
                 "別名 {alias} 指向不存在的 {target}"
             );
         }
@@ -405,8 +497,60 @@ mod tests {
     #[test]
     fn prompt_list_contains_every_point() {
         let list = prompt_list(&english()).expect("英文要有清單");
-        for (id, _) in seed_for("en") {
+        for (id, _, _) in seed_for("en") {
             assert!(list.contains(id), "prompt 清單漏了 {id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod seed_v2_tests {
+    use super::*;
+
+    fn english() -> Vec<String> {
+        seed_for("en")
+            .iter()
+            .map(|(id, _, _)| id.to_string())
+            .collect()
+    }
+
+    /// 新增的點如果沒有別名，模型照自己的習慣寫就會被丟掉——
+    /// `normalize_point` 認不出來時回 `None`，那個錯誤不會有人發現。
+    #[test]
+    fn a_model_writing_in_its_own_words_still_lands_on_the_new_points() {
+        let points = english();
+        for (raw, want) in [
+            ("indirect speech", "reported-speech"),
+            ("Reported Speech", "reported-speech"),
+            ("tag questions", "question-tags"),
+            ("quantifier", "quantifiers"),
+            ("there is/there are", "there-be"),
+            ("subjunctive", "subjunctive-wish"),
+            ("wish", "subjunctive-wish"),
+            ("participle clause", "participle-clauses"),
+            ("noun clause", "noun-clauses"),
+            ("adverbial clause", "adverbial-clauses"),
+            ("order of adjectives", "adjective-order"),
+            ("causatives", "causative"),
+            ("used to", "used-to"),
+        ] {
+            assert_eq!(
+                normalize_point(&points, raw).as_deref(),
+                Some(want),
+                "{raw} 該收斂到 {want}"
+            );
+        }
+    }
+
+    /// 等級只能是 CEFR 那六級。打錯字的話 UI 的分級篩選會多出一個
+    /// 沒有人看得懂的分類，而那看起來完全正常。
+    #[test]
+    fn every_seed_level_is_a_real_cefr_band() {
+        for (point, _, level) in seed_for("en") {
+            assert!(
+                ["A1", "A2", "B1", "B2", "C1", "C2"].contains(level),
+                "{point} 的等級是 {level}"
+            );
         }
     }
 }

@@ -487,24 +487,79 @@ pub async fn delete_def(db: &Db, lang: &str, point: &str) -> Result<bool> {
     Ok(affected > 0)
 }
 
-/// 第一次使用某個語言時，把程式碼裡的種子寫進資料表。
+/// 第一次使用某個語言時，把程式碼裡的種子寫進資料表；種子清單改版時
+/// 補上缺的那些。回傳這次寫了幾筆。
 ///
-/// 已經有定義的語言原樣不動——使用者編輯過或匯入過之後，
-/// 再跑一次不該把他的東西蓋掉。回傳這次寫了幾筆。
+/// ## 為什麼不是「有資料就不動」
+///
+/// 原本只要該語言有任何一筆定義就直接返回，於是種子清單改了之後，
+/// **早就用過的資料庫永遠看不到新增的點**——只有全新安裝的人拿得到。
+/// 那等於清單只能改給未來的使用者看。
+///
+/// ## 為什麼也不是「每次都補齊缺的」
+///
+/// 那樣使用者刪掉一個用不到的點之後，下次開 App 它就回來了，
+/// 而且怎麼刪都刪不掉。所以補齊靠 [`SEED_VERSION`] 版號**只跑一次**：
+/// 清單改版才補，補完記下版號。
+///
+/// [`SEED_VERSION`]: wordforge_core::grammar_points::SEED_VERSION
+///
+/// ## 補齊時碰什麼、不碰什麼
+///
+/// INSERT 缺的識別碼；另外把**我們自己種下的**那些列（`origin = 'seed'`）
+/// 的 `level` 與 `sort_order` 對齊到新版種子。
+///
+/// 只補 `level` 是不夠的：既有資料庫裡那 26 筆的等級全是 NULL、順序是
+/// 舊版的排法，只加新點的話文法頁會變成「新的十四個有分級、舊的沒有，
+/// 而且順序還是亂的」——看起來像功能壞了一半，實際上就是壞了一半。
+///
+/// **`name`、`explanation`、`examples` 一律不碰。** 那些可能是使用者
+/// 自己改的、或花了一次模型呼叫生出來的，沒有備份，洗掉就沒了。
+/// `origin` 不是 `seed` 的列（使用者自己加的、匯入的）整列都不動。
 ///
 /// 沒有種子的語言（日文、法文…）回傳 0，文法頁會是空的並提示匯入。
 /// 那是誠實的：硬套英文的分類只會產生垃圾資料。
 pub async fn seed_defs(db: &Db, lang: &str, now: OffsetDateTime) -> Result<usize> {
-    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grammar_def WHERE lang = ?")
-        .bind(lang)
-        .fetch_one(db.pool())
-        .await?;
-    if existing > 0 {
+    use wordforge_core::grammar_points::SEED_VERSION;
+
+    let seed = wordforge_core::grammar_points::seed_for(lang);
+    if seed.is_empty() {
         return Ok(0);
     }
 
-    let seed = wordforge_core::grammar_points::seed_for(lang);
-    for (i, (point, name)) in seed.iter().enumerate() {
+    let version_key = format!("grammar_seed:{lang}");
+    let applied = crate::meta::get_i64(db, &version_key).await?;
+
+    let existing: Vec<String> = sqlx::query_scalar("SELECT point FROM grammar_def WHERE lang = ?")
+        .bind(lang)
+        .fetch_all(db.pool())
+        .await?;
+
+    // 版號已經是最新的就什麼都不做。**這個判斷要在 `existing` 之前生效**，
+    // 否則使用者刪掉的點每次啟動都會回來。
+    if applied == Some(SEED_VERSION) {
+        return Ok(0);
+    }
+
+    let mut written = 0usize;
+    for (i, (point, name, level)) in seed.iter().enumerate() {
+        if existing.iter().any(|e| e == point) {
+            // 已經有了：只把等級與順序對齊，而且只碰我們自己種的那些列。
+            // `name` 與講解不在 SET 裡——那是使用者的東西。
+            sqlx::query(
+                "UPDATE grammar_def
+                 SET level = COALESCE(level, ?3), sort_order = ?4, updated_at = ?5
+                 WHERE lang = ?1 AND point = ?2 AND origin = 'seed'",
+            )
+            .bind(lang)
+            .bind(*point)
+            .bind(*level)
+            .bind(i as i64)
+            .bind(ts::to_sql(now))
+            .execute(db.pool())
+            .await?;
+            continue;
+        }
         upsert_def(
             db,
             &GrammarDef {
@@ -514,15 +569,18 @@ pub async fn seed_defs(db: &Db, lang: &str, now: OffsetDateTime) -> Result<usize
                 name: (*name).to_string(),
                 explanation: None,
                 examples: Vec::new(),
-                level: None,
+                level: Some((*level).to_string()),
                 sort_order: i as i64,
                 origin: "seed".into(),
             },
             now,
         )
         .await?;
+        written += 1;
     }
-    Ok(seed.len())
+
+    crate::meta::set_i64(db, &version_key, SEED_VERSION).await?;
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -622,6 +680,107 @@ mod def_tests {
 
         let got = get_def(&db, "en", "tense").await.unwrap().unwrap();
         assert_eq!(got.name, "我自己改的名字", "使用者的編輯被種子蓋掉了");
+    }
+
+    /// 種子要帶 CEFR 等級。`level` 欄位資料表一直都有，但種子從來沒填過，
+    /// 所以文法頁沒辦法說「這個點你現在還用不到」。
+    #[tokio::test]
+    async fn seeded_points_carry_their_level() {
+        let db = setup().await;
+        seed_defs(&db, "en", t0()).await.unwrap();
+
+        let defs = list_defs(&db, "en").await.unwrap();
+        assert!(
+            defs.iter().all(|d| d.level.is_some()),
+            "有種子的點都該有等級：{:?}",
+            defs.iter()
+                .filter(|d| d.level.is_none())
+                .map(|d| &d.point)
+                .collect::<Vec<_>>()
+        );
+
+        // 順序要是教材的順序，不是字母序——冠詞排在倒裝前面
+        let order = |p: &str| defs.iter().position(|d| d.point == p).unwrap();
+        assert!(
+            order("articles") < order("inversion"),
+            "A1 的點該排在 C1 前面"
+        );
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：`seed_defs` 只要該語言有任何
+    /// 一筆定義就直接返回，於是種子清單改版之後，**早就用過的資料庫
+    /// 永遠看不到新增的點**——只有全新安裝的人拿得到。
+    #[tokio::test]
+    async fn a_new_seed_version_tops_up_an_existing_database() {
+        let db = setup().await;
+
+        // 一個「舊版」的資料庫：只有幾個點，版號停在 1
+        for (i, (point, name)) in [("tense", "時態"), ("articles", "冠詞")].iter().enumerate() {
+            let mut d = def(point, name);
+            d.origin = "seed".into();
+            d.sort_order = i as i64;
+            upsert_def(&db, &d, t0()).await.unwrap();
+        }
+        let mut edited = def("tense", "我自己改的名字");
+        edited.explanation = Some("我自己寫的".into());
+        upsert_def(&db, &edited, t0()).await.unwrap();
+        crate::meta::set_i64(&db, "grammar_seed:en", 1)
+            .await
+            .unwrap();
+
+        let added = seed_defs(&db, "en", t0()).await.unwrap();
+        assert!(added > 0, "改版之後該補上缺的點");
+
+        let defs = list_defs(&db, "en").await.unwrap();
+        assert!(
+            defs.iter().any(|d| d.point == "reported-speech"),
+            "新增的點沒有補進來"
+        );
+
+        // 名稱與講解是使用者的東西，不能碰
+        let tense = get_def(&db, "en", "tense").await.unwrap().unwrap();
+        assert_eq!(tense.name, "我自己改的名字", "使用者改的名稱被蓋掉了");
+        assert_eq!(
+            tense.explanation.as_deref(),
+            Some("我自己寫的"),
+            "使用者的講解被蓋掉了"
+        );
+
+        // 但等級與順序要對齊：只補新的點的話，舊的那些永遠沒有等級、
+        // 順序還是舊版的排法，文法頁等於只做了一半
+        assert!(
+            defs.iter().all(|d| d.level.is_some()),
+            "既有的點沒有補上等級：{:?}",
+            defs.iter()
+                .filter(|d| d.level.is_none())
+                .map(|d| &d.point)
+                .collect::<Vec<_>>()
+        );
+        let order = |p: &str| defs.iter().position(|d| d.point == p).unwrap();
+        assert!(
+            order("articles") < order("tense"),
+            "既有的點沒有照新版順序重排"
+        );
+
+        // 補完就記下版號，再跑一次不該重複做事
+        assert_eq!(seed_defs(&db, "en", t0()).await.unwrap(), 0);
+    }
+
+    /// 補齊只跑一次，否則使用者刪掉用不到的點之後，下次開 App 它就回來了，
+    /// 而且怎麼刪都刪不掉。
+    #[tokio::test]
+    async fn a_deleted_point_does_not_come_back_on_the_next_launch() {
+        let db = setup().await;
+        seed_defs(&db, "en", t0()).await.unwrap();
+
+        assert!(delete_def(&db, "en", "inversion").await.unwrap());
+        seed_defs(&db, "en", t0()).await.unwrap();
+
+        let defs = list_defs(&db, "en").await.unwrap();
+        assert!(
+            !defs.iter().any(|d| d.point == "inversion"),
+            "刪掉的點又被種回來了"
+        );
     }
 
     /// 沒有種子的語言開箱是空的——硬套英文的分類只會產生垃圾資料。
