@@ -682,6 +682,10 @@ pub fn translation_task(
     native_lang: &str,
     direction_to_target: bool,
     material_excerpt: Option<&str>,
+    // 這次的情境主題，空字串表示不指定（有教材時就該是空的）。
+    // 沒有這個東西時，模型拿到一組日常單字只會反覆寫出同一批場景——
+    // 閱讀早就在輪換主題了，翻譯漏掉了。
+    topic: &str,
     // 這次要練到的字。一部分是今天到期的，一部分是從學過的字裡隨機抽的
     // （見 `practice::translation_mix`），所以文案不能寫「今天該複習的」。
     words: &[String],
@@ -710,7 +714,12 @@ pub fn translation_task(
          這些字是照著他的複習進度挑出來的，所以**一題用一個、盡量不要重複**，\n\
          剛好把清單用完。\n\
          方向是{target} → {native}時，那個字直接出現在題目句子裡；\n\
-         方向是{native} → {target}時，題目句子要寫成翻出來自然會用到它。\n\n",
+         方向是{native} → {target}時，題目句子要寫成翻出來自然會用到它。\n\n\
+         # 情境要有變化\n\
+         每一題的**場合、說話的人、想達成的事都要不一樣**。\n\
+         同一個字在不同情境下的用法不同，換情境等於多練一次；\n\
+         每題都寫成同一個場景的話，這份練習就只練到一種用法。\n\
+         也不要每題都是同一個句型（都是問句、都是「我昨天…」）。\n\n",
         count = count,
         native = native_lang,
         target = target_lang,
@@ -718,6 +727,18 @@ pub fn translation_task(
         answer = answer_lang,
         words = words.join("、"),
     );
+
+    // 主題只是起點，不是限制：真正要的是題目之間有差異。
+    // 上面那段「情境要有變化」不管有沒有主題都要講——沒有主題時
+    // 模型的預設場景收斂得更嚴重。
+    if !topic.is_empty() {
+        prompt.push_str(&format!(
+            "# 這次的主題\n\
+             {topic}\n\
+             句子都落在這個主題底下，但主題底下也有很多不同的場合，\n\
+             上一段的要求仍然成立。\n\n"
+        ));
+    }
 
     if let Some(excerpt) = material_excerpt {
         prompt.push_str(&format!(
@@ -1039,6 +1060,7 @@ mod tests {
             "繁體中文",
             true,
             Some("Lesson 3: At the market."),
+            "",
             &due,
             3,
         );
@@ -1047,8 +1069,34 @@ mod tests {
         assert!(text.contains("只能"), "沒有講清楚是硬限制：{text}");
 
         // 沒指定教材時整段不該出現，否則模型會看到一個空的「指定教材」
-        let free = translation_task("English", "繁體中文", true, None, &due, 3);
+        let free = translation_task("English", "繁體中文", true, None, "", &due, 3);
         assert!(!free.messages[0].content.contains("指定教材"));
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：翻譯的 prompt 對句子的要求只有
+    /// 「自然、日常」，沒有主題也沒有任何變化的要求。模型拿到一組日常單字
+    /// （water、catch、sign）就反覆寫出同一批場景，使用者看到的是
+    /// 「出的句子情境都類似」。閱讀早就在輪換主題了，翻譯漏掉了。
+    #[test]
+    fn translation_asks_for_a_different_scene_in_every_item() {
+        let due = vec!["weather".to_string()];
+
+        let with_topic = translation_task("English", "繁體中文", true, None, "旅行：訂房", &due, 3);
+        let text = with_topic.messages[0].content.clone();
+        assert!(text.contains("旅行：訂房"), "主題沒進 prompt：{text}");
+        assert!(
+            text.contains("場合"),
+            "光給主題不夠，還要明講每題場景不同：{text}"
+        );
+
+        // 沒有主題時「情境要有變化」仍然要講——那時候收斂得更嚴重
+        let no_topic = translation_task("English", "繁體中文", true, None, "", &due, 3);
+        let text = no_topic.messages[0].content.clone();
+        assert!(text.contains("場合"), "沒主題時更需要這段：{text}");
+        assert!(
+            !text.contains("這次的主題"),
+            "空主題不該留下一個空標題：{text}"
+        );
     }
 
     /// 選擇題在本地判分，模型從頭到尾沒看過學習者選了什麼。
@@ -1122,7 +1170,7 @@ mod tests {
     fn the_source_sentence_language_follows_the_direction() {
         let due = vec!["weather".to_string()];
 
-        let to_target = translation_task("English", "繁體中文", true, None, &due, 3);
+        let to_target = translation_task("English", "繁體中文", true, None, "", &due, 3);
         let text = &to_target.messages[0].content;
         assert!(
             text.contains("繁體中文 → English"),
@@ -1133,7 +1181,7 @@ mod tests {
             "中翻英的題目句子該是中文：{text}"
         );
 
-        let to_native = translation_task("English", "繁體中文", false, None, &due, 3);
+        let to_native = translation_task("English", "繁體中文", false, None, "", &due, 3);
         let text = &to_native.messages[0].content;
         assert!(text.contains("English → 繁體中文"), "{text}");
         assert!(
@@ -1284,7 +1332,7 @@ mod tests {
     #[test]
     fn translation_task_reuses_due_words() {
         let due = vec!["borrow".to_string(), "return".to_string()];
-        let req = translation_task("English", "繁體中文", true, None, &due, 3);
+        let req = translation_task("English", "繁體中文", true, None, "", &due, 3);
         let text = &req.messages[0].content;
         assert!(text.contains("borrow"));
         assert!(text.contains("出 3 個"));

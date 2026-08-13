@@ -141,16 +141,34 @@ pub async fn delete(db: &Db, profile_id: ProfileId, id: ExerciseId) -> Result<bo
 }
 
 /// 最近用過的情境主題，新的在後。用來輪換，避免每篇文章都在講校園生活。
-pub async fn recent_topics(db: &Db, profile_id: ProfileId, limit: i64) -> Result<Vec<String>> {
-    let rows: Vec<String> = sqlx::query_scalar(
+///
+/// `kinds` 限定只看哪些題型，理由跟 [`recent_target_words`] 一樣：
+/// 記憶名額只有幾個，不限題型的話兩種題型會互相沖掉對方的歷史。
+/// 閱讀與翻譯各自輪換自己的主題——它們的主題撞在一起沒有關係，
+/// 一篇講旅行的文章配一題講旅行的翻譯反而是好事。
+pub async fn recent_topics(
+    db: &Db,
+    profile_id: ProfileId,
+    kinds: &[&str],
+    limit: i64,
+) -> Result<Vec<String>> {
+    if kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", kinds.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let sql = format!(
         "SELECT topic FROM exercise
-         WHERE profile_id = ? AND topic IS NOT NULL
-         ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(profile_id.0)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
+         WHERE profile_id = ? AND topic IS NOT NULL AND kind IN ({placeholders})
+         ORDER BY created_at DESC LIMIT ?"
+    );
+    let mut q = sqlx::query_scalar::<_, String>(&sql).bind(profile_id.0);
+    for kind in kinds {
+        q = q.bind(*kind);
+    }
+    let rows: Vec<String> = q.bind(limit).fetch_all(db.pool()).await?;
     Ok(rows.into_iter().rev().collect())
 }
 
@@ -505,8 +523,66 @@ mod tests {
             .unwrap();
         }
 
-        let topics = recent_topics(&db, profile, 10).await.unwrap();
+        let topics = recent_topics(&db, profile, &["reading"], 10).await.unwrap();
         assert_eq!(topics, vec!["校園生活", "職場", "旅行"], "舊到新");
+    }
+
+    /// 主題記憶只有幾個名額，不限題型的話兩種題型會互相沖掉對方的歷史：
+    /// 翻譯連出幾題就把閱讀的主題擠光，下一篇文章又回到六篇前的題材。
+    /// 這跟 `recent_target_words` 要限定題型是同一個理由。
+    #[tokio::test]
+    async fn topic_memory_is_not_shared_across_exercise_kinds() {
+        let (db, profile) = setup().await;
+        for (i, (kind, topic)) in [
+            ("reading", "校園生活"),
+            ("translation_to_target", "職場"),
+            ("translation_to_native", "旅行"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            create(
+                &db,
+                NewExercise {
+                    profile_id: profile,
+                    kind,
+                    payload_json: "{}",
+                    target_words: &[],
+                    coverage: None,
+                    model: None,
+                    material_id: None,
+                    topic: Some(topic),
+                },
+                t0() + time::Duration::minutes(i as i64),
+            )
+            .await
+            .unwrap();
+        }
+
+        let reading = recent_topics(&db, profile, &["reading"], 10).await.unwrap();
+        assert_eq!(reading, vec!["校園生活"], "翻譯的主題不該算進閱讀的歷史");
+
+        let translation = recent_topics(
+            &db,
+            profile,
+            &["translation_to_target", "translation_to_native"],
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            translation,
+            vec!["職場", "旅行"],
+            "翻譯的兩個方向算同一組，閱讀的不算"
+        );
+
+        assert!(
+            recent_topics(&db, profile, &[], 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "沒指定題型時回空的，不要靜靜地回全部"
+        );
     }
 
     #[tokio::test]
@@ -514,7 +590,12 @@ mod tests {
         let (db, profile) = setup().await;
         assert!(recent_kinds(&db, profile, 5).await.unwrap().is_empty());
         assert!(recent(&db, profile, 5, 0).await.unwrap().is_empty());
-        assert!(recent_topics(&db, profile, 5).await.unwrap().is_empty());
+        assert!(
+            recent_topics(&db, profile, &["reading"], 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(count(&db, profile).await.unwrap(), 0);
     }
 

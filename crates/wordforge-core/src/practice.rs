@@ -26,7 +26,10 @@ pub enum ExerciseKind {
 }
 
 impl ExerciseKind {
-    pub fn as_str(&self) -> &'static str {
+    // `const` 讓呼叫端可以組出 `&[&str]` 常數，不必再抄一次這些字串。
+    // 抄一份的話改了這裡不會有人報錯，而題型過濾失效是安靜的：
+    // 查詢照樣回結果，只是回錯的那些。
+    pub const fn as_str(&self) -> &'static str {
         match self {
             ExerciseKind::TranslationToTarget => "translation_to_target",
             ExerciseKind::TranslationToNative => "translation_to_native",

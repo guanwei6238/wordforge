@@ -102,7 +102,26 @@ const REVIEW_WORDS: i64 = 6;
 /// 那就是間隔重複。
 const NEW_WORD_MEMORY: i64 = 5;
 
+/// 翻譯選字要避開最近幾份翻譯用過的字。
+///
+/// 比 [`NEW_WORD_MEMORY`] 長，因為每份只有三到五個字——五份才二十個字左右，
+/// 而牌組裡「學過的字」本來就比生詞候選池小得多（實測一個牌組只有 43 個）。
+/// 太短的話輪不出效果，太長的話小牌組會被排除到沒東西可用，
+/// 每次都得走放寬那條路。
+const TRANSLATION_WORD_MEMORY: i64 = 8;
+
 const TOPIC_MEMORY: i64 = 6;
+
+/// 會寫成短文的題型。主題輪換時這兩種算同一組——同一個主題的文章
+/// 接著一份同主題的克漏字，讀起來就是同一篇。
+const PROSE_KINDS: &[&str] = &[ExerciseKind::Reading.as_str(), ExerciseKind::Cloze.as_str()];
+
+/// 翻譯的兩個方向算同一組：中翻英和英翻中撞題材時，
+/// 使用者看到的仍然是「又是這個情境」。
+const TRANSLATION_KINDS: &[&str] = &[
+    ExerciseKind::TranslationToTarget.as_str(),
+    ExerciseKind::TranslationToNative.as_str(),
+];
 
 /// 一篇克漏字挖幾格。
 ///
@@ -307,11 +326,32 @@ impl<'a> PracticeEngine<'a> {
         let excerpt = self
             .material_excerpt(&words, now.unix_timestamp() as u64)
             .await?;
+
+        // 主題輪換。跟閱讀同一個機制，只是翻譯一直沒接上——沒有主題時
+        // 模型拿到一組日常單字（water、catch、sign）永遠寫出同一批場景。
+        //
+        // 只看翻譯自己的歷史：跟閱讀共用記憶的話，六個名額會被兩種題型
+        // 分掉，兩邊都輪不完一輪就被沖掉了。
+        let recent_topics = exercises::recent_topics(
+            self.db,
+            ProfileId(profile_id),
+            TRANSLATION_KINDS,
+            TOPIC_MEMORY,
+        )
+        .await?;
+        // 指定教材時取材範圍由課本決定，主題輪換不該再插手（同 `generate_reading`）
+        let topic = if excerpt.is_some() {
+            ""
+        } else {
+            practice::pick_topic(&recent_topics, now.unix_timestamp() as u64)
+        };
+
         let mut req = prompts::translation_task(
             self.target_name(),
             self.native_name(),
             kind == ExerciseKind::TranslationToTarget,
             excerpt.as_deref(),
+            topic,
             &words,
             count,
         );
@@ -354,7 +394,11 @@ impl<'a> PracticeEngine<'a> {
             to_target: kind == ExerciseKind::TranslationToTarget,
             items,
         };
-        self.store(profile_id, kind, body, words, None, None, now)
+        // 主題一定要存回去，否則 `recent_topics` 永遠是空的、`pick_topic`
+        // 永遠從同一個位置挑，輪換等於沒有開。空字串存成 NULL——
+        // 存進去的話它會佔掉一個記憶名額，還會被當成「用過的主題」。
+        let topic = Some(topic).filter(|t| !t.is_empty());
+        self.store(profile_id, kind, body, words, None, topic, now)
             .await
     }
 
@@ -456,7 +500,8 @@ impl<'a> PracticeEngine<'a> {
         // 主題輪換：不指定的話模型永遠寫校園生活與天氣，
         // 十篇讀起來像同一篇。用時間戳當 seed，同一批候選也不會每次都給同一個。
         let recent_topics =
-            exercises::recent_topics(self.db, ProfileId(profile_id), TOPIC_MEMORY).await?;
+            exercises::recent_topics(self.db, ProfileId(profile_id), PROSE_KINDS, TOPIC_MEMORY)
+                .await?;
         let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
 
         // 指定教材時，取材範圍由課本決定，主題輪換就不該再插手
@@ -649,7 +694,8 @@ impl<'a> PracticeEngine<'a> {
             .await?;
 
         let recent_topics =
-            exercises::recent_topics(self.db, ProfileId(profile_id), TOPIC_MEMORY).await?;
+            exercises::recent_topics(self.db, ProfileId(profile_id), PROSE_KINDS, TOPIC_MEMORY)
+                .await?;
         let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
         // 指定教材時取材範圍由課本決定，主題輪換就不該再插手
         let topic = if excerpt.is_some() { "" } else { topic };
@@ -1402,6 +1448,20 @@ impl<'a> PracticeEngine<'a> {
     /// 只有**一個學過的字都沒有**時才退到沒學過的到期字。那是新使用者
     /// 才會遇到的狀況（匯完字典、加了一批字就來練），這時候給空白比
     /// 給新卡更糟。
+    ///
+    /// ## 為什麼要排除最近用過的字
+    ///
+    /// 到期那半邊是 `ORDER BY due` 取前幾個，**完全決定性**。而翻譯練習
+    /// 不動 FSRS 排程（`grade_translation` 不 review 任何卡片），所以做完
+    /// 一份翻譯之後那些字的 `due` 沒有變——下一份拿到的是同一批。
+    ///
+    /// 實測一個牌組：到期且學過的字只有 7 個，出 5 題時到期那半邊固定
+    /// 是同樣的 3 個。使用者看到的是「翻譯用的單字都一樣」。
+    ///
+    /// 而且 `due` 常常整批平手（同一次匯入、同一天複習的卡），平手時
+    /// SQLite 的順序固定，字變多也不會自己輪換。
+    ///
+    /// 排除是**軟的**：排完沒東西剩就照用。少練一次不如重複練一次。
     async fn translation_words(
         &self,
         profile_id: i64,
@@ -1410,17 +1470,43 @@ impl<'a> PracticeEngine<'a> {
     ) -> Result<Vec<String>> {
         let (due_n, extra_n) = practice::translation_mix(count);
 
-        // 多撈一點，讓補位有東西可用
+        // 只看翻譯自己的歷史。混進閱讀的話，那邊每篇教六個生詞，
+        // 幾篇就把翻譯的記憶名額吃光了。
+        let recent = exercises::recent_target_words(
+            self.db,
+            ProfileId(profile_id),
+            TRANSLATION_KINDS,
+            TRANSLATION_WORD_MEMORY,
+        )
+        .await?;
+        let used_recently = |w: &String| recent.iter().any(|r| r.eq_ignore_ascii_case(w.as_str()));
+
+        // 撈的量要**連排除掉的份一起算**。
+        //
+        // `LIMIT` 是在 SQL 裡截斷的，排除最近用過的字則發生在那之後——
+        // 只撈 `count` 個的話，前幾個剛好都是上次用過的時候，剩下的
+        // 不夠填到期那半邊的名額，於是又把上次的字拿回來。
+        // 這個洞是測試抓到的：連兩次出題仍然重複拿到第一個字。
         let due_pool = self
-            .studied_due_words(profile_id, count as i64, now)
+            .studied_due_words(profile_id, count as i64 + TRANSLATION_WORD_MEMORY, now)
             .await?;
+
+        // 沒用過的排前面，用過的仍留在池子裡當備胎——順序決定誰先被取用
+        let (fresh_due, stale_due): (Vec<String>, Vec<String>) =
+            due_pool.iter().cloned().partition(|w| !used_recently(w));
+        let due_pool: Vec<String> = fresh_due.into_iter().chain(stale_due).collect();
+
         let mut words: Vec<String> = due_pool.iter().take(due_n).cloned().collect();
 
+        // 隨機那半邊同樣先避開最近用過的：`sample_known_words` 的 exclude
+        // 是硬排除，所以把 recent 一起傳進去，不夠再放寬。
+        let mut avoid = words.clone();
+        avoid.extend(recent.iter().cloned());
         let extra = cards::sample_known_words(
             self.db,
             ProfileId(profile_id),
             &self.target_lang,
-            &words,
+            &avoid,
             extra_n as i64,
         )
         .await?;
@@ -1440,7 +1526,10 @@ impl<'a> PracticeEngine<'a> {
         // 隨機抽的不夠時，回頭用剩下的到期字補
         fill(due_pool, &mut words);
 
-        // 到期的不夠時，再多抽一些學過的
+        // 到期的不夠時，再多抽一些學過的。
+        // 這一輪的 exclude **只有 `words`**，不含 `recent`——上面避開最近用過的
+        // 那層在這裡自動放寬。牌組小的時候排除完就沒東西可抽了，
+        // 那時候重複出現一個練過的字，比硬縮題數好。
         if words.len() < count {
             let more = cards::sample_known_words(
                 self.db,

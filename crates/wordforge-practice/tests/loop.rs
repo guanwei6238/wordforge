@@ -1684,6 +1684,150 @@ async fn translation_does_not_quiz_words_the_learner_has_never_studied() {
     }
 }
 
+/// 這條測試存在的理由是它曾經是錯的：到期那半邊是 `ORDER BY due` 取前幾個，
+/// 完全決定性，而翻譯練習**不動 FSRS 排程**（`grade_translation` 不 review
+/// 任何卡片）——做完一份之後那些字的 `due` 沒有變，下一份拿到同一批。
+///
+/// 使用者的原話是「出題用的單字都練習過」。實測一個真實牌組：到期且學過的
+/// 字只有 7 個，出 5 題時到期那半邊固定是同樣的 3 個。
+///
+/// 這裡所有的字都在同一刻學過，`due` 整批平手——正是 SQLite 順序最穩定、
+/// 輪換最不可能自己發生的情況。
+#[tokio::test]
+async fn two_translations_in_a_row_do_not_reuse_the_same_words() {
+    // 用互相不是子字串的字：`prompt.contains("eta")` 在 beta / zeta / theta
+    // 出現時都會成立，那樣測到的是子字串比對，不是選字邏輯。
+    let words = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima",
+    ];
+    let (db, profile) = setup(&words).await;
+    set_vocabulary(&db, profile, 1_000).await; // 滿額 5 題
+
+    for id in 1..=words.len() as i64 {
+        study(&db, profile, id).await;
+    }
+
+    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items, items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let later = t0() + Duration::days(400);
+    let used = |prompt: &str| -> Vec<String> {
+        words
+            .iter()
+            .filter(|w| prompt.contains(**w))
+            .map(|w| w.to_string())
+            .collect()
+    };
+
+    engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), later)
+        .await
+        .unwrap();
+    let first = used(&llm.last_prompt());
+
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            later + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+    let second = used(&llm.last_prompt());
+
+    assert!(!first.is_empty() && !second.is_empty(), "兩次都要出得了題");
+    let repeated: Vec<&String> = second.iter().filter(|w| first.contains(w)).collect();
+    assert!(
+        repeated.is_empty(),
+        "字夠多的時候不該重複用：第一次 {first:?}，第二次 {second:?}，重複了 {repeated:?}"
+    );
+}
+
+/// 但排除是**軟的**：牌組小到排完沒東西剩時，寧可重複也要出得了題。
+///
+/// 這條跟上一條是一組的。只寫上一條的話，很容易實作成硬排除，
+/// 然後小牌組的使用者會突然一題都拿不到——而那個壞法沒有任何測試會紅。
+#[tokio::test]
+async fn a_small_deck_repeats_words_rather_than_running_out() {
+    let (db, profile) = setup(&["alpha", "beta", "gamma"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for id in 1..=3 {
+        study(&db, profile, id).await;
+    }
+
+    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items, items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let later = t0() + Duration::days(400);
+    engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), later)
+        .await
+        .unwrap();
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            later + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        ["alpha", "beta", "gamma"]
+            .iter()
+            .any(|w| prompt.contains(w)),
+        "三個字全被排除掉就一題都出不了了：\n{prompt}"
+    );
+}
+
+/// 情境主題要輪換，而且要存回去——沒存的話 `recent_topics` 永遠是空的，
+/// `pick_topic` 每次從同一個位置挑，等於這個機制沒開。
+///
+/// 使用者的原話是「出的句子情境都類似」。
+#[tokio::test]
+async fn translation_topics_rotate_between_exercises() {
+    let (db, profile) = setup(&["alpha", "beta", "gamma", "delta", "epsilon"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for id in 1..=5 {
+        study(&db, profile, id).await;
+    }
+
+    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items, items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let later = t0() + Duration::days(400);
+    let topic_of = |prompt: &str| -> String {
+        wordforge_core::practice::TOPICS
+            .iter()
+            .find(|t| prompt.contains(**t))
+            .unwrap_or_else(|| panic!("prompt 裡沒有任何主題：\n{prompt}"))
+            .to_string()
+    };
+
+    engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), later)
+        .await
+        .unwrap();
+    let first = topic_of(&llm.last_prompt());
+
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            later + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+    let second = topic_of(&llm.last_prompt());
+
+    assert_ne!(first, second, "連兩次同一個主題，輪換沒有生效");
+}
+
 /// 學過的字不夠出滿題數時，**縮題數**而不是拿新卡湊滿。
 ///
 /// 少出兩題比要使用者寫出從沒見過的單字好。只有一個學過的字都沒有時
