@@ -18,5 +18,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "time"] }
 tracing = { workspace = true }
 
+# 只為了 `setsid`：查 PATH 的那支互動式 shell 必須跟終端機脫鉤，
+# 否則它的 job control 初始化會把整個 App 停掉（見 shell_path.rs）
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

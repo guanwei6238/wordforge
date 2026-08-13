@@ -77,16 +77,16 @@ async fn query() -> Option<String> {
 
     let script = format!("printf '%s%s%s' '{MARKER}' \"$PATH\" '{MARKER}'");
 
-    let output = tokio::time::timeout(
-        TIMEOUT,
-        tokio::process::Command::new(&shell)
-            // -i 是關鍵：nvm 之類的初始化只寫在 ~/.bashrc，
-            // 而登入非互動 shell 不讀它
-            .args(["-ilc", &script])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output(),
-    )
+    let mut cmd = tokio::process::Command::new(&shell);
+    // -i 是關鍵：nvm 之類的初始化只寫在 ~/.bashrc，
+    // 而登入非互動 shell 不讀它
+    cmd.args(["-ilc", &script])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    detach_from_terminal(&mut cmd);
+
+    let output = tokio::time::timeout(TIMEOUT, cmd.output())
     .await
     .inspect_err(|_| tracing::debug!(%shell, "查 PATH 逾時"))
     .ok()?
@@ -94,6 +94,50 @@ async fn query() -> Option<String> {
 
     extract(&String::from_utf8_lossy(&output.stdout))
 }
+
+/// 把子行程放進自己的 session，跟控制終端機切斷。
+///
+/// ## 這一步不是保險，是必要的
+///
+/// **互動式 shell 會做 job control 初始化**：它比對自己的行程組和終端機的
+/// 前景行程組，對不上就對**自己所在的行程組**送 `SIGTTIN` 把大家停住，
+/// 等著被搬到前景。而它預設繼承我們的行程組——也就是整個 App 的行程組。
+///
+/// 從終端機啟動（`npm run tauri dev`）時，這件事的後果是：使用者一開設定頁，
+/// `detect_backends` 走到這裡，然後整個 job 就被停住：
+///
+/// ```text
+/// 287475 Tl+  wordforge-desktop            ← App 被停住
+/// 289777 T+   /bin/bash -ilc printf ...    ← 兇手
+/// [1]+  Stopped    npm run tauri dev
+/// ```
+///
+/// 使用者看到的是視窗凍結，桌面環境接著跳出「強制退出」。
+///
+/// 打包後從桌面點開不會發生——那時候沒有控制終端機。所以這個 bug
+/// 只在開發時看得到，而且看起來像 App 自己崩潰。
+///
+/// `setsid` 之後子行程沒有控制終端機，bash 直接關掉 job control
+/// （它會往 stderr 抱怨一句，而我們本來就把 stderr 丟掉了），
+/// rc 檔照樣讀，PATH 照樣查得到。
+///
+/// 只換行程組（`process_group`）不夠：那樣 App 不會被停，但 shell 自己
+/// 仍然會卡在 `T` 直到逾時，每次開設定頁都白等五秒，還留下一個殭屍。
+#[cfg(unix)]
+fn detach_from_terminal(cmd: &mut tokio::process::Command) {
+    // SAFETY: `pre_exec` 在 fork 之後、exec 之前執行，這中間只能呼叫
+    // async-signal-safe 的東西。`setsid` 是其中之一，而且我們沒有配置
+    // 記憶體、沒有碰鎖。失敗（已經是 session leader）不影響正確性。
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_from_terminal(_cmd: &mut tokio::process::Command) {}
 
 /// 從一堆雜訊裡撈出兩個標記之間的東西。
 fn extract(stdout: &str) -> Option<String> {
@@ -123,6 +167,44 @@ pub fn merge(shell_path: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 這條測試存在的理由是它曾經是錯的：查 PATH 用的互動式 shell 繼承了
+    /// App 的行程組，而互動式 bash 一啟動就做 job control 初始化——
+    /// 發現自己不是終端機的前景行程組，就對整個行程組送 SIGTTIN。
+    /// 從終端機啟動時，使用者一開設定頁整個 App 就被停住：
+    ///
+    /// ```text
+    /// 287475 Tl+  wordforge-desktop
+    /// 289777 T+   /bin/bash -ilc printf ...
+    /// [1]+  Stopped    npm run tauri dev
+    /// ```
+    ///
+    /// 這裡驗兩件事：子行程真的脫離了終端機（成為 session leader 而不是
+    /// 停在 `T`），而且**PATH 仍然查得到**——脫鉤如果讓 rc 檔不再被讀，
+    /// 那就是修掉一個 bug 換來另一個。
+    ///
+    /// 標 `#[ignore]` 是因為它會真的執行使用者的 shell 與 rc 檔，
+    /// 結果取決於機器上的環境。用這個跑：
+    ///
+    /// ```bash
+    /// cargo test -p wordforge-llm --lib -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "會執行使用者的 shell 與 rc 檔，結果依機器而異"]
+    async fn the_lookup_shell_never_stops_the_app() {
+        let Ok(shell) = std::env::var("SHELL") else {
+            eprintln!("沒有 SHELL，跳過");
+            return;
+        };
+        println!("shell = {shell}");
+
+        let path = query().await;
+        println!("查到的 PATH = {path:?}");
+        assert!(
+            path.is_some_and(|p| p.contains('/')),
+            "脫離終端機之後 rc 檔沒被讀到，PATH 查不出來"
+        );
+    }
 
     /// 互動式 shell 會印一堆東西，PATH 要能從裡面撈出來。
     #[test]
