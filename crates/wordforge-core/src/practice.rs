@@ -127,7 +127,7 @@ pub fn reading_length(vocabulary: i64) -> usize {
     }
 }
 
-/// 情境主題池。
+/// 情境主題的**種子**：`(主題, 適用題型)`。
 ///
 /// 沒有指定主題時，模型會自己挑——而它挑出來的永遠是那幾個
 /// （學校生活、天氣、旅行）。同樣的字彙樣本加同樣的主題，
@@ -135,36 +135,71 @@ pub fn reading_length(vocabulary: i64) -> usize {
 ///
 /// 主題本身也是學習內容：同一個字在點餐、看醫生、談工作時的用法不同，
 /// 換情境等於多練一次。
-pub const TOPICS: &[&str] = &[
-    "日常對話：問路、點餐、購物",
-    "校園生活：課程、考試、社團",
-    "職場：面試、開會、寫信",
-    "旅行：訂房、機場、迷路",
-    "健康：看醫生、描述症狀、運動習慣",
-    "科技：手機、網路、人工智慧",
-    "環境：氣候、回收、動物保育",
-    "飲食：食譜、餐廳評論、飲食習慣",
-    "娛樂：電影、音樂、遊戲",
-    "人際關係：朋友、家庭、衝突",
-    "新聞事件：報導一則虛構但合理的地方新聞",
-    "說明文：解釋一個日常現象為什麼會發生",
+///
+/// ## 這裡不是唯一的真相
+///
+/// 真正的清單存在 `topic` 資料表，使用者可以增刪改。這份種子只是
+/// 「開箱就有題材可用」的起點——準備多益的人不需要「校園生活」，
+/// 醫生要練的科別情境這裡一個都沒有。
+///
+/// ## 為什麼要標題型
+///
+/// 空陣列表示全部題型都適用，那是大多數。但最後兩項是**體裁**不是情境：
+/// 「報導一則虛構的地方新聞」對閱讀成立，拿去出翻譯題就是歪的——
+/// 翻譯要的是「在什麼場合說這句話」。這份清單原本只給閱讀用，
+/// 翻譯接上來之後才暴露出這個差別。
+pub const TOPICS: &[(&str, &[&str])] = &[
+    ("日常對話：問路、點餐、購物", &[]),
+    ("校園生活：課程、考試、社團", &[]),
+    ("職場：面試、開會、寫信", &[]),
+    ("旅行：訂房、機場、迷路", &[]),
+    ("健康：看醫生、描述症狀、運動習慣", &[]),
+    ("科技：手機、網路、人工智慧", &[]),
+    ("環境：氣候、回收、動物保育", &[]),
+    ("飲食：食譜、餐廳評論、飲食習慣", &[]),
+    ("娛樂：電影、音樂、遊戲", &[]),
+    ("人際關係：朋友、家庭、衝突", &[]),
+    (
+        "新聞事件：報導一則虛構但合理的地方新聞",
+        &["reading", "cloze"],
+    ),
+    (
+        "說明文：解釋一個日常現象為什麼會發生",
+        &["reading", "cloze"],
+    ),
 ];
+
+/// 主題種子的版本。**改動 [`TOPICS`] 就要加一。**
+///
+/// 理由同 `grammar_points::SEED_VERSION`：清單改了之後，早就用過的
+/// 資料庫要補得到，而且補齊只能跑一次，否則使用者刪掉的主題會復活。
+pub const TOPIC_SEED_VERSION: i64 = 1;
 
 /// 挑一個主題，避開最近用過的。
 ///
+/// `candidates` 由呼叫端從 `topic` 資料表撈出來（已經照題型過濾、
+/// 排除停用的）——`wordforge-core` 不碰 I/O，清單不可能住在這裡。
+///
 /// `recent` 是最近幾次用過的主題（新的在後）。用 `seed` 決定從哪裡開始挑，
 /// 讓同一批候選不會每次都給同一個——呼叫端傳練習次數或時間戳即可。
-pub fn pick_topic(recent: &[String], seed: u64) -> &'static str {
-    let available: Vec<&&str> = TOPICS
+///
+/// 一個候選都沒有時回 `None`：使用者可以把主題全部刪掉或停用，
+/// 那時候不指定主題就好，不該硬塞一個他刪掉的東西回去。
+pub fn pick_topic(candidates: &[String], recent: &[String], seed: u64) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let available: Vec<&String> = candidates
         .iter()
-        .filter(|t| !recent.iter().any(|r| r == **t))
+        .filter(|t| !recent.iter().any(|r| r == *t))
         .collect();
 
     // 全部都用過就重新開始，總不能沒有主題
     if available.is_empty() {
-        return TOPICS[(seed as usize) % TOPICS.len()];
+        return Some(candidates[(seed as usize) % candidates.len()].clone());
     }
-    available[(seed as usize) % available.len()]
+    Some(available[(seed as usize) % available.len()].clone())
 }
 
 /// 一個可以拿來當「這篇要教的新詞」的候選。
@@ -500,28 +535,33 @@ mod tests {
         assert!(reading_length(0) < reading_length(10_000));
     }
 
+    /// 候選清單實際上來自 `topic` 資料表；測試裡直接拿種子，
+    /// 內容一樣，只是省掉一個資料庫。
+    fn seed_topics() -> Vec<String> {
+        TOPICS.iter().map(|(t, _)| t.to_string()).collect()
+    }
+
     /// 同樣的主題重複出現，文章會越來越像。
     #[test]
     fn topics_rotate_away_from_recent_ones() {
-        let recent: Vec<String> = TOPICS[..3].iter().map(|t| t.to_string()).collect();
+        let all = seed_topics();
+        let recent: Vec<String> = all[..3].to_vec();
 
         for seed in 0..20 {
-            let picked = pick_topic(&recent, seed);
-            assert!(
-                !recent.iter().any(|r| r == picked),
-                "挑到了最近用過的主題：{picked}"
-            );
+            let picked = pick_topic(&all, &recent, seed).expect("有候選就該挑得出來");
+            assert!(!recent.contains(&picked), "挑到了最近用過的主題：{picked}");
         }
     }
 
     /// 不同的 seed 要挑到不同主題，否則等於沒輪換。
     #[test]
     fn different_seeds_give_different_topics() {
-        let picked: std::collections::HashSet<&str> = (0..TOPICS.len() as u64)
-            .map(|s| pick_topic(&[], s))
+        let all = seed_topics();
+        let picked: std::collections::HashSet<String> = (0..all.len() as u64)
+            .filter_map(|s| pick_topic(&all, &[], s))
             .collect();
         assert!(
-            picked.len() > TOPICS.len() / 2,
+            picked.len() > all.len() / 2,
             "輪換不夠分散，只出現 {} 種",
             picked.len()
         );
@@ -530,9 +570,33 @@ mod tests {
     /// 全部主題都用過之後不能卡住。
     #[test]
     fn exhausting_every_topic_starts_over() {
-        let all: Vec<String> = TOPICS.iter().map(|t| t.to_string()).collect();
-        let picked = pick_topic(&all, 5);
-        assert!(TOPICS.contains(&picked));
+        let all = seed_topics();
+        let picked = pick_topic(&all, &all, 5).expect("用完了也要挑得出來");
+        assert!(all.contains(&picked));
+    }
+
+    /// 使用者可以把主題全部刪掉或停用。那時候要回 `None`——
+    /// 硬塞一個他刪掉的東西回去，等於這個設定頁是裝飾品。
+    #[test]
+    fn no_candidates_means_no_topic() {
+        assert_eq!(pick_topic(&[], &[], 0), None);
+        assert_eq!(pick_topic(&[], &["用過的".to_string()], 7), None);
+    }
+
+    /// 體裁類的題材只給會寫成短文的題型。翻譯拿到「報導一則虛構的
+    /// 地方新聞」的話，出來的題目是歪的——翻譯要的是「在什麼場合說
+    /// 這句話」，不是文章體裁。
+    #[test]
+    fn genre_topics_are_restricted_to_prose_kinds() {
+        for (text, kinds) in TOPICS {
+            if text.starts_with("新聞事件") || text.starts_with("說明文") {
+                assert!(
+                    !kinds.is_empty(),
+                    "{text} 是體裁，該限定題型，否則翻譯也會拿到"
+                );
+                assert!(kinds.contains(&"reading"), "{text} 至少該給閱讀");
+            }
+        }
     }
 
     fn word(id: i64, text: &str, pos: &[&str], rank: i64) -> NewWord {

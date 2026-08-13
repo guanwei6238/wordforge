@@ -9,6 +9,7 @@ import {
 } from "../api";
 import LanguageSettings from "../components/LanguageSettings";
 import MaterialManager from "../components/MaterialManager";
+import TopicManager from "../components/TopicManager";
 import UsageStats from "../components/UsageStats";
 import LlmSetup from "../components/LlmSetup";
 
@@ -175,6 +176,8 @@ export default function Settings() {
           讀文章的時候也可以直接在閱讀測驗上按 A− / A+ 調，兩邊改的是同一個值。
         </p>
       </section>
+
+      <TopicManager />
 
       <MaterialManager />
 

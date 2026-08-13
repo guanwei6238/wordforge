@@ -1019,6 +1019,76 @@ export function deleteGrammar(
   return invoke("delete_grammar", { profileId, point });
 }
 
+/**
+ * 一個情境主題。出題時用來輪換題材，避免每篇都在講校園生活。
+ *
+ * 清單存在 `topic` 資料表，可以增刪改——寫死的那份對準備多益的人、
+ * 對醫生、對想練特定題材的人都不成立。
+ */
+export interface Topic {
+  id: number;
+  lang: string;
+  /** 給模型看的描述，會直接進 prompt，寫具體一點比較有用 */
+  text: string;
+  /** 適用的題型。**空的表示全部題型都適用**，那是大多數 */
+  kinds: string[];
+  /** seed（內建種子）/ import（匯入）/ manual（自己加） */
+  origin: string;
+  sort_order: number;
+  /** 關掉的仍然看得到，只是不會被拿去出題 */
+  enabled: boolean;
+}
+
+/** 可以指定給主題的題型。空陣列＝全部適用。 */
+export const TOPIC_KINDS: { value: string; label: string }[] = [
+  { value: "reading", label: "閱讀" },
+  { value: "cloze", label: "克漏字" },
+  { value: "translation_to_target", label: "中翻英" },
+  { value: "translation_to_native", label: "英翻中" },
+];
+
+/** 這個語言的全部主題，含停用的。 */
+export function listTopics(profileId = DEFAULT_PROFILE_ID): Promise<Topic[]> {
+  return invoke("list_topics", { profileId });
+}
+
+/**
+ * 新增或編輯一個主題。語言由 profile 決定，不用傳。
+ *
+ * 有 `id` 就是編輯（改得動文字本身），沒有就是新增。
+ */
+export function saveTopic(
+  topic: {
+    id?: number;
+    text: string;
+    kinds?: string[];
+    origin?: string;
+    sort_order?: number;
+    enabled?: boolean;
+  },
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<number> {
+  return invoke("save_topic", {
+    profileId,
+    topic: {
+      id: 0,
+      lang: "",
+      kinds: [],
+      origin: "manual",
+      sort_order: 0,
+      enabled: true,
+      ...topic,
+    },
+  });
+}
+
+export function deleteTopic(
+  id: number,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<boolean> {
+  return invoke("delete_topic", { profileId, id });
+}
+
 /** 請模型講解一個文法點，結果存進資料庫。要幾十秒。 */
 export function explainGrammar(
   point: string,

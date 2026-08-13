@@ -830,9 +830,9 @@ async fn consecutive_articles_use_different_topics() {
         let prompt = llm.last_prompt();
         let used = wordforge_core::practice::TOPICS
             .iter()
-            .find(|t| prompt.contains(**t))
+            .find(|(t, _)| prompt.contains(t))
             .expect("prompt 裡沒有指定主題");
-        topics.push(*used);
+        topics.push(used.0);
     }
 
     let unique: std::collections::HashSet<&&str> = topics.iter().collect();
@@ -1804,8 +1804,9 @@ async fn translation_topics_rotate_between_exercises() {
     let topic_of = |prompt: &str| -> String {
         wordforge_core::practice::TOPICS
             .iter()
-            .find(|t| prompt.contains(**t))
+            .find(|(t, _)| prompt.contains(t))
             .unwrap_or_else(|| panic!("prompt 裡沒有任何主題：\n{prompt}"))
+            .0
             .to_string()
     };
 
@@ -1826,6 +1827,106 @@ async fn translation_topics_rotate_between_exercises() {
     let second = topic_of(&llm.last_prompt());
 
     assert_ne!(first, second, "連兩次同一個主題，輪換沒有生效");
+}
+
+/// 主題清單是使用者的，不是寫死的。加一個自訂主題、把內建的全部停用，
+/// 出題就只會用他加的那個。
+///
+/// 這條測試存在的理由：`TOPICS` 曾經是 `const`，設定頁改不了任何東西。
+#[tokio::test]
+async fn a_topic_the_learner_added_is_the_one_that_reaches_the_prompt() {
+    use wordforge_db::topics;
+
+    let (db, profile) = setup(&["alpha", "beta", "gamma", "delta", "epsilon"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for id in 1..=5 {
+        study(&db, profile, id).await;
+    }
+
+    // 先讓種子進去，再把內建的全部停用，只留自己加的那個
+    topics::seed(&db, "en", t0()).await.unwrap();
+    for mut t in topics::list(&db, "en").await.unwrap() {
+        t.enabled = false;
+        topics::upsert(&db, &t, t0()).await.unwrap();
+    }
+    topics::upsert(
+        &db,
+        &topics::Topic {
+            id: 0,
+            lang: "en".into(),
+            text: "看診：描述症狀、聽醫囑".into(),
+            kinds: Vec::new(),
+            origin: "manual".into(),
+            sort_order: 0,
+            enabled: true,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let prompt = llm.last_prompt();
+    assert!(
+        prompt.contains("看診：描述症狀、聽醫囑"),
+        "自訂主題沒有進到 prompt：\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("校園生活"),
+        "停用的內建主題還是被拿去出題了：\n{prompt}"
+    );
+}
+
+/// 主題可以全部刪光——那時候不指定主題就好，不該硬塞一個回去，
+/// 也不該讓出題整個失敗。
+#[tokio::test]
+async fn deleting_every_topic_still_produces_an_exercise() {
+    use wordforge_db::topics;
+
+    let (db, profile) = setup(&["alpha", "beta", "gamma", "delta", "epsilon"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    for id in 1..=5 {
+        study(&db, profile, id).await;
+    }
+
+    topics::seed(&db, "en", t0()).await.unwrap();
+    for t in topics::list(&db, "en").await.unwrap() {
+        topics::delete(&db, "en", t.id).await.unwrap();
+    }
+
+    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
+    let llm = FakeLlm::new(&[items]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .expect("沒有主題也要出得了題");
+
+    assert!(matches!(
+        exercise.body,
+        wordforge_practice::payload::ExerciseBody::Translation { .. }
+    ));
+    assert!(
+        !llm.last_prompt().contains("這次的主題"),
+        "沒有主題時不該留下一個空的主題段落"
+    );
 }
 
 /// 學過的字不夠出滿題數時，**縮題數**而不是拿新卡湊滿。

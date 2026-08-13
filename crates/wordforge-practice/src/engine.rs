@@ -10,6 +10,7 @@ use wordforge_db::grammar;
 use wordforge_db::llm_usage;
 use wordforge_db::material::{self, MaterialId};
 use wordforge_db::repo::{cards, lemmas, profiles};
+use wordforge_db::topics;
 use wordforge_llm::{LlmProvider, prompts};
 
 use crate::payload::*;
@@ -332,18 +333,12 @@ impl<'a> PracticeEngine<'a> {
         //
         // 只看翻譯自己的歷史：跟閱讀共用記憶的話，六個名額會被兩種題型
         // 分掉，兩邊都輪不完一輪就被沖掉了。
-        let recent_topics = exercises::recent_topics(
-            self.db,
-            ProfileId(profile_id),
-            TRANSLATION_KINDS,
-            TOPIC_MEMORY,
-        )
-        .await?;
         // 指定教材時取材範圍由課本決定，主題輪換不該再插手（同 `generate_reading`）
         let topic = if excerpt.is_some() {
-            ""
+            None
         } else {
-            practice::pick_topic(&recent_topics, now.unix_timestamp() as u64)
+            self.choose_topic(profile_id, kind, TRANSLATION_KINDS, now)
+                .await?
         };
 
         let mut req = prompts::translation_task(
@@ -351,7 +346,7 @@ impl<'a> PracticeEngine<'a> {
             self.native_name(),
             kind == ExerciseKind::TranslationToTarget,
             excerpt.as_deref(),
-            topic,
+            topic.as_deref().unwrap_or(""),
             &words,
             count,
         );
@@ -397,8 +392,7 @@ impl<'a> PracticeEngine<'a> {
         // 主題一定要存回去，否則 `recent_topics` 永遠是空的、`pick_topic`
         // 永遠從同一個位置挑，輪換等於沒有開。空字串存成 NULL——
         // 存進去的話它會佔掉一個記憶名額，還會被當成「用過的主題」。
-        let topic = Some(topic).filter(|t| !t.is_empty());
-        self.store(profile_id, kind, body, words, None, topic, now)
+        self.store(profile_id, kind, body, words, None, topic.as_deref(), now)
             .await
     }
 
@@ -499,17 +493,16 @@ impl<'a> PracticeEngine<'a> {
 
         // 主題輪換：不指定的話模型永遠寫校園生活與天氣，
         // 十篇讀起來像同一篇。用時間戳當 seed，同一批候選也不會每次都給同一個。
-        let recent_topics =
-            exercises::recent_topics(self.db, ProfileId(profile_id), PROSE_KINDS, TOPIC_MEMORY)
-                .await?;
-        let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
+        let topic = self
+            .choose_topic(profile_id, ExerciseKind::Reading, PROSE_KINDS, now)
+            .await?;
 
         // 指定教材時，取材範圍由課本決定，主題輪換就不該再插手
         // 教材檢索用複習字：課本裡本來就不會有他還沒學的生詞
         let excerpt = self
             .material_excerpt(&review_words, now.unix_timestamp() as u64)
             .await?;
-        let topic = if excerpt.is_some() { "" } else { topic };
+        let topic = if excerpt.is_some() { None } else { topic };
 
         let spec = prompts::ReadingSpec {
             target_lang: self.target_name(),
@@ -521,7 +514,7 @@ impl<'a> PracticeEngine<'a> {
             known_sample: &known_sample,
             target_words: &target_words,
             review_words: &review_words,
-            topic: (!topic.is_empty()).then_some(topic),
+            topic: topic.as_deref(),
             material_excerpt: excerpt.as_deref(),
             question_count: 4,
         };
@@ -614,7 +607,10 @@ impl<'a> PracticeEngine<'a> {
                         body,
                         target_words,
                         Some(coverage.ratio()),
-                        Some(topic),
+                        // `as_deref` 而不是 `Some(topic)`：指定教材時沒有主題，
+                        // 原本會存進一個空字串，而 `recent_topics` 只濾 NULL，
+                        // 那個空主題會佔掉一個記憶名額
+                        topic.as_deref(),
                         now,
                     )
                     .await;
@@ -693,12 +689,11 @@ impl<'a> PracticeEngine<'a> {
             .material_excerpt(&blanks, now.unix_timestamp() as u64)
             .await?;
 
-        let recent_topics =
-            exercises::recent_topics(self.db, ProfileId(profile_id), PROSE_KINDS, TOPIC_MEMORY)
-                .await?;
-        let topic = practice::pick_topic(&recent_topics, now.unix_timestamp() as u64);
+        let topic = self
+            .choose_topic(profile_id, ExerciseKind::Cloze, PROSE_KINDS, now)
+            .await?;
         // 指定教材時取材範圍由課本決定，主題輪換就不該再插手
-        let topic = if excerpt.is_some() { "" } else { topic };
+        let topic = if excerpt.is_some() { None } else { topic };
 
         let mut req = prompts::cloze_passage(&prompts::ClozeSpec {
             target_lang: self.target_name(),
@@ -707,7 +702,7 @@ impl<'a> PracticeEngine<'a> {
             known_word_count: learner.vocabulary as usize,
             known_sample: &known_sample,
             blank_words: &blanks,
-            topic: (!topic.is_empty()).then_some(topic),
+            topic: topic.as_deref(),
             material_excerpt: excerpt.as_deref(),
         });
         let value = self
@@ -789,7 +784,7 @@ impl<'a> PracticeEngine<'a> {
             body,
             blanks,
             None,
-            Some(topic),
+            topic.as_deref(),
             now,
         )
         .await
@@ -1553,6 +1548,41 @@ impl<'a> PracticeEngine<'a> {
         }
 
         Ok(words)
+    }
+
+    /// 這次要用哪個情境主題。
+    ///
+    /// 候選來自 `topic` 資料表（使用者可增刪改），照 `kind` 過濾——
+    /// 「報導一則虛構的地方新聞」是體裁，對閱讀成立，出翻譯題就是歪的。
+    ///
+    /// `memory_kinds` 決定「最近用過」要看哪些題型的歷史。閱讀與克漏字
+    /// 算同一組，翻譯的兩個方向算另一組：記憶名額只有幾個，混在一起的話
+    /// 兩邊都輪不完一輪就被對方沖掉。
+    ///
+    /// 回傳 `None` 代表這次不指定主題——使用者可以把主題全部刪掉或停用，
+    /// 那時候不該硬塞一個他刪掉的東西回去。
+    async fn choose_topic(
+        &self,
+        profile_id: i64,
+        kind: ExerciseKind,
+        memory_kinds: &[&str],
+        now: OffsetDateTime,
+    ) -> Result<Option<String>> {
+        // 第一次用到時才把種子寫進去。放在這裡而不是開 App 時：
+        // 出題本來就會等模型幾十秒，多一個查詢無所謂，而且不必在
+        // 啟動路徑上多做一件會寫入的事。
+        topics::seed(self.db, &self.target_lang, now).await?;
+
+        let candidates = topics::usable(self.db, &self.target_lang, kind.as_str()).await?;
+        let recent =
+            exercises::recent_topics(self.db, ProfileId(profile_id), memory_kinds, TOPIC_MEMORY)
+                .await?;
+
+        Ok(practice::pick_topic(
+            &candidates,
+            &recent,
+            now.unix_timestamp() as u64,
+        ))
     }
 
     /// 送出請求並驗收格式，沒過就把它的輸出串回輸入、指出哪裡錯，再問一次。
