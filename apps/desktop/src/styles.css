@@ -278,7 +278,8 @@ button:disabled {
 
 .dict-body {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(0, 1.4fr);
+  /* 詳情那欄現在裝的是「釋義 + 做過的句子」兩欄，所以要比搜尋結果寬得多 */
+  grid-template-columns: minmax(200px, 0.7fr) minmax(0, 2fr);
   gap: 1rem;
   align-items: start;
 }
@@ -1159,6 +1160,281 @@ button.link {
   align-items: center;
   gap: 0.75rem;
   margin-top: 0.75rem;
+}
+
+/* 一份練習的作答詳情：左邊是那一次的內容，右邊切換是哪一次。
+   就地展開的話，做過十次的練習會把整份清單推到看不見 */
+.attempt-head {
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.attempt-head h2 {
+  margin: 0;
+}
+
+.attempt-detail {
+  display: grid;
+  /* 左邊放的是完整的練習畫面（閱讀是三欄），所以右邊那欄要窄 */
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 1rem;
+  align-items: start;
+}
+
+/* 窄視窗時右欄擺不下，改成疊在上面——不折的話兩欄都被壓扁 */
+@media (max-width: 720px) {
+  .attempt-detail {
+    grid-template-columns: 1fr;
+  }
+}
+
+.attempt-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  border-left: 1px solid var(--border);
+  padding-left: 0.75rem;
+}
+
+.attempt-picker > div {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.attempt-picker .pick {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  text-align: left;
+  font-size: 0.85rem;
+}
+
+.attempt-picker > div.current .pick {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 原始題目：文章、每一題、每個選項。詳情頁預設收起來——
+   克漏字的整篇文章擺在最上面會把作答推到看不見 */
+.original {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+  margin-bottom: 0.75rem;
+}
+
+.original-title {
+  margin: 0 0 0.3rem;
+  font-weight: 600;
+}
+
+.original-passage {
+  margin: 0 0 0.6rem;
+  white-space: pre-wrap;
+  line-height: 1.7;
+}
+
+.original-options {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.9rem;
+  font-size: 0.9rem;
+}
+
+.original-options li {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+/* 詞條模板切兩欄：釋義在左，做過的句子在右。
+   接在釋義後面的話，義項多的字有十幾條，「我用過這個字」會被推到
+   捲不到的地方——而那正是最該看的一塊。標題不在這個元件裡，
+   所以它天然是跨欄的。 */
+.word-senses {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 0.75fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+/* 沒有句子時右欄整個不渲染，這時左欄要吃滿——
+   不然釋義會縮在左半邊，右邊一片空白 */
+.word-senses > .senses-main:only-child {
+  grid-column: 1 / -1;
+}
+
+/* 窄視窗擺不下兩欄，改成疊起來。句子仍然在釋義後面，
+   但那時整頁本來就是直的，捲距離短得多 */
+@media (max-width: 720px) {
+  .word-senses {
+    grid-template-columns: 1fr;
+  }
+}
+
+.my-sentences {
+  border-left: 1px solid var(--border);
+  padding-left: 0.9rem;
+}
+
+.my-sentences > p:first-child {
+  font-size: 0.8rem;
+  margin: 0 0 0.5rem;
+}
+
+.my-sentences ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.my-sentences li {
+  border-left: 3px solid var(--accent);
+  padding-left: 0.6rem;
+}
+
+.mine-text {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.my-sentences .muted {
+  margin: 0.1rem 0 0.25rem;
+  font-size: 0.85rem;
+}
+
+/* 錯過幾次要看得出來，但不能比句子本身還搶眼 */
+.tag.miss {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.sentence-pager {
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  font-size: 0.85rem;
+}
+
+.sentence-pager button {
+  padding: 0.2rem 0.6rem;
+}
+
+/* 複習分單字與句子兩種，共用頂部的 tab 樣式 */
+.review-modes {
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.attempt-items {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* 對錯用左邊那條線表示。整段染色的話，錯的那幾題會變成一片紅字，
+   而使用者要讀的正是那幾題 */
+.attempt-items li {
+  border-left: 3px solid var(--border);
+  padding-left: 0.6rem;
+}
+
+.attempt-items li.ok {
+  border-left-color: var(--accent);
+  color: inherit;
+}
+
+.attempt-items li.bad {
+  border-left-color: var(--error);
+  color: inherit;
+}
+
+.attempt-question {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.attempt-mine {
+  margin: 0.15rem 0;
+}
+
+.attempt-ref {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--accent);
+}
+
+.attempt-items p.muted {
+  margin: 0.15rem 0 0;
+  font-size: 0.85rem;
+}
+
+.attempt-corrections {
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+}
+
+.attempt-corrections .was {
+  text-decoration: line-through;
+  color: var(--muted);
+  margin-right: 0.4rem;
+}
+
+.attempt-corrections .now {
+  color: var(--accent);
+  margin-right: 0.4rem;
+}
+
+/* 重寫還沒對的那幾題。就地改，不用跳回題目畫面—— */
+/* 使用者要對照的正是上面那幾行「你寫了什麼、正解是什麼」 */
+.retry {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  padding: 0.6rem;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.retry-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.retry textarea {
+  width: 100%;
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  resize: vertical;
+}
+
+.retry button {
+  align-self: flex-start;
 }
 
 /* --------------------------------------------------------------- 重置 */

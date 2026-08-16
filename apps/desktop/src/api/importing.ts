@@ -47,6 +47,17 @@ export const IMPORT_KINDS: { value: ImportKind; label: string; extensions: strin
   { value: "freq_comma", label: "詞頻表：字,次數", extensions: ["txt", "csv"] },
 ];
 
+/**
+ * 字典裡有沒有東西。開機畫面只需要這個。
+ *
+ * 不要用 `dictionaryStats` 代替：那個為了「每個來源幾個詞條」要對
+ * 285 萬列做 COUNT(DISTINCT)，實測 1.3 秒（冷快取更久），
+ * 而複習頁在它回來之前是一片空白。
+ */
+export function dictionaryHasEntries(): Promise<boolean> {
+  return invoke("dictionary_has_entries");
+}
+
 export function dictionaryStats(): Promise<DictStats> {
   return invoke("dictionary_stats");
 }

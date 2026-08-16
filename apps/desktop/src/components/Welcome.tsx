@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { currentLanguages, dictionaryStats, errorMessage, languageName } from "../api";
+import { currentLanguages, dictionaryHasEntries, errorMessage, languageName } from "../api";
 
 interface Props {
   /** 使用者按下「去匯入」時切到匯入頁 */
@@ -52,8 +52,13 @@ export default function Welcome({ onGoImport, children }: Props) {
   useEffect(() => {
     void (async () => {
       try {
-        const [stats, langs] = await Promise.all([dictionaryStats(), currentLanguages()]);
-        setEmpty(stats.lemmas === 0);
+        // 這裡只要一個布林值。撈整份字典統計的話，複習頁會在那 1.3 秒
+        // （冷快取更久）裡一片空白——使用者感受到的是「點複習要等十秒」。
+        const [hasEntries, langs] = await Promise.all([
+          dictionaryHasEntries(),
+          currentLanguages(),
+        ]);
+        setEmpty(!hasEntries);
         setTarget(langs.target);
       } catch (e) {
         setError(errorMessage(e));

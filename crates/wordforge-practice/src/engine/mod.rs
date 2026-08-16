@@ -10,7 +10,9 @@ use wordforge_db::grammar;
 use wordforge_db::llm_usage;
 use wordforge_db::material::{self, MaterialId};
 use wordforge_db::repo::{cards, lemmas, profiles};
+use wordforge_db::sentences;
 use wordforge_db::topics;
+use wordforge_db::word_sentences;
 use wordforge_llm::{LlmProvider, prompts};
 
 use crate::payload::*;
@@ -31,6 +33,11 @@ pub enum PracticeError {
 
     #[error("詞彙量還不夠出這種題目")]
     NotEnoughVocabulary,
+
+    /// 這件事在這個題型上不成立。訊息要說得出「那該怎麼辦」——
+    /// 「不支援」對使用者等於沒說。
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, PracticeError>;
@@ -167,6 +174,7 @@ pub struct PracticeEngine<'a> {
 mod choices;
 mod generate;
 mod grade;
+mod links;
 mod points;
 mod words;
 
@@ -174,6 +182,7 @@ use choices::{
     align_comments, grade_choices, missed_words, missing_option_notes, parse_choice_items,
     shuffle_answers, shuffle_seed,
 };
+use links::checked_sentences;
 
 impl<'a> PracticeEngine<'a> {
     pub fn new(db: &'a Db, llm: &'a dyn LlmProvider) -> Self {
@@ -556,6 +565,15 @@ impl<'a> PracticeEngine<'a> {
             now,
         )
         .await?;
+
+        // 把這次的句子連回單字。連不上就跳過——這是加分項，
+        // 不該讓一份出好的練習因此失敗。
+        if let Err(e) = self
+            .link_sentences(profile_id, id.0, &body, &target_words, now)
+            .await
+        {
+            tracing::warn!(error = %e, "句子連結沒建起來");
+        }
 
         Ok(ExerciseView {
             exercise_id: id.0,

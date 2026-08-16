@@ -48,6 +48,21 @@ pub struct ChoiceItem {
     pub difficulty: Option<String>,
 }
 
+/// 文章的一句，配上它的意思。
+///
+/// 全文翻譯（`translation`）要合併、拆分、調整語序才讀得順，那是好翻譯
+/// 該做的事——但那樣就對不回原文的第幾句。這一份是**額外**的逐句對照，
+/// 只給「這個字出現在哪一句、那句什麼意思」用，兩份並存。
+///
+/// 模型是看著整篇文章一次輸出這兩份的（不是分次逐句翻譯），
+/// 上下文一直都在。舊的練習沒有這個欄位，那時退回本地切句。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SentencePair {
+    pub text: String,
+    #[serde(default)]
+    pub translation: Option<String>,
+}
+
 /// 閱讀理解裡預先標好的生詞。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewWord {
@@ -75,6 +90,9 @@ pub enum ExerciseBody {
         translation: Option<String>,
         #[serde(default)]
         new_words: Vec<NewWord>,
+        /// 逐句對照。模型沒給或對不回原文時是空的，那時退回本地切句。
+        #[serde(default)]
+        sentences: Vec<SentencePair>,
         questions: Vec<ChoiceItem>,
     },
     /// 克漏字：一篇用已知詞寫的短文，把該複習的字挖掉。
@@ -88,6 +106,9 @@ pub enum ExerciseBody {
         passage: String,
         #[serde(default)]
         translation: Option<String>,
+        /// 逐句對照，空格已填回正確答案。對不回原文時是空的。
+        #[serde(default)]
+        sentences: Vec<SentencePair>,
         /// 第 k 題對應 `{{k}}` 那一格
         items: Vec<ChoiceItem>,
     },
@@ -124,7 +145,10 @@ pub struct GradeInput {
 }
 
 /// 單題的批改結果。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Default` 是「這一題還沒有批改結果」：只重寫某幾題時，其餘題目
+/// 要先有位置才貼得回去（見 `engine::regrade`）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ItemResult {
     #[serde(default)]
     pub index: usize,

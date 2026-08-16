@@ -13,7 +13,6 @@ import {
   generateExercise,
   getStudySettings,
   gradeExercise,
-  languageName,
   type GrammarView,
   isGrammarKnown,
   listExercises,
@@ -27,19 +26,10 @@ import {
   type ProfileLanguages,
   updateStudySettings,
 } from "../../api";
-import { Choices } from "./choices";
 import LlmSetup from "../../components/LlmSetup";
-import SpeakButton from "../../components/SpeakButton";
-import { FeedbackPanel, SubmitRow } from "./feedback";
+import ExerciseBoard from "./board";
 import { History, HISTORY_PAGE, MaterialPicker } from "./history";
-import {
-  ClozePassage,
-  FONT_MAX,
-  FONT_MIN,
-  normalizeWord,
-  PassageHeader,
-  WordNotes,
-} from "./passage";
+import { FONT_MAX, FONT_MIN, normalizeWord } from "./passage";
 
 
 
@@ -99,6 +89,9 @@ export default function Practice() {
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyPage, setHistoryPage] = useState(0);
   const [showHistory, setShowHistory] = useState(false);
+  // 紀錄裡攤開某一份時，詳情裡是完整的練習畫面（閱讀是三欄），
+  // 那時要跟練習頁一樣用寬版
+  const [historyDetail, setHistoryDetail] = useState(false);
   // 解析階段點到的字，顯示釋義用
   const [lookup, setLookup] = useState<string | null>(null);
   // 覆盤時另外補加進牌組的字。跟 marked 分開：那個是送出時一起帶的，
@@ -318,7 +311,7 @@ export default function Practice() {
   const cloze = exercise?.body.kind === "cloze" ? exercise.body : null;
   // 有文章的題型才用寬版；而且紀錄攤開時要收回窄版，
   // 不然一張清單被拉到 1300px 寬會很難讀
-  const wide = (reading || cloze) && !showHistory;
+  const wide = ((reading || cloze) && !showHistory) || historyDetail;
 
   // 沒作答的題數。全部答完才讓送出——漏掉一題送出去，
   // 批改會把它算成答錯，而那不是他的本意。
@@ -431,289 +424,35 @@ export default function Practice() {
           onPage={setHistoryPage}
           onRedo={redo}
           onDelete={remove}
+          onChanged={() => void refreshHistory(historyPage)}
+          onOpenChange={setHistoryDetail}
         />
-      ) : (
-        <>
-          {/* 閱讀測驗：文章在左、題目在右；批改完再插入一欄全文翻譯。
-              翻譯排在原文旁邊才對照得起來，擺在最下面等於要一直上下捲。 */}
-          {exercise && reading && (
-            <div className={feedback && reading.translation ? "reading-layout three" : "reading-layout"}>
-              <section className="panel exercise passage-pane">
-                <PassageHeader
-                  title={reading.title}
-                  fontSize={fontSize}
-                  onFontSize={changeFontSize}
-                />
-                <p className="muted hint">
-                  {feedback
-                    ? "點文章裡的任何一個字可以查它的意思。"
-                    : "點任何一個字可以標記「我不會」，送出後會排進複習。"}
-                  {exercise.coverage != null &&
-                    `　這篇有 ${Math.round(exercise.coverage * 100)}% 的字你已經學過。`}
-                </p>
-
-                <p className="passage">
-                  {reading.passage.split(/(\s+)/).map((chunk, i) => {
-                    if (!chunk.trim()) return chunk;
-                    const word = normalizeWord(chunk);
-                    const isMarked = marked.some((w) => w.toLowerCase() === word);
-                    return (
-                      <span
-                        key={i}
-                        className={[
-                          "token",
-                          isMarked ? "marked" : "",
-                          feedback && lookup === word ? "looking" : "",
-                        ]
-                          .filter(Boolean)
-                          .join(" ")}
-                        onClick={() =>
-                          feedback
-                            ? setLookup((cur) => (cur === word ? null : word))
-                            : toggleMarked(chunk)
-                        }
-                      >
-                        {chunk}
-                      </span>
-                    );
-                  })}
-                </p>
-
-                {marked.length > 0 && !feedback && (
-                  <p className="muted">標記為不會的字：{marked.join("、")}</p>
-                )}
-
-                {reading.new_words.length > 0 && (
-                  <ul className="new-words">
-                    {reading.new_words.map((w) => (
-                      <li key={w.word}>
-                        <strong>{w.word}</strong>
-                        <SpeakButton text={w.word} />
-                        <span className="muted"> {w.gloss}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-
-              {/* 全文翻譯獨立一欄，跟原文並排。只在批改之後出現——
-                  作答前給等於直接送答案。 */}
-              {feedback && reading.translation && (
-                <section className="panel translation-pane">
-                  <h2>全文翻譯</h2>
-                  <p className="passage">
-                    {reading.translation}
-                  </p>
-                </section>
-              )}
-
-              <div className="answer-pane">
-                {/* 點到的字的釋義自成一塊，而且釘在最上面：
-                    夾在題目中間的話，看完要往回捲才找得到原文與翻譯。 */}
-                {feedback && lookup && (
-                  <WordNotes
-                    term={lookup}
-                    glossary={feedback.glossary ?? []}
-                    onClose={() => setLookup(null)}
-                    onAdd={addLater}
-                    added={addedLater}
-                  />
-                )}
-
-                <section className="panel exercise">
-                  <Choices
-                    items={reading.questions}
-                    choices={choices}
-                    setChoices={setChoices}
-                    feedback={feedback}
-                  />
-                  {!feedback && (
-                    <SubmitRow
-                      unanswered={unanswered}
-                      busy={busy}
-                      onSubmit={submit}
-                      what="題"
-                    />
-                  )}
-                </section>
-
-                {feedback && (
-                  <FeedbackPanel
-                    feedback={feedback}
-                    materials={materials}
-                    materialId={materialId}
-                    setMaterialId={setMaterialId}
-                    busy={busy}
-                    onNext={start}
-                  />
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* 克漏字：短文在左、每一格的選項在右，批改完中間插入翻譯。
-              跟閱讀測驗一樣的版面——同樣是「對照原文看」的需求。 */}
-          {exercise && cloze && (
-            <div
-              className={
-                feedback && cloze.translation ? "reading-layout three" : "reading-layout"
-              }
-            >
-              <section className="panel exercise passage-pane">
-                <PassageHeader
-                  title={cloze.title}
-                  fontSize={fontSize}
-                  onFontSize={changeFontSize}
-                />
-                <p className="muted hint">
-                  文章裡的每一個空格對應右邊同號的一題。這些字你都學過，
-                  考的是在句子裡想不想得起來。
-                  {!feedback && "　點空格以外的任何一個字可以標記「我不會」，送出後會排進複習。"}
-                </p>
-                <ClozePassage
-                  passage={cloze.passage}
-                  items={cloze.items}
-                  choices={choices}
-                  feedback={feedback}
-                  lookup={lookup}
-                  onLookup={setLookup}
-                  marked={marked}
-                  onToggleMark={toggleMarked}
-                />
-                {marked.length > 0 && !feedback && (
-                  <p className="muted">標記為不會的字：{marked.join("、")}</p>
-                )}
-                {feedback && (
-                  <p className="muted hint">點文章裡的任何一個字可以查它的意思。</p>
-                )}
-              </section>
-
-              {feedback && cloze.translation && (
-                <section className="panel translation-pane">
-                  <h2>全文翻譯</h2>
-                  <p className="passage">{cloze.translation}</p>
-                </section>
-              )}
-
-              <div className="answer-pane">
-                {feedback && lookup && (
-                  <WordNotes
-                    term={lookup}
-                    glossary={feedback.glossary ?? []}
-                    onClose={() => setLookup(null)}
-                    onAdd={addLater}
-                    added={addedLater}
-                  />
-                )}
-
-                <section className="panel exercise">
-                  <Choices
-                    items={cloze.items}
-                    choices={choices}
-                    setChoices={setChoices}
-                    feedback={feedback}
-                    numbered
-                    compact
-                  />
-                  {!feedback && (
-                    <SubmitRow
-                      unanswered={unanswered}
-                      busy={busy}
-                      onSubmit={submit}
-                      what="格"
-                    />
-                  )}
-                </section>
-                {feedback && (
-                  <FeedbackPanel
-                    feedback={feedback}
-                    materials={materials}
-                    materialId={materialId}
-                    setMaterialId={setMaterialId}
-                    busy={busy}
-                    onNext={start}
-                  />
-                )}
-              </div>
-            </div>
-          )}
-
-          {exercise && !reading && !cloze && (
-            <section className="panel exercise">
-              {exercise.body.kind === "translation" && (
-                <>
-                  <h2>
-                    {exercise.body.to_target
-                      ? `翻成${languageName(langs.target)}`
-                      : `翻成${languageName(langs.native)}`}
-                  </h2>
-                  {exercise.body.items.map((item, i) => (
-                    <div key={i} className="question">
-                      <p className="prompt">
-                        {i + 1}. {item.source}
-                        {item.target_word && (
-                          <span className="tag" title="這題想讓你用到的字">
-                            {item.target_word}
-                          </span>
-                        )}
-                      </p>
-                      <input
-                        value={answers[i] ?? ""}
-                        onChange={(e) =>
-                          setAnswers((a) => a.map((v, j) => (j === i ? e.target.value : v)))
-                        }
-                        disabled={feedback !== null}
-                        placeholder="你的翻譯…"
-                      />
-                      {feedback?.items[i] && (
-                        <p className={feedback.items[i].correct ? "ok" : "error"}>
-                          {feedback.items[i].correct ? "✓" : "✗"}{" "}
-                          {feedback.items[i].reference && (
-                            <span className="muted">參考：{feedback.items[i].reference}　</span>
-                          )}
-                          {feedback.items[i].comment}
-                        </p>
-                      )}
-                    </div>
-                  ))}
-                </>
-              )}
-
-              {exercise.body.kind === "choices" && (
-                <>
-                  <h2>文法練習</h2>
-                  <Choices
-                    items={exercise.body.items}
-                    choices={choices}
-                    setChoices={setChoices}
-                    feedback={feedback}
-                  />
-                </>
-              )}
-
-              {!feedback && (
-                <SubmitRow
-                  unanswered={unanswered}
-                  busy={busy}
-                  onSubmit={submit}
-                  what="題"
-                />
-              )}
-            </section>
-          )}
-
-          {feedback && !reading && !cloze && (
-            <FeedbackPanel
-              feedback={feedback}
-              materials={materials}
-              materialId={materialId}
-              setMaterialId={setMaterialId}
-              busy={busy}
-              onNext={start}
-            />
-          )}
-        </>
-      )}
+      ) : exercise ? (
+        <ExerciseBoard
+          exercise={exercise}
+          langs={langs}
+          fontSize={fontSize}
+          onFontSize={changeFontSize}
+          answers={answers}
+          choices={choices}
+          marked={marked}
+          lookup={lookup}
+          feedback={feedback}
+          setLookup={setLookup}
+          addedLater={addedLater}
+          onAddLater={addLater}
+          setAnswers={setAnswers}
+          setChoices={setChoices}
+          onToggleMark={toggleMarked}
+          onSubmit={submit}
+          busy={busy}
+          unanswered={unanswered}
+          materials={materials}
+          materialId={materialId}
+          setMaterialId={setMaterialId}
+          onNext={start}
+        />
+      ) : null}
     </div>
   );
 }

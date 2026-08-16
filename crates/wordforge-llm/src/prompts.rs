@@ -216,6 +216,7 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
          \x20 \"title\": \"文章標題（用{target}）\",\n\
          \x20 \"passage\": \"文章內容\",\n\
          \x20 \"translation\": \"整篇文章的{native}翻譯，逐段對應，讓他讀完可以自己對照\",\n\
+         \x20 \"sentences\": [{{\"text\": \"文章的第一句（原文照抄，不要改字）\", \"translation\": \"這一句的{native}意思\"}}],\n\
          \x20 \"new_words\": [{{\"word\": \"新詞\", \"gloss\": \"{native}解釋\", \"line_hint\": \"可推敲出意思的那句話\"}}],\n\
          \x20 \"questions\": [{{\"question\": \"問題（用{target}）\", \
          \"options\": [\"用{target}寫的四個選項\"], \"answer_index\": 0, \
@@ -333,6 +334,7 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
          \x20 \"title\": \"標題（用{target}）\",\n\
          \x20 \"passage\": \"挖好空格的短文\",\n\
          \x20 \"translation\": \"整篇的{native}翻譯，空格處填上正確答案再翻\",\n\
+         \x20 \"sentences\": [{{\"text\": \"文章的第一句（原文照抄，不要改字）\", \"translation\": \"這一句的{native}意思\"}}],\n\
          \x20 \"items\": [{{\"options\": [\"四個{target}選項\"], \"answer_index\": 0, \
          \"option_notes\": [\"每個選項各一句{native}說明\"], \
          \"explanation\": \"用{native}說明這一格在考什麼\"}}]\n\

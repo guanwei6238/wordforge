@@ -29,6 +29,15 @@ pub async fn word_detail(
     Ok(wordforge_db::dict::detail(&state.db, lemma_id, profile_id).await?)
 }
 
+/// 字典裡有沒有東西。開機畫面只需要這個。
+///
+/// 不要用 `dictionary_stats` 代替：那個為了「每個來源幾個詞條」要對
+/// 285 萬列做 COUNT(DISTINCT)，實測 1.3 秒，而複習頁在那之前是空白的。
+#[tauri::command]
+pub async fn dictionary_has_entries(state: tauri::State<'_, AppState>) -> CmdResult<bool> {
+    Ok(wordforge_db::dict::has_entries(&state.db).await?)
+}
+
 #[tauri::command]
 pub async fn dictionary_stats(state: tauri::State<'_, AppState>) -> CmdResult<DictStats> {
     Ok(wordforge_db::dict::stats(&state.db).await?)

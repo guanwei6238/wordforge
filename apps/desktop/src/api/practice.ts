@@ -302,6 +302,15 @@ export interface ExerciseSummary {
   coverage: number | null;
   /** 做過才有分數。null 代表出了題但沒作答 */
   score: number | null;
+  /** 做過幾次 */
+  attempts: number;
+  /**
+   * 最後一次還有幾題沒全對。
+   *
+   * null 是沒作答過，或那次批改沒有逐題結果（模型偶爾只給總分）——
+   * 那時候說不出「還有幾題」，UI 就不要顯示，不要猜成 0。
+   */
+  pending: number | null;
   title: string;
 }
 
@@ -317,6 +326,127 @@ export function listExercises(
   profileId = DEFAULT_PROFILE_ID,
 ): Promise<ExercisePage> {
   return invoke("list_exercises", { profileId, limit, offset });
+}
+
+/**
+ * 一次作答：你當時寫了什麼、模型當時怎麼講。
+ *
+ * `answer` 與 `feedback` 是後端解析好的，不是 JSON 字串——欄位長什麼樣
+ * 只有一份定義。壞掉的紀錄會是 null，不會讓整份查詢失敗。
+ */
+export interface AttemptView {
+  attempt_id: number;
+  created_at: string;
+  score: number | null;
+  answer: GradeInput | null;
+  feedback: Feedback | null;
+}
+
+/** 一份練習做過幾次，舊的在前——62 → 85 → 100 讀起來才是一條線。 */
+export function listAttempts(exerciseId: number): Promise<AttemptView[]> {
+  return invoke("list_attempts", { exerciseId });
+}
+
+/**
+ * 一句做過的句子。
+ *
+ * 這是「我真的用過這個字」的紀錄，跟字典的例句分開——那些是別人寫的。
+ */
+export interface WordSentence {
+  id: number;
+  exercise_id: number;
+  /** 目標語言那一句 */
+  text: string;
+  /** 母語翻譯。閱讀文章對不齊時可能是整段，也可能沒有。 */
+  translation: string | null;
+  /** translation / reading / cloze */
+  origin: string;
+  /**
+   * 這一句錯過幾次。
+   *
+   * 累計在句子上而不是讀排程表：句子寫對之後排程那一列會被刪掉，
+   * 而「錯過三次才寫對」正是練起來之後最值得留著的訊號。
+   */
+  misses: number;
+  created_at: string;
+}
+
+export const SENTENCE_ORIGIN_LABELS: Record<string, string> = {
+  translation: "翻譯題",
+  reading: "閱讀",
+  cloze: "克漏字",
+};
+
+/** 一頁的「你做過的句子」。total 讓 UI 說得出「第 2 / 5 句」。 */
+export interface SentencePage {
+  items: WordSentence[];
+  total: number;
+}
+
+/**
+ * 這個字在哪幾句話裡用過。第一次呼叫會順便補寫既有練習的連結。
+ *
+ * 查詢會展開整個詞族：句子存在原形底下（練 `ran` 記在 `run`），
+ * 而這裡傳進去的是使用者正在看的那個詞條。
+ */
+export function wordSentences(
+  lemmaId: number,
+  limit = 3,
+  offset = 0,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<SentencePage> {
+  return invoke("word_sentences", { profileId, lemmaId, limit, offset });
+}
+
+/**
+ * 今天要重練的一句翻譯。
+ *
+ * 刻意沒有參考答案、也沒有你上次寫的東西：今天要問的是「隔一天之後
+ * 你自己想得出來嗎」。把上次的作答擺在旁邊，複習就退化成抄寫。
+ */
+export interface DueSentence {
+  exercise_id: number;
+  item_index: number;
+  kind: ExerciseKind;
+  source: string;
+  target_word: string | null;
+  /** 錯過幾次 */
+  misses: number;
+}
+
+/**
+ * 今天該重練的句子。答錯的明天回來，答對的從此不再出現。
+ *
+ * 一句每天只出現一次——當天反覆重寫刷到全對，看起來是 100 分，
+ * 實際上只是背下剛看到的參考答案。
+ */
+export function dueSentences(
+  limit = 20,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<DueSentence[]> {
+  return invoke("due_sentences", { profileId, limit });
+}
+
+/**
+ * 只重寫沒全對的那幾題，其餘沿用上一次的批改。
+ *
+ * 只有翻譯題適用：選擇題本地判分，整份「再做一次」不必打模型，很便宜。
+ * 分數會用「答對幾題 ÷ 總題數」重算，所以 100 分＝每一題都對。
+ */
+export function regradeItems(
+  exerciseId: number,
+  items: { index: number; answer: string }[],
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<Feedback> {
+  return invoke("regrade_items", { profileId, exerciseId, items });
+}
+
+/** 刪掉單獨一次作答，練習本身留著。 */
+export function deleteAttempt(
+  attemptId: number,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<boolean> {
+  return invoke("delete_attempt", { profileId, attemptId });
 }
 
 /** 刪掉一份練習紀錄，連同它的作答。回傳有沒有真的刪到。 */

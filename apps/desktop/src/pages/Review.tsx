@@ -15,7 +15,9 @@ import {
   suspendCard,
   type WordDetail,
   wordDetail,
+  dueSentences,
 } from "../api";
+import DueSentences from "../components/DueSentences";
 import QueueEmpty from "../components/QueueEmpty";
 import SpeakButton from "../components/SpeakButton";
 import WordSenses from "../components/WordSenses";
@@ -27,6 +29,12 @@ import WordSenses from "../components/WordSenses";
  * 但都建立在同一份卡片資料之上。
  */
 export default function Review() {
+  // 複習分兩種：單字卡，以及之前寫錯的翻譯句。
+  //
+  // 句子不跟單字卡混在同一個佇列裡：一個是「看字想意思」按四個鍵，
+  // 另一個是打一整句話等模型批改，兩種節奏混在一起，兩邊都做不順。
+  const [mode, setMode] = useState<"cards" | "sentences">("cards");
+  const [sentenceCount, setSentenceCount] = useState(0);
   const [queue, setQueue] = useState<CardView[]>([]);
   const [stats, setStats] = useState<StudyStats | null>(null);
   const [status, setStatus] = useState<QueueStatus | null>(null);
@@ -44,10 +52,16 @@ export default function Review() {
 
   const refresh = useCallback(async () => {
     try {
-      const [cards, s, q] = await Promise.all([listDueCards(), studyStats(), queueStatus()]);
+      const [cards, s, q, sentences] = await Promise.all([
+        listDueCards(),
+        studyStats(),
+        queueStatus(),
+        dueSentences(),
+      ]);
       setQueue(cards);
       setStats(s);
       setStatus(q);
+      setSentenceCount(sentences.length);
       setError(null);
     } catch (e) {
       setError(errorMessage(e));
@@ -185,9 +199,28 @@ export default function Review() {
         </dl>
       )}
 
+      {/* 兩種複習擇一。句子那邊有東西時把數字標出來——不標的話
+          使用者不會知道那裡有欠著的句子，而它們正是他寫錯過的 */}
+      <div className="row review-modes">
+        <button
+          className={mode === "cards" ? "tab active" : "tab"}
+          onClick={() => setMode("cards")}
+        >
+          單字{stats && stats.due_now + stats.new_today > 0 && `（${stats.due_now + stats.new_today}）`}
+        </button>
+        <button
+          className={mode === "sentences" ? "tab active" : "tab"}
+          onClick={() => setMode("sentences")}
+        >
+          句子{sentenceCount > 0 && `（${sentenceCount}）`}
+        </button>
+      </div>
+
       {error && <p className="error">{error}</p>}
 
-      {loading ? (
+      {mode === "sentences" ? (
+        <DueSentences onGraded={refresh} />
+      ) : loading ? (
         <p className="muted">載入中…</p>
       ) : current ? (
         <section className="card">

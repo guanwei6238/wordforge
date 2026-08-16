@@ -295,7 +295,12 @@ impl PracticeEngine<'_> {
                     })
                     .unwrap_or_default();
 
+                // 逐句對照要**本地驗過**才收：把每一句接起來要對得回原文。
+                // 模型漏一句或自己改了字，這裡就會發現，然後退回本地切句。
+                let sentences = checked_sentences(&value, &passage);
+
                 let body = ExerciseBody::Reading {
+                    sentences,
                     title: value
                         .get("title")
                         .and_then(|t| t.as_str())
@@ -473,7 +478,10 @@ impl PracticeEngine<'_> {
         .await?;
         shuffle_answers(&mut items, shuffle_seed(now));
 
+        let sentences = checked_sentences(&value, &passage);
+
         let body = ExerciseBody::Cloze {
+            sentences,
             title: value
                 .get("title")
                 .and_then(|t| t.as_str())

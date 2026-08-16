@@ -104,6 +104,15 @@ impl PracticeEngine<'_> {
         self.record_grammar_results(profile_id, &body, input, &feedback, now)
             .await?;
 
+        // 翻譯的每一句各自排程：錯的明天再出現，對的就結束。
+        // 這是「練到 100 分」的機制——不排的話，錯的那幾句只是靜靜地
+        // 留在紀錄裡，而它們正是他還不會的東西。
+        if let ExerciseBody::Translation { items, .. } = &body {
+            let indices: Vec<usize> = (0..items.len()).collect();
+            self.schedule_sentences(profile_id, input.exercise_id, &indices, &feedback, now)
+                .await?;
+        }
+
         let answer_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
         let feedback_json = serde_json::to_string(&feedback).unwrap_or_else(|_| "{}".into());
         exercises::record_attempt(
@@ -117,6 +126,219 @@ impl PracticeEngine<'_> {
         .await?;
 
         Ok(feedback)
+    }
+
+    /// 只重寫沒全對的那幾題，其餘沿用上一次的批改。
+    ///
+    /// ## 為什麼不整份重來
+    ///
+    /// 翻譯題的批改是一次完整的模型呼叫。五題裡錯兩題，整份重送等於
+    /// 為了那兩題燒掉一整次的額度與幾十秒；而且已經對的那三題會被
+    /// 重新判一次——同一句話兩次批改的結果不一定一樣，使用者會看到
+    /// 「我明明沒動它，怎麼變成錯的」。
+    ///
+    /// ## 分數改成本地算
+    ///
+    /// 合併過的這一份，模型從來沒有看過全貌，它給的分數不會是整份的
+    /// 分數。所以這裡用「答對幾題 ÷ 總題數」自己算——這也讓「做到
+    /// 100 分」有一個說得清楚的定義：每一題都對。
+    ///
+    /// `redone` 是 (題號, 新的作答)，題號從 0 起算。
+    pub async fn regrade(
+        &self,
+        profile_id: i64,
+        exercise_id: i64,
+        redone: &[(usize, String)],
+        now: OffsetDateTime,
+    ) -> Result<Feedback> {
+        let record = exercises::get(self.db, ExerciseId(exercise_id))
+            .await?
+            .ok_or(PracticeError::NotFound)?;
+        let body: ExerciseBody = serde_json::from_str(&record.payload_json)
+            .map_err(|e| PracticeError::BadResponse(e.to_string()))?;
+
+        let ExerciseBody::Translation { to_target, items } = &body else {
+            return Err(PracticeError::Unsupported(
+                "只有翻譯題可以單獨重寫某幾題。選擇題請用「再做一次」整份重做——\
+                 那個不必打模型，重做一次很便宜。"
+                    .into(),
+            ));
+        };
+
+        // 上一次的作答與批改是這次的底：沒重寫的題目原封不動留著
+        let past = exercises::attempts(self.db, ExerciseId(exercise_id)).await?;
+        let last = past.last().ok_or(PracticeError::Unsupported(
+            "這份練習還沒有作答過，沒有東西可以重寫。".into(),
+        ))?;
+        let previous: GradeInput = serde_json::from_str(&last.answer_json)
+            .map_err(|e| PracticeError::BadResponse(e.to_string()))?;
+        let mut merged: Feedback = serde_json::from_str(&last.feedback_json)
+            .map_err(|e| PracticeError::BadResponse(e.to_string()))?;
+
+        // 題號超出範圍就當作沒這一題，不要 panic 也不要靜靜地改到別題
+        let mut wanted: Vec<(usize, String)> = redone
+            .iter()
+            .filter(|(i, _)| *i < items.len())
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
+            return Err(PracticeError::Unsupported("沒有指定要重寫哪一題。".into()));
+        }
+
+        // 一句每天只練一次。當天反覆重寫同一句刷到全對，看起來是 100 分，
+        // 實際上只是背下了剛剛看到的參考答案——而參考答案就印在上面那一行。
+        let mut locked = Vec::new();
+        for (i, _) in &wanted {
+            if sentences::practised_today(
+                self.db,
+                ProfileId(profile_id),
+                exercise_id,
+                *i as i64,
+                now,
+            )
+            .await?
+            {
+                locked.push(*i + 1);
+            }
+        }
+        wanted.retain(|(i, _)| !locked.contains(&(*i + 1)));
+        if wanted.is_empty() {
+            return Err(PracticeError::Unsupported(format!(
+                "第 {} 題今天已經練過了。明天會再出現——隔一天再想一次才是複習，\
+                 現在重寫只是抄上面的參考答案。",
+                locked
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )));
+        }
+        let redone = wanted;
+
+        let mut answers = previous.answers.clone();
+        answers.resize(items.len(), String::new());
+        for (i, text) in &redone {
+            answers[*i] = text.clone();
+        }
+
+        // 只把重寫的那幾題送出去
+        let pairs: Vec<(String, String)> = redone
+            .iter()
+            .map(|(i, text)| (items[*i].source.clone(), text.clone()))
+            .collect();
+        let weak_points =
+            grammar::due_points(self.db, ProfileId(profile_id), now, GRAMMAR_BATCH).await?;
+        let points = self.grammar_points(now).await?;
+        let req = prompts::translation_feedback(
+            self.target_name(),
+            self.native_name(),
+            *to_target,
+            &pairs,
+            &weak_points,
+            &points,
+        );
+        let value = self.ask_json(profile_id, "grade", &req).await?;
+        let fresh: Feedback =
+            serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))?;
+
+        // 回來的結果是**子集**的題號（第 1 題指的是重寫清單裡的第一題），
+        // 要對回原本的題號。模型沒給 index 或給了範圍外的值時退回照順序貼——
+        // 貼錯的話使用者會看到「我改的是第 4 題，講評卻掛在第 2 題」。
+        merged.items.resize_with(items.len(), ItemResult::default);
+        for (k, result) in fresh.items.iter().enumerate() {
+            let within = result
+                .index
+                .checked_sub(1)
+                .filter(|idx| *idx < redone.len())
+                .unwrap_or(k);
+            let Some((target, _)) = redone.get(within) else {
+                continue;
+            };
+            merged.items[*target] = ItemResult {
+                index: *target + 1,
+                ..result.clone()
+            };
+        }
+
+        // 修正建議換成這一次的：它們只講重寫的那幾題，舊的那些仍然
+        // 留在上一次的紀錄裡，兩份對照著看才知道改掉了什麼
+        merged.corrections = fresh.corrections;
+        merged.unknown_words = fresh.unknown_words.clone();
+        merged.taught_words.clear();
+
+        let correct = merged.items.iter().filter(|r| r.correct).count();
+        merged.score = Some(100.0 * correct as f64 / items.len() as f64);
+
+        for word in &previous.marked_unknown {
+            if !merged
+                .unknown_words
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case(word))
+            {
+                merged.unknown_words.push(word.clone());
+            }
+        }
+        let to_add = merged.unknown_words.clone();
+        merged.added_to_deck = self.add_unknown_words(profile_id, &to_add, now).await?;
+
+        let input = GradeInput {
+            exercise_id,
+            answers,
+            choices: Vec::new(),
+            marked_unknown: previous.marked_unknown.clone(),
+        };
+        self.record_grammar_results(profile_id, &body, &input, &merged, now)
+            .await?;
+
+        // 只更新這次重寫的那幾句：沒動到的題目不該因為這次送出
+        // 就被記成「今天練過了」，那會讓它們明天才回來。
+        let touched: Vec<usize> = redone.iter().map(|(i, _)| *i).collect();
+        self.schedule_sentences(profile_id, exercise_id, &touched, &merged, now)
+            .await?;
+
+        let answer_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+        let feedback_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".into());
+        exercises::record_attempt(
+            self.db,
+            ExerciseId(exercise_id),
+            &answer_json,
+            merged.score,
+            &feedback_json,
+            now,
+        )
+        .await?;
+
+        Ok(merged)
+    }
+
+    /// 把翻譯的每一句排進（或移出）複習。
+    ///
+    /// 沒有逐題結果的那幾句**不動**：模型偶爾只回一個總分，那時候
+    /// 說不出這一句對不對。猜「對」會讓還不會的句子從此消失，
+    /// 猜「錯」會讓明明寫對的句子明天又冒出來——兩個都比不動更糟。
+    async fn schedule_sentences(
+        &self,
+        profile_id: i64,
+        exercise_id: i64,
+        indices: &[usize],
+        feedback: &Feedback,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let pid = ProfileId(profile_id);
+        for &i in indices {
+            let Some(result) = feedback.items.get(i) else {
+                continue;
+            };
+            if result.correct {
+                sentences::pass(self.db, pid, exercise_id, i as i64).await?;
+            } else {
+                sentences::miss(self.db, pid, exercise_id, i as i64, now).await?;
+                // 次數同時累計到句子那一側：排程那張表在寫對之後整列會被刪掉，
+                // 而「這句我錯過三次」正是練起來之後最值得留著的訊號
+                word_sentences::mark_missed(self.db, pid, exercise_id, i as i64).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn grade_translation(

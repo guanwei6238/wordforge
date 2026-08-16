@@ -171,6 +171,18 @@ pub async fn forms(db: &Db, lang: &str, word: &str) -> Result<Vec<String>> {
 /// 要分開得看上下文，那需要真正的詞性標注。併錯的代價是
 /// 一張卡標到鄰近的意思；不併的代價是同一個字散成好幾張卡，
 /// 每張各自排程。前者比較容易發現也比較容易修。
+/// 這個 id 對應的詞條原文。
+///
+/// 拿 id 換回文字聽起來多此一舉，但很多正規化的路（詞形還原、家族查詢）
+/// 的入口是**文字**，而 UI 手上只有 id。查不到就回 `None`——
+/// 字典重匯之後舊的 id 可能已經不在了。
+pub async fn text_of(db: &Db, lemma_id: LemmaId) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar("SELECT text FROM lemma WHERE id = ?")
+        .bind(lemma_id.0)
+        .fetch_optional(db.pool())
+        .await?)
+}
+
 pub async fn base_form(db: &Db, lang: &str, form: &str) -> Result<Option<LemmaId>> {
     let normalized = wordforge_core::text::normalize(form);
     if normalized.is_empty() {

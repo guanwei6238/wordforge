@@ -828,6 +828,21 @@ pub async fn languages(db: &Db) -> Result<Vec<(String, i64)>> {
     )
 }
 
+/// 字典裡有沒有東西。
+///
+/// 開機畫面只需要這一個布林值，但它原本是靠 [`stats`] 取得的——而那個
+/// 函式為了「每個來源有幾個詞條」要對 285 萬列的 `sense` 做
+/// `COUNT(DISTINCT lemma_id)`，實測 1.3 秒（冷快取更久）。複習頁在那之前
+/// 是一片空白，使用者感受到的是「點複習要等十秒」。
+///
+/// `EXISTS` 一找到第一列就停，實測 0.0 ms。要一個布林值就不要撈統計。
+pub async fn has_entries(db: &Db) -> Result<bool> {
+    let found: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM lemma LIMIT 1)")
+        .fetch_one(db.pool())
+        .await?;
+    Ok(found != 0)
+}
+
 pub async fn stats(db: &Db) -> Result<DictStats> {
     let lemmas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lemma")
         .fetch_one(db.pool())

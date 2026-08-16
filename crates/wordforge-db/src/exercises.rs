@@ -68,6 +68,9 @@ pub struct ExerciseRecord {
     pub created_at: String,
     /// 已經作答過的話，最後一次的批改結果
     pub feedback_json: Option<String>,
+    /// 做過幾次。清單上要說得出「做過 2 次：62 → 85」，
+    /// 不然使用者看到的分數是最後一次的，而他記得的是第一次那個。
+    pub attempt_count: i64,
 }
 
 fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> ExerciseRecord {
@@ -80,13 +83,15 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> ExerciseRecord {
         coverage: row.get("coverage"),
         created_at: row.get("created_at"),
         feedback_json: row.get("feedback_json"),
+        attempt_count: row.get("attempt_count"),
     }
 }
 
 const SELECT_EXERCISE: &str = "SELECT e.id, e.kind, e.payload_json, e.target_lemmas_json,
         e.coverage, e.created_at,
         (SELECT feedback_json FROM attempt WHERE exercise_id = e.id
-         ORDER BY created_at DESC LIMIT 1) AS feedback_json
+         ORDER BY created_at DESC, id DESC LIMIT 1) AS feedback_json,
+        (SELECT COUNT(*) FROM attempt WHERE exercise_id = e.id) AS attempt_count
     FROM exercise e";
 
 pub async fn get(db: &Db, id: ExerciseId) -> Result<Option<ExerciseRecord>> {
@@ -231,7 +236,7 @@ pub async fn recent_kinds(db: &Db, profile_id: ProfileId, limit: i64) -> Result<
     Ok(rows.into_iter().rev().collect())
 }
 
-/// 記錄一次作答與批改結果。
+/// 記錄一次作答與批改結果。回傳這一筆的 id。
 pub async fn record_attempt(
     db: &Db,
     exercise_id: ExerciseId,
@@ -239,19 +244,79 @@ pub async fn record_attempt(
     score: Option<f64>,
     feedback_json: &str,
     now: OffsetDateTime,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<i64> {
+    let id: i64 = sqlx::query_scalar(
         "INSERT INTO attempt (exercise_id, answer_json, score, feedback_json, created_at)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING id",
     )
     .bind(exercise_id.0)
     .bind(answer_json)
     .bind(score)
     .bind(feedback_json)
     .bind(ts::to_sql(now))
-    .execute(db.pool())
+    .fetch_one(db.pool())
     .await?;
-    Ok(())
+    Ok(id)
+}
+
+/// 一次作答的完整內容。
+///
+/// `answer_json` 這個欄位曾經**只有寫入端**：批改時存進去，然後沒有任何
+/// 查詢讀它。使用者做完一份練習、關掉畫面，寫過什麼就再也叫不回來了——
+/// 而重做同一份時最想看的就是「上次我是怎麼寫的」。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AttemptRecord {
+    pub id: i64,
+    /// 使用者當時送出的作答（`GradeInput` 的 JSON）
+    pub answer_json: String,
+    pub score: Option<f64>,
+    /// 當時的批改與解析（`Feedback` 的 JSON）
+    pub feedback_json: String,
+    pub created_at: String,
+}
+
+/// 一份練習做過幾次，舊的在前。
+///
+/// 舊的在前是因為這串要當「進步的軌跡」看：62 → 85 → 100 讀起來
+/// 才是一條線，反過來要從結果往回推。
+pub async fn attempts(db: &Db, exercise_id: ExerciseId) -> Result<Vec<AttemptRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, answer_json, score, feedback_json, created_at FROM attempt
+         WHERE exercise_id = ? ORDER BY created_at, id",
+    )
+    .bind(exercise_id.0)
+    .fetch_all(db.pool())
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| AttemptRecord {
+            id: row.get("id"),
+            answer_json: row.get("answer_json"),
+            score: row.get("score"),
+            feedback_json: row.get("feedback_json"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+/// 刪掉單獨一次作答，練習本身留著。
+///
+/// 綁 `profile_id` 的理由同 [`delete`]：id 從前端傳進來，少了這個條件
+/// 就能刪到別人的紀錄。這裡要繞一層 `exercise` 才問得到 profile，
+/// 因為 `attempt` 沒有自己的 profile 欄位——它本來就只能屬於某一份練習。
+pub async fn delete_attempt(db: &Db, profile_id: ProfileId, attempt_id: i64) -> Result<bool> {
+    let affected = sqlx::query(
+        "DELETE FROM attempt WHERE id = ? AND exercise_id IN
+             (SELECT id FROM exercise WHERE profile_id = ?)",
+    )
+    .bind(attempt_id)
+    .bind(profile_id.0)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
 }
 
 #[cfg(test)]
@@ -412,6 +477,106 @@ mod tests {
 
         let got = get(&db, id).await.unwrap().unwrap();
         assert!(got.feedback_json.unwrap().contains("\"score\":80"));
+    }
+
+    /// 這條測試存在的理由是它曾經不可能通過：`answer_json` 只有寫入端，
+    /// 沒有任何查詢讀它。使用者關掉畫面之後，自己寫過什麼就再也叫不回來。
+    #[tokio::test]
+    async fn a_past_answer_can_be_read_back() {
+        let (db, profile) = setup().await;
+        let id = add(&db, profile, "translation_to_target", t0()).await;
+        record_attempt(
+            &db,
+            id,
+            r#"{"answers":["I would like prepare three reasons"]}"#,
+            Some(62.0),
+            r#"{"score":62,"items":[{"index":1,"correct":false}]}"#,
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let got = attempts(&db, id).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].answer_json.contains("I would like prepare"),
+            "作答讀不回來：{}",
+            got[0].answer_json
+        );
+        assert!(got[0].feedback_json.contains("\"correct\":false"));
+        assert_eq!(got[0].score, Some(62.0));
+    }
+
+    /// 同一份練習做過幾次要照時間排，舊的在前——62 → 85 → 100
+    /// 讀起來才是一條進步的線。
+    #[tokio::test]
+    async fn repeated_attempts_are_listed_oldest_first() {
+        let (db, profile) = setup().await;
+        let id = add(&db, profile, "translation_to_target", t0()).await;
+        for (n, score) in [(1, 62.0), (2, 85.0), (3, 100.0)] {
+            record_attempt(
+                &db,
+                id,
+                &format!(r#"{{"answers":["第 {n} 次"]}}"#),
+                Some(score),
+                "{}",
+                t0() + time::Duration::minutes(n),
+            )
+            .await
+            .unwrap();
+        }
+
+        let scores: Vec<Option<f64>> = attempts(&db, id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.score)
+            .collect();
+        assert_eq!(scores, vec![Some(62.0), Some(85.0), Some(100.0)]);
+    }
+
+    /// 刪掉其中一次作答，練習與其他次都要留著。
+    #[tokio::test]
+    async fn one_attempt_can_be_deleted_without_the_exercise() {
+        let (db, profile) = setup().await;
+        let id = add(&db, profile, "translation_to_target", t0()).await;
+        let first = record_attempt(
+            &db,
+            id,
+            r#"{"answers":["隨便寫的"]}"#,
+            Some(20.0),
+            "{}",
+            t0(),
+        )
+        .await
+        .unwrap();
+        record_attempt(
+            &db,
+            id,
+            r#"{"answers":["認真寫的"]}"#,
+            Some(90.0),
+            "{}",
+            t0() + time::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+        let other = profiles::create(&db, "別人", "zh-TW", "en", t0())
+            .await
+            .unwrap();
+        assert!(
+            !delete_attempt(&db, other, first).await.unwrap(),
+            "別的 profile 不該刪得掉"
+        );
+
+        assert!(delete_attempt(&db, profile, first).await.unwrap());
+        let left = attempts(&db, id).await.unwrap();
+        assert_eq!(left.len(), 1, "只該刪掉那一次");
+        assert!(left[0].answer_json.contains("認真寫的"));
+        assert!(get(&db, id).await.unwrap().is_some(), "練習本身要留著");
+
+        // 已經不存在的再刪一次不該報錯，只要說「沒刪到」
+        assert!(!delete_attempt(&db, profile, first).await.unwrap());
     }
 
     /// 同一題重做時，拿到的該是最後一次的批改。

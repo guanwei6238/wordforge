@@ -2091,6 +2091,318 @@ async fn a_brand_new_deck_still_produces_a_translation_exercise() {
     );
 }
 
+/// 練過的字要連回「我在哪句話裡用過它」。
+///
+/// 複習時看得到的本來只有字典的釋義與別人寫的例句。真正記得住的是
+/// 自己做過的那一句，而那些句子一直都存在練習裡，只是沒有人把它們
+/// 接回單字。
+#[tokio::test]
+async fn a_practised_word_links_back_to_the_sentence_you_wrote() {
+    use wordforge_db::word_sentences;
+
+    let (db, profile) = setup(&["alpha", "beta"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    study(&db, profile, 1).await;
+    study(&db, profile, 2).await;
+
+    let llm = FakeLlm::translating(&[]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let linked = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(linked.len(), 1, "練了 alpha 卻沒有連到任何句子");
+    assert!(
+        linked[0].text.contains("alpha"),
+        "連到的句子裡沒有那個字：{}",
+        linked[0].text
+    );
+    assert_eq!(linked[0].origin, "translation");
+}
+
+/// 這個功能對老使用者一開始是空的，而他做過的每一份練習裡都有句子。
+///
+/// 補寫要能從閱讀文章裡挑出**用到那個字的那一句**，並配上對應的譯句
+/// ——整篇翻譯掛在一個單字底下沒有人會讀。
+#[tokio::test]
+async fn backfill_finds_the_sentence_that_uses_the_word() {
+    use wordforge_db::exercises::{self, NewExercise};
+    use wordforge_db::word_sentences;
+
+    let (db, profile) = setup(&["umbrella"]).await;
+
+    // 直接建一份練習，模擬「這個功能還不存在時做過的」
+    let payload = r#"{"kind":"reading","title":"Rain","new_words":[],"questions":[],
+        "passage":"It rained hard all morning. I forgot my umbrella at home.",
+        "translation":"整個早上雨下得很大。我把雨傘忘在家裡了。"}"#;
+    exercises::create(
+        &db,
+        NewExercise {
+            profile_id: ProfileId(profile),
+            kind: "reading",
+            payload_json: payload,
+            target_words: &["umbrella".to_string()],
+            coverage: Some(0.96),
+            model: None,
+            material_id: None,
+            topic: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let llm = FakeLlm::new(&[]);
+    let engine = PracticeEngine::new(&db, &llm);
+    assert_eq!(engine.backfill_sentences(profile, t0()).await.unwrap(), 1);
+
+    let linked = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].text, "I forgot my umbrella at home.");
+    assert_eq!(
+        linked[0].translation.as_deref(),
+        Some("我把雨傘忘在家裡了。"),
+        "配到的該是那一句的翻譯，不是整篇"
+    );
+
+    // 版號守著，第二次不該再掃一遍
+    assert_eq!(engine.backfill_sentences(profile, t0()).await.unwrap(), 0);
+}
+
+/// 這條測試存在的理由是它真的發生過：句子對齊改好之後，**既有的連結
+/// 沒有跟著更新**——使用者看到的還是舊演算法的結果（一句英文底下掛著
+/// 整段中文）。補寫有版號守門，而版號沒加就等於改進只對新練習生效。
+///
+/// 重算靠 UNIQUE 收斂，所以 `misses` 那些累計的東西不會被洗掉。
+#[tokio::test]
+async fn bumping_the_backfill_version_recomputes_old_links() {
+    use wordforge_db::exercises::{self, NewExercise};
+    use wordforge_db::word_sentences;
+
+    let (db, profile) = setup(&["umbrella"]).await;
+    let payload = r#"{"kind":"reading","title":"Rain","new_words":[],"questions":[],
+        "passage":"It rained hard all morning. I forgot my umbrella at home.",
+        "translation":"整個早上雨下得很大。我把雨傘忘在家裡了。"}"#;
+    let exercise = exercises::create(
+        &db,
+        NewExercise {
+            profile_id: ProfileId(profile),
+            kind: "reading",
+            payload_json: payload,
+            target_words: &["umbrella".to_string()],
+            coverage: None,
+            model: None,
+            material_id: None,
+            topic: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    // 模擬舊演算法留下的連結：譯文是整段，不是那一句
+    word_sentences::record(
+        &db,
+        word_sentences::NewSentence {
+            profile_id: ProfileId(profile),
+            lemma_id: LemmaId(1),
+            exercise_id: exercise.0,
+            text: "I forgot my umbrella at home.",
+            translation: Some("整個早上雨下得很大。我把雨傘忘在家裡了。"),
+            origin: "reading",
+            item_index: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+    // 舊版號：跑過了，但用的是舊邏輯
+    wordforge_db::meta::set_i64(&db, &format!("sentence_backfill:{profile}"), 1)
+        .await
+        .unwrap();
+
+    let llm = FakeLlm::new(&[]);
+    let engine = PracticeEngine::new(&db, &llm);
+    assert_eq!(
+        engine.backfill_sentences(profile, t0()).await.unwrap(),
+        1,
+        "版號舊就要重算，不能因為「已經連過」而跳過"
+    );
+
+    let linked = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(linked.len(), 1, "重算不該產生重複的句子");
+    assert_eq!(
+        linked[0].translation.as_deref(),
+        Some("我把雨傘忘在家裡了。"),
+        "譯文該更新成那一句，而不是整段"
+    );
+}
+
+/// 「這句我錯過幾次」要在句子練起來之後**還留著**。
+///
+/// 次數本來記在排程那張表，但句子寫對之後那一列會被刪掉——那正是
+/// 使用者最想看到這個數字的時候（「這句我卡過三次才寫對」）。
+/// 所以次數累計在句子這一側。
+#[tokio::test]
+async fn a_sentence_keeps_its_miss_count_after_it_is_learned() {
+    use wordforge_db::word_sentences;
+
+    let (db, profile) = setup(&["alpha", "beta"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    study(&db, profile, 1).await;
+    study(&db, profile, 2).await;
+
+    let missed = r#"{"score":0,"items":[{"index":1,"correct":false},{"index":2,"correct":false}],
+        "corrections":[],"unknown_words":[]}"#;
+    let fixed = r#"{"score":100,"items":[{"index":1,"correct":true}],
+        "corrections":[],"unknown_words":[]}"#;
+    let llm = FakeLlm::translating(&[missed, fixed]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let day1 = t0() + Duration::days(400);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), day1)
+        .await
+        .unwrap();
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["寫錯的".into(), "也寫錯的".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            day1,
+        )
+        .await
+        .unwrap();
+
+    // 隔天把第一句寫對
+    engine
+        .regrade(
+            profile,
+            exercise.exercise_id,
+            &[(0, "這次寫對了".into())],
+            day1 + Duration::days(1),
+        )
+        .await
+        .unwrap();
+
+    let linked = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(
+        linked[0].misses, 1,
+        "寫對之後排程那一列被刪掉了，但錯過的次數要留著"
+    );
+}
+
+/// 翻譯的每一句各自排程：做錯的今天就不再出現，明天回來，寫對就結束。
+///
+/// 「當天鎖住」是這條規則的重點。參考答案與講評就印在畫面上，
+/// 當天反覆重寫刷到全對看起來是 100 分，實際上只是抄了上面那一行——
+/// 那不是複習，是抄寫。
+#[tokio::test]
+async fn a_missed_sentence_is_locked_today_and_comes_back_tomorrow() {
+    use wordforge_db::sentences;
+
+    let (db, profile) = setup(&["alpha", "beta"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    study(&db, profile, 1).await;
+    study(&db, profile, 2).await;
+
+    // 第一次批改：第一句對、第二句錯
+    let graded = r#"{"score":50,
+        "items":[{"index":1,"correct":true},{"index":2,"correct":false}],
+        "corrections":[],"unknown_words":[]}"#;
+    // 重寫那一句：這次對了
+    let regraded = r#"{"score":100,"items":[{"index":1,"correct":true}],
+        "corrections":[],"unknown_words":[]}"#;
+    let llm = FakeLlm::translating(&[graded, regraded]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let today = t0() + Duration::days(400);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), today)
+        .await
+        .unwrap();
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["第一句".into(), "第二句".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            today,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        sentences::due(&db, ProfileId(profile), today, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "今天做錯的句子今天不該再出現"
+    );
+
+    let blocked = engine
+        .regrade(
+            profile,
+            exercise.exercise_id,
+            &[(1, "再寫一次".into())],
+            today,
+        )
+        .await
+        .expect_err("當天重寫該被擋下來");
+    assert!(
+        blocked.to_string().contains("今天已經練過"),
+        "訊息要說得出為什麼與下一步：{blocked}"
+    );
+
+    let tomorrow = today + Duration::days(1);
+    let due = sentences::due(&db, ProfileId(profile), tomorrow, 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1, "只有做錯的那一句回來");
+    assert_eq!(due[0].item_index, 1);
+
+    // 明天寫對 → 從此不再出現，整份也變成 100 分
+    let feedback = engine
+        .regrade(
+            profile,
+            exercise.exercise_id,
+            &[(1, "這次寫對了".into())],
+            tomorrow,
+        )
+        .await
+        .unwrap();
+    assert_eq!(feedback.score, Some(100.0), "兩題都對就是 100 分");
+    assert!(
+        sentences::due(&db, ProfileId(profile), tomorrow + Duration::days(30), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "寫對的句子不該再回來"
+    );
+}
+
 /// 這條測試存在的理由是它曾經完全沒有被驗過：prompt 一直有列出要練的字，
 /// 但那只是請求。模型常常寫出一句通順、自然、跟那個字沒有關係的句子，
 /// 而系統照收——題目是好題目，只是那個字沒練到，`target_words` 還照樣

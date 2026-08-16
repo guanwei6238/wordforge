@@ -54,7 +54,8 @@ export function FeedbackPanel({
   materialId: number | null;
   setMaterialId: (id: number | null) => void;
   busy: string | null;
-  onNext: () => void;
+  /** 不傳就沒有「下一題」與教材選單——看歷史紀錄時沒有下一題可出 */
+  onNext?: () => void;
 }) {
   // 解析不再把整份字表攤出來——那是一大塊沒有人會逐條讀的東西。
   // 這裡只提「這篇有幾個你不會的字」，要看意思就去點文章裡的那個字。
@@ -111,19 +112,22 @@ export function FeedbackPanel({
         )
       )}
 
-      <div className="row">
-        {materials.length > 0 && (
-          <MaterialPicker
-            materials={materials}
-            value={materialId}
-            onChange={setMaterialId}
-            disabled={busy !== null}
-          />
-        )}
-        <button className="primary" onClick={onNext} disabled={busy !== null}>
-          下一題
-        </button>
-      </div>
+      {/* 看歷史紀錄時沒有下一題可出，整列連同教材選單一起收掉 */}
+      {onNext && (
+        <div className="row">
+          {materials.length > 0 && (
+            <MaterialPicker
+              materials={materials}
+              value={materialId}
+              onChange={setMaterialId}
+              disabled={busy !== null}
+            />
+          )}
+          <button className="primary" onClick={onNext} disabled={busy !== null}>
+            下一題
+          </button>
+        </div>
+      )}
     </section>
   );
 }

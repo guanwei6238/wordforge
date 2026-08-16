@@ -12,8 +12,10 @@ pub mod llm_usage;
 pub mod material;
 pub mod meta;
 pub mod repo;
+pub mod sentences;
 pub mod topics;
 pub(crate) mod ts;
+pub mod word_sentences;
 
 use std::path::Path;
 
