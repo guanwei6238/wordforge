@@ -163,7 +163,8 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
             你不確定它在這個情境的搭配詞或介系詞、或者它粗俗冒犯不適合教材。\n\
             **寧可少教一個字，也不要寫出「為了用這個字而存在」的句子，\n\
             更不要造一個看起來很像但錯的用法。**\n\
-         4. 白名單以外，不要使用專有名詞、縮寫、俚語或罕見字。\n\
+         4. 白名單與上面那份已知詞清單以外，不要使用專有名詞、縮寫、俚語或罕見字。\n\
+            （清單裡本來就有的專有名詞是他自己學過的，用得上就用。）\n\
          5. 文章要有完整的起承轉合，不要像單字例句的拼貼。\n\
          6. **題目與選項一律用{target}寫**，因為那是他要練的語言；\n\
             只有 explanation 與 gloss 用{native}。\n\n",
@@ -817,9 +818,11 @@ pub fn translation_task(spec: &TranslationSpec) -> ChatRequest {
     let word_rule = if words.is_empty() {
         String::new()
     } else {
+        // **不要 take(count)**：清單要列出整個候選池，模型才有得挑。
+        // 砍到 count 個等於「給 5 挑 5」，那就是改之前的行為——
+        // 這個洞是把真實資料組出來的 prompt 印出來才看到的。
         let assignments: String = words
             .iter()
-            .take(count)
             .enumerate()
             .map(|(i, word)| format!("{}. {word}\n", i + 1))
             .collect();

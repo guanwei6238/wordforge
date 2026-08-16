@@ -413,6 +413,20 @@ impl PracticeEngine<'_> {
                        WHERE c.profile_id = ?1 AND c.lemma_id = lemma.id
                          AND c.state = 'new'
                    )
+                   -- **排除專有名詞**。實測這個池子有 29.7% 是人名與地名
+                   -- （charles、powell、raf…），而同一份 prompt 第 4 點
+                   -- 正好寫著「不要使用專有名詞」——等於白燒三成的 token
+                   -- 去給模型一份它不該用的清單。
+                   --
+                   -- 判斷方式跟 `new_word_candidates` 一致：詞性表裡出現
+                   -- `name` 就整個排掉。維基詞典對專有名詞常常同時標上
+                   -- 普通詞性（edward 是 name,noun），只排「只有 name」
+                   -- 的話攔不住。
+                   AND NOT EXISTS (
+                       SELECT 1 FROM lemma p
+                       WHERE p.lang = lemma.lang AND p.normalized = lemma.normalized
+                         AND p.pos LIKE '%name%'
+                   )
              ),
              banded AS (
                  SELECT text, freq_rank,

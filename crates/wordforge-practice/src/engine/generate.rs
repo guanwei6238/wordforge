@@ -31,10 +31,15 @@ impl PracticeEngine<'_> {
             count.min(words.len())
         };
 
-        // 題目句子的其他用字要是他讀得懂的——讀不懂的話那一題考的是別的東西
-        let usable = self
+        // 題目句子的其他用字要是他讀得懂的——讀不懂的話那一題考的是別的東西。
+        // 扣掉硬性池：同一個字在兩份清單裡各出現一次只是浪費 token，
+        // 而且「可以練的字」跟「可以用的字」混在一起會讓要求變模糊。
+        let usable: Vec<String> = self
             .sentence_pool(profile_id, learner.vocabulary, SENTENCE_WORD_POOL)
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|w| !words.iter().any(|p| p.eq_ignore_ascii_case(w)))
+            .collect();
 
         let excerpt = self
             .material_excerpt(&words, now.unix_timestamp() as u64)

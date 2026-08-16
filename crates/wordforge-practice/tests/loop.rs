@@ -1825,37 +1825,25 @@ async fn two_translations_in_a_row_do_not_reuse_the_same_words() {
     let engine = PracticeEngine::new(&db, &llm);
 
     let later = t0() + Duration::days(400);
-    // 只看**硬性池**那一段（「可以挑的字」底下的編號清單）。
-    // 可用池是「他讀得懂的字」，整個牌組本來就都在裡面，
-    // 掃整份 prompt 會把那些也算進來。
-    let used = |prompt: &str| -> Vec<String> {
-        let pool = prompt
-            .split_once(ASSIGNMENT_HEADER)
-            .and_then(|(_, rest)| rest.split_once("`target_word`"))
-            .map(|(list, _)| list.to_string())
-            .unwrap_or_default();
-        words
-            .iter()
-            .filter(|w| pool.contains(**w))
-            .map(|w| w.to_string())
-            .collect()
-    };
 
-    engine
+    // 看的是**真的用到的字**（`target_words`），不是候選池。
+    // 候選給得比要用的多，沒被挑中的字不算練過——它下一次還該出現在
+    // 池子裡，那是刻意的。會重複才是問題的是「兩次都練到同一個字」。
+    let first = engine
         .generate(profile, Some(ExerciseKind::TranslationToTarget), later)
         .await
-        .unwrap();
-    let first = used(&llm.last_prompt());
+        .unwrap()
+        .target_words;
 
-    engine
+    let second = engine
         .generate(
             profile,
             Some(ExerciseKind::TranslationToTarget),
             later + Duration::minutes(1),
         )
         .await
-        .unwrap();
-    let second = used(&llm.last_prompt());
+        .unwrap()
+        .target_words;
 
     assert!(!first.is_empty() && !second.is_empty(), "兩次都要出得了題");
     let repeated: Vec<&String> = second.iter().filter(|w| first.contains(w)).collect();
