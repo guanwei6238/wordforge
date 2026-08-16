@@ -208,6 +208,71 @@ pub async fn base_form(db: &Db, lang: &str, form: &str) -> Result<Option<LemmaId
     Ok(id.map(LemmaId))
 }
 
+/// 一次查一批詞形的基本形。
+///
+/// 建句子索引時一句要查十幾個詞元、再加上片語的 n-gram，一個一個查會變成
+/// 幾十次往返；整篇文章就是上千次。
+///
+/// 挑選規則跟 [`base_form`] **必須一樣**（最常見的優先，同分取 id 最小）。
+/// 兩邊不一致的話，寫進索引的 lemma 跟查詢時算出來的會對不上，
+/// 而畫面上只是少了幾句，看不出哪裡壞了。
+pub async fn base_forms(
+    db: &Db,
+    lang: &str,
+    forms: &[String],
+) -> Result<std::collections::HashMap<String, LemmaId>> {
+    use std::collections::HashMap;
+
+    let mut wanted: Vec<String> = forms
+        .iter()
+        .map(|f| wordforge_core::text::normalize(f))
+        .filter(|f| !f.is_empty())
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+
+    // (freq_rank IS NULL, freq_rank, id)——排序鍵在 Rust 這側算，
+    // 因為一次查回來的是好幾個詞形混在一起的結果
+    let mut best: HashMap<String, (bool, i64, i64)> = HashMap::new();
+    // SQLite 的變數上限是 999，而清單用了兩次
+    for chunk in wanted.chunks(400) {
+        let holes = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT normalized, id, freq_rank FROM lemma
+             WHERE lang = ? AND normalized IN ({holes})
+             UNION ALL
+             SELECT s.normalized, l.id, l.freq_rank FROM lemma l
+               JOIN surface_form s ON s.lemma_id = l.id
+             WHERE s.lang = ? AND s.normalized IN ({holes})"
+        );
+        let mut q = sqlx::query_as::<_, (String, i64, Option<i64>)>(&sql).bind(lang);
+        for form in chunk {
+            q = q.bind(form);
+        }
+        q = q.bind(lang);
+        for form in chunk {
+            q = q.bind(form);
+        }
+        for (normalized, id, freq_rank) in q.fetch_all(db.pool()).await? {
+            let key = (freq_rank.is_none(), freq_rank.unwrap_or(i64::MAX), id);
+            best.entry(normalized)
+                .and_modify(|current| {
+                    if key < *current {
+                        *current = key;
+                    }
+                })
+                .or_insert(key);
+        }
+    }
+
+    Ok(best
+        .into_iter()
+        .map(|(form, (_, _, id))| (form, LemmaId(id)))
+        .collect())
+}
+
 /// 挑「剛好在他程度上緣」的生詞，給閱讀理解當新詞白名單。
 ///
 /// ## 為什麼需要這個

@@ -2186,6 +2186,100 @@ async fn backfill_finds_the_sentence_that_uses_the_word() {
     assert_eq!(engine.backfill_sentences(profile, t0()).await.unwrap(), 0);
 }
 
+/// 這條測試存在的理由是它曾經是錯的：連結只認「那份練習指派的目標字」，
+/// 所以句子裡順帶用到的字一句都查不到。實測使用者的資料庫裡 `final`
+/// 出現在「before the final exam」，而那一題練的是 `ahead`——查 `final`
+/// 一句都沒有，而畫面上只是少一塊，看不出哪裡壞了。
+///
+/// `morning` 在這裡刻意**沒有進牌組**：索引不看使用者學了什麼，
+/// 否則今天才學的字回頭還是看不到三個月前做過的句子。
+#[tokio::test]
+async fn a_word_that_merely_appears_in_a_sentence_is_findable_too() {
+    use wordforge_db::exercises::{self, NewExercise};
+    use wordforge_db::word_sentences;
+
+    let (db, profile) = setup(&["umbrella", "morning"]).await;
+    let payload = r#"{"kind":"reading","title":"Rain","new_words":[],"questions":[],
+        "passage":"It rained hard all morning. I forgot my umbrella at home.",
+        "translation":"整個早上雨下得很大。我把雨傘忘在家裡了。"}"#;
+    exercises::create(
+        &db,
+        NewExercise {
+            profile_id: ProfileId(profile),
+            kind: "reading",
+            payload_json: payload,
+            // 這份練習指派的只有 umbrella
+            target_words: &["umbrella".to_string()],
+            coverage: None,
+            model: None,
+            material_id: None,
+            topic: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let llm = FakeLlm::new(&[]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine.backfill_sentences(profile, t0()).await.unwrap();
+
+    let linked = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(linked.len(), 1, "morning 不是目標字，但它就出現在那句話裡");
+    assert_eq!(linked[0].text, "It rained hard all morning.");
+}
+
+/// 句子存一份，不是一個字一份。
+///
+/// 原本的表是 `(lemma_id, text)` 一列，一句話裡有兩個牌組裡的字就存兩份
+/// 本文；索引擴大到整句之後會變成十幾份，而那一句的「錯過幾次」
+/// 也會散在十幾列上。
+#[tokio::test]
+async fn one_sentence_is_stored_once_no_matter_how_many_words_point_at_it() {
+    use wordforge_db::exercises::{self, NewExercise};
+    use wordforge_db::word_sentences;
+
+    let (db, profile) = setup(&["umbrella", "home"]).await;
+    let payload = r#"{"kind":"reading","title":"Rain","new_words":[],"questions":[],
+        "passage":"I forgot my umbrella at home.",
+        "translation":"我把雨傘忘在家裡了。"}"#;
+    exercises::create(
+        &db,
+        NewExercise {
+            profile_id: ProfileId(profile),
+            kind: "reading",
+            payload_json: payload,
+            target_words: &["umbrella".to_string()],
+            coverage: None,
+            model: None,
+            material_id: None,
+            topic: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let llm = FakeLlm::new(&[]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine.backfill_sentences(profile, t0()).await.unwrap();
+
+    let by_umbrella = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(1), 10)
+        .await
+        .unwrap();
+    let by_home = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(by_umbrella.len(), 1);
+    assert_eq!(by_home.len(), 1);
+    assert_eq!(
+        by_umbrella[0].id, by_home[0].id,
+        "兩個字該指到同一句，而不是各存一份"
+    );
+}
+
 /// 這條測試存在的理由是它真的發生過：句子對齊改好之後，**既有的連結
 /// 沒有跟著更新**——使用者看到的還是舊演算法的結果（一句英文底下掛著
 /// 整段中文）。補寫有版號守門，而版號沒加就等於改進只對新練習生效。
@@ -2218,11 +2312,10 @@ async fn bumping_the_backfill_version_recomputes_old_links() {
     .unwrap();
 
     // 模擬舊演算法留下的連結：譯文是整段，不是那一句
-    word_sentences::record(
+    let stale = word_sentences::record(
         &db,
         word_sentences::NewSentence {
             profile_id: ProfileId(profile),
-            lemma_id: LemmaId(1),
             exercise_id: exercise.0,
             text: "I forgot my umbrella at home.",
             translation: Some("整個早上雨下得很大。我把雨傘忘在家裡了。"),
@@ -2232,7 +2325,11 @@ async fn bumping_the_backfill_version_recomputes_old_links() {
         t0(),
     )
     .await
+    .unwrap()
     .unwrap();
+    word_sentences::index(&db, stale, &[LemmaId(1)])
+        .await
+        .unwrap();
     // 舊版號：跑過了，但用的是舊邏輯
     wordforge_db::meta::set_i64(&db, &format!("sentence_backfill:{profile}"), 1)
         .await

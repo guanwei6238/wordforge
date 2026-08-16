@@ -1,10 +1,18 @@
-//! 「這個字我在哪句話裡用過」。
+//! 做過的句子，以及「這個字我在哪句話裡用過」。
 //!
 //! 複習單字時看得到的是字典的釋義與別人寫的例句。真正記得住的是**自己
 //! 做過的那一句**——翻譯題裡寫過的、閱讀文章裡讀到的。這個模組把單字接回
 //! 那些句子，複習頁與字典頁共用同一份資料。
 //!
-//! 連結存的是 lemma 而不是字串：查 `ran` 要看得到練 `run` 時寫的句子。
+//! ## 兩張表
+//!
+//! 句子存一份（`sentence`），「哪個字出現在哪一句」是一張倒排索引
+//! （`sentence_lemma`）。所以寫入是兩步：[`record`] 記下句子拿到 id，
+//! [`index`] 把它連到那句話裡出現的每個詞條。
+//!
+//! 索引存的是 lemma 而不是字串：查 `ran` 要看得到練 `run` 時寫的句子。
+//! 索引也**不限使用者的牌組**——今天才學的字，回頭要看得到三個月前
+//! 做過、明明用到它的句子。
 
 use serde::Serialize;
 use sqlx::Row;
@@ -40,7 +48,6 @@ pub struct WordSentence {
 #[derive(Debug, Clone)]
 pub struct NewSentence<'a> {
     pub profile_id: ProfileId,
-    pub lemma_id: LemmaId,
     pub exercise_id: i64,
     pub text: &'a str,
     pub translation: Option<&'a str>,
@@ -50,34 +57,51 @@ pub struct NewSentence<'a> {
     pub item_index: Option<i64>,
 }
 
-/// 記一句。同一份練習裡同一個字重複出現時只留一句。
+/// 記一句，回傳它的 id。同一份練習裡同一句只留一份。
 ///
 /// 空句子直接忽略：出題偶爾會少一個欄位，而一個空白的「你寫過的句子」
 /// 在畫面上看起來像壞掉。
-pub async fn record(db: &Db, s: NewSentence<'_>, now: OffsetDateTime) -> Result<bool> {
+///
+/// 重跑（補寫舊資料、重算對齊）走 `ON CONFLICT`：譯文與題號會被更新，
+/// 而 `misses` 與文法點留著——那是使用者練出來的紀錄，重算補不回來。
+pub async fn record(db: &Db, s: NewSentence<'_>, now: OffsetDateTime) -> Result<Option<i64>> {
     if s.text.trim().is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
-    let affected = sqlx::query(
-        "INSERT INTO word_sentence
-             (profile_id, lemma_id, exercise_id, text, translation, origin, item_index, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (profile_id, lemma_id, exercise_id, text) DO UPDATE SET
-             translation = COALESCE(excluded.translation, word_sentence.translation),
-             item_index  = COALESCE(excluded.item_index, word_sentence.item_index)",
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO sentence
+             (profile_id, exercise_id, text, translation, origin, item_index, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (profile_id, exercise_id, text) DO UPDATE SET
+             translation = COALESCE(excluded.translation, sentence.translation),
+             item_index  = COALESCE(excluded.item_index, sentence.item_index)
+         RETURNING id",
     )
     .bind(s.profile_id.0)
-    .bind(s.lemma_id.0)
     .bind(s.exercise_id)
     .bind(s.text.trim())
     .bind(s.translation.map(str::trim).filter(|t| !t.is_empty()))
     .bind(s.origin)
     .bind(s.item_index)
     .bind(ts::to_sql(now))
-    .execute(db.pool())
-    .await?
-    .rows_affected();
-    Ok(affected > 0)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Some(id))
+}
+
+/// 把一句連到它裡面出現的詞條。
+///
+/// 重跑時**只加不減**：`INSERT OR IGNORE`。減的情況只有「這個字其實不在
+/// 這句裡」，而那是索引建錯了，不是資料變了——真要修得整批重建。
+pub async fn index(db: &Db, sentence_id: i64, lemma_ids: &[LemmaId]) -> Result<()> {
+    for lemma_id in lemma_ids {
+        sqlx::query("INSERT OR IGNORE INTO sentence_lemma (sentence_id, lemma_id) VALUES (?, ?)")
+            .bind(sentence_id)
+            .bind(lemma_id.0)
+            .execute(db.pool())
+            .await?;
+    }
+    Ok(())
 }
 
 /// 這個字做過的句子，新的在前。
@@ -106,8 +130,9 @@ pub async fn count_for_lemmas(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT COUNT(*) FROM word_sentence
-         WHERE profile_id = ? AND lemma_id IN ({placeholders})"
+        "SELECT COUNT(DISTINCT s.id) FROM sentence s
+           JOIN sentence_lemma sl ON sl.sentence_id = s.id
+         WHERE s.profile_id = ? AND sl.lemma_id IN ({placeholders})"
     );
     let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(profile_id.0);
     for id in lemma_ids {
@@ -136,11 +161,12 @@ pub async fn for_lemmas(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT id, exercise_id, text, translation, origin, misses,
-                grammar_points_json, created_at
-         FROM word_sentence
-         WHERE profile_id = ? AND lemma_id IN ({placeholders})
-         ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        "SELECT DISTINCT s.id, s.exercise_id, s.text, s.translation, s.origin, s.misses,
+                s.grammar_points_json, s.created_at
+         FROM sentence s
+           JOIN sentence_lemma sl ON sl.sentence_id = s.id
+         WHERE s.profile_id = ? AND sl.lemma_id IN ({placeholders})
+         ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?"
     );
     let mut q = sqlx::query(&sql).bind(profile_id.0);
     for id in lemma_ids {
@@ -183,7 +209,7 @@ pub async fn add_grammar_points(
         return Ok(());
     }
     let rows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, grammar_points_json FROM word_sentence
+        "SELECT id, grammar_points_json FROM sentence
          WHERE profile_id = ? AND exercise_id = ? AND item_index = ?",
     )
     .bind(profile_id.0)
@@ -199,7 +225,7 @@ pub async fn add_grammar_points(
                 merged.push(point.clone());
             }
         }
-        sqlx::query("UPDATE word_sentence SET grammar_points_json = ? WHERE id = ?")
+        sqlx::query("UPDATE sentence SET grammar_points_json = ? WHERE id = ?")
             .bind(serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into()))
             .bind(id)
             .execute(db.pool())
@@ -211,8 +237,7 @@ pub async fn add_grammar_points(
 /// 這一句又錯了一次。
 ///
 /// 對到的是「那份練習的第幾題」，所以只有翻譯題會呼叫——閱讀與克漏字的
-/// 句子不是一題，沒有對錯可言。同一句可能連到好幾個字（一句話裡有兩個
-/// 目標詞），那時每一筆都要加，因為每一筆都是「那個字的那一句」。
+/// 句子不是一題，沒有對錯可言。
 pub async fn mark_missed(
     db: &Db,
     profile_id: ProfileId,
@@ -220,7 +245,7 @@ pub async fn mark_missed(
     item_index: i64,
 ) -> Result<u64> {
     Ok(sqlx::query(
-        "UPDATE word_sentence SET misses = misses + 1
+        "UPDATE sentence SET misses = misses + 1
          WHERE profile_id = ? AND exercise_id = ? AND item_index = ?",
     )
     .bind(profile_id.0)
@@ -234,7 +259,7 @@ pub async fn mark_missed(
 /// 這份練習已經記過句子了沒有。補寫舊資料時用來略過做過的。
 pub async fn has_any(db: &Db, exercise_id: i64) -> Result<bool> {
     let found: i64 =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM word_sentence WHERE exercise_id = ?)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sentence WHERE exercise_id = ?)")
             .bind(exercise_id)
             .fetch_one(db.pool())
             .await?;
@@ -290,14 +315,12 @@ mod tests {
 
     fn sentence<'a>(
         profile: ProfileId,
-        lemma: LemmaId,
         exercise: i64,
         text: &'a str,
         translation: Option<&'a str>,
     ) -> NewSentence<'a> {
         NewSentence {
             profile_id: profile,
-            lemma_id: lemma,
             exercise_id: exercise,
             text,
             translation,
@@ -306,22 +329,29 @@ mod tests {
         }
     }
 
+    /// 寫入是兩步：記下句子拿到 id，再把它連到出現的詞條。
+    async fn store(db: &Db, s: NewSentence<'_>, lemma: LemmaId) -> Option<i64> {
+        let id = record(db, s, t0()).await.unwrap();
+        if let Some(id) = id {
+            index(db, id, &[lemma]).await.unwrap();
+        }
+        id
+    }
+
     #[tokio::test]
     async fn a_sentence_comes_back_for_its_word() {
         let (db, profile, lemma, exercise) = setup().await;
-        record(
+        store(
             &db,
             sentence(
                 profile,
-                lemma,
                 exercise,
                 "I borrowed a book from him.",
                 Some("我跟他借了一本書"),
             ),
-            t0(),
+            lemma,
         )
-        .await
-        .unwrap();
+        .await;
 
         let got = for_lemma(&db, profile, lemma, 10).await.unwrap();
         assert_eq!(got.len(), 1);
@@ -334,16 +364,13 @@ mod tests {
     async fn the_same_sentence_is_only_kept_once() {
         let (db, profile, lemma, exercise) = setup().await;
         let text = "I borrowed a book.";
-        record(&db, sentence(profile, lemma, exercise, text, None), t0())
-            .await
-            .unwrap();
-        record(
+        store(&db, sentence(profile, exercise, text, None), lemma).await;
+        store(
             &db,
-            sentence(profile, lemma, exercise, text, Some("我借了一本書")),
-            t0(),
+            sentence(profile, exercise, text, Some("我借了一本書")),
+            lemma,
         )
-        .await
-        .unwrap();
+        .await;
 
         let got = for_lemma(&db, profile, lemma, 10).await.unwrap();
         assert_eq!(got.len(), 1);
@@ -380,22 +407,20 @@ mod tests {
             .await
             .unwrap();
 
-        // 句子是存在 base form 底下的
-        record(
+        // 句子的索引是建在 base form 底下的
+        store(
             &db,
             NewSentence {
                 profile_id: profile,
-                lemma_id: run,
                 exercise_id: exercise,
                 text: "She ran to the station.",
                 translation: Some("她跑去車站"),
                 origin: "translation",
                 item_index: Some(0),
             },
-            t0(),
+            run,
         )
-        .await
-        .unwrap();
+        .await;
 
         let family = lemmas::family(&db, "en", "ran").await.unwrap();
         let got = for_lemmas(&db, profile, &family, 10, 0).await.unwrap();
@@ -408,9 +433,9 @@ mod tests {
     async fn an_empty_sentence_is_ignored() {
         let (db, profile, lemma, exercise) = setup().await;
         assert!(
-            !record(&db, sentence(profile, lemma, exercise, "   ", None), t0())
+            store(&db, sentence(profile, exercise, "   ", None), lemma)
                 .await
-                .unwrap()
+                .is_none()
         );
         assert!(for_lemma(&db, profile, lemma, 10).await.unwrap().is_empty());
     }
@@ -419,13 +444,12 @@ mod tests {
     #[tokio::test]
     async fn deleting_an_exercise_takes_its_sentences_with_it() {
         let (db, profile, lemma, exercise) = setup().await;
-        record(
+        store(
             &db,
-            sentence(profile, lemma, exercise, "I borrowed it.", None),
-            t0(),
+            sentence(profile, exercise, "I borrowed it.", None),
+            lemma,
         )
-        .await
-        .unwrap();
+        .await;
         assert!(has_any(&db, exercise).await.unwrap());
 
         exercises::delete(&db, profile, exercises::ExerciseId(exercise))

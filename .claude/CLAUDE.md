@@ -96,6 +96,15 @@ sqlite3.connect('file:...wordforge.db?mode=ro', uri=True)
 - 以為 `find_by_form` 會回原形 → 它回 id 最小的，所以 `ran` 回 `ran` 不是 `run`
 - 以為粗話會有 register 標記 → `bitch` 只標了 `countable, archaic, colloquial`
 
+**要複製它來試 migration 的話，`-wal` 與 `-shm` 一起複製。** App 是 WAL 模式，
+最近的改動可能還沒 checkpoint 進主檔——實測有 667 KB 只存在 `-wal` 裡。
+只 `cp wordforge.db` 會拿到一個舊了好幾個 migration 的資料庫，
+而症狀是「no such column」這種看起來像自己 SQL 寫錯的錯誤。
+
+```bash
+cp ~/.local/share/org.wordforge.app/wordforge.db* .   # 星號不能少
+```
+
 ## 驗證方法本身也要驗證
 
 `strings` 預設只掃 ASCII，所以拿它找中文字串**不管在不在都會回 0**。

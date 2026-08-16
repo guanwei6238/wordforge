@@ -626,10 +626,7 @@ impl<'a> PracticeEngine<'a> {
 
         // 把這次的句子連回單字。連不上就跳過——這是加分項，
         // 不該讓一份出好的練習因此失敗。
-        if let Err(e) = self
-            .link_sentences(profile_id, id.0, &body, &target_words, now)
-            .await
-        {
+        if let Err(e) = self.link_sentences(profile_id, id.0, &body, now).await {
             tracing::warn!(error = %e, "句子連結沒建起來");
         }
 

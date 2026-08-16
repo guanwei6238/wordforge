@@ -159,13 +159,14 @@ pub async fn words_with_few_sentences(
         "SELECT l.text
          FROM card c
            JOIN lemma l ON l.id = c.lemma_id
-           LEFT JOIN word_sentence w
-             ON w.lemma_id = c.lemma_id AND w.profile_id = c.profile_id
+           LEFT JOIN sentence_lemma sl ON sl.lemma_id = c.lemma_id
+           LEFT JOIN sentence s
+             ON s.id = sl.sentence_id AND s.profile_id = c.profile_id
          WHERE c.profile_id = ?1 AND c.suspended = 0
            AND l.lang = ?2 AND c.state = 'review'
          GROUP BY c.lemma_id
-         HAVING COUNT(w.id) < ?3
-         ORDER BY COUNT(w.id), RANDOM()
+         HAVING COUNT(s.id) < ?3
+         ORDER BY COUNT(s.id), RANDOM()
          LIMIT ?4",
     )
     .bind(profile_id.0)
@@ -461,11 +462,10 @@ mod tests {
             let db = &db;
             let text = format!("A sentence number {index}.");
             async move {
-                crate::word_sentences::record(
+                let id = crate::word_sentences::record(
                     db,
                     crate::word_sentences::NewSentence {
                         profile_id: profile,
-                        lemma_id: lemma,
                         exercise_id: exercise.0,
                         text: &text,
                         translation: None,
@@ -475,7 +475,11 @@ mod tests {
                     t0(),
                 )
                 .await
+                .unwrap()
                 .unwrap();
+                crate::word_sentences::index(db, id, &[lemma])
+                    .await
+                    .unwrap();
             }
         };
         sentence(once, 0).await;

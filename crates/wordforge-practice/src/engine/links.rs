@@ -1,17 +1,30 @@
-//! 把做過的句子接回單字。
+//! 把做過的句子存下來，並建立「哪個字出現在哪一句」的索引。
 //!
 //! 複習單字時看得到的是字典的釋義與別人寫的例句。真正記得住的是自己
-//! 做過的那一句——所以每出一份練習，就把裡面的句子連到它練的那個字，
-//! 複習頁與字典頁都拿得到。
+//! 做過的那一句——所以每出一份練習，就把裡面的句子留下來，複習頁與
+//! 字典頁都查得到。
+//!
+//! ## 存所有句子，不只目標字的
+//!
+//! 原本只存「那份練習指派的目標字所在的句子」。那讓兩件事永遠不成立：
+//!
+//! - 句子裡順帶用到的字一句都拿不到。`final` 出現在
+//!   「before the final exam」裡，但那題練的是 `ahead`，查 `final` 空空如也。
+//! - 今天才學的字，回頭看不到三個月前做過、明明用到它的句子——
+//!   因為連哪些字是在**出題當下**決定的。
+//!
+//! 所以改成：句子全部存，索引由句子本身的內容決定（分詞 → 查字典 →
+//! 那句出現了哪些詞條）。索引不看使用者的牌組，否則只是把同一個
+//! 寫死換個地方。
 //!
 //! 三個題型的「句子」長得不一樣：
 //!
-//! - **翻譯題**：一題就是一句，指派的字也是明講的，直接連。
-//! - **閱讀 / 克漏字**：一整篇文章，要先切句、再對齊全文翻譯，
-//!   然後找出那個字真的出現在哪一句（見 `text::align_sentences`）。
-//! - **文法題**：沒有句子層級的教學目標，不連。
+//! - **翻譯題**：一題就是一句。
+//! - **閱讀 / 克漏字**：一整篇文章，要先切句、再對齊全文翻譯
+//!   （見 `text::align_sentences`）。
+//! - **文法題**：那些句子是為了考一個文法點寫的，不存。
 //!
-//! 連的是 lemma 不是字串：查 `ran` 要看得到練 `run` 時寫的句子。
+//! 索引存的是 lemma 不是字串：查 `ran` 要看得到練 `run` 時寫的句子。
 
 use std::collections::HashSet;
 
@@ -24,27 +37,26 @@ use super::*;
 ///
 /// 2：句子對齊從「句數對不上就整段」改成比例對齊。舊資料裡每一句配到的
 /// 都是整段譯文（一句英文底下掛著八句中文），要整批重算。
-const BACKFILL_VERSION: i64 = 2;
+///
+/// 3：改成存所有句子、索引由句子內容決定。舊資料只有目標字的那幾句，
+/// 而且索引只連得到目標字。
+const BACKFILL_VERSION: i64 = 3;
 
 impl PracticeEngine<'_> {
-    /// 把這一份練習的句子連回單字。
+    /// 把這一份練習的句子存下來，並建立索引。
     ///
-    /// 連不上就跳過（字典查不到那個字、句子是空的），不讓它擋住出題——
+    /// 存不下就跳過（句子是空的、字典查不到任何詞），不讓它擋住出題——
     /// 這是加分項，不是必要條件。
     pub(super) async fn link_sentences(
         &self,
         profile_id: i64,
         exercise_id: i64,
         body: &ExerciseBody,
-        target_words: &[String],
         now: OffsetDateTime,
     ) -> Result<()> {
         match body {
             ExerciseBody::Translation { to_target, items } => {
                 for (index, item) in items.iter().enumerate() {
-                    let Some(word) = item.target_word.as_deref() else {
-                        continue;
-                    };
                     // 目標語言那一句：中翻英時在參考答案，英翻中時就是題目
                     let (text, translation) = if *to_target {
                         (item.reference.as_deref(), Some(item.source.as_str()))
@@ -54,10 +66,9 @@ impl PracticeEngine<'_> {
                     let Some(text) = text else {
                         continue;
                     };
-                    self.link_one(
+                    self.store_sentence(
                         profile_id,
                         exercise_id,
-                        word,
                         text,
                         translation,
                         "translation",
@@ -74,13 +85,12 @@ impl PracticeEngine<'_> {
                 sentences,
                 ..
             } => {
-                self.link_passage(
+                self.store_passage(
                     profile_id,
                     exercise_id,
                     passage,
                     translation.as_deref(),
                     sentences,
-                    target_words,
                     "reading",
                     now,
                 )
@@ -95,15 +105,14 @@ impl PracticeEngine<'_> {
                 ..
             } => {
                 // 空格要先填回正確答案：`{{3}}` 不是句子的一部分，
-                // 而挖掉的那個字往往正是要連的字
+                // 而挖掉的那個字往往正是最值得查到的那個
                 let filled = fill_blanks(passage, items);
-                self.link_passage(
+                self.store_passage(
                     profile_id,
                     exercise_id,
                     &filled,
                     translation.as_deref(),
                     sentences,
-                    target_words,
                     "cloze",
                     now,
                 )
@@ -117,23 +126,19 @@ impl PracticeEngine<'_> {
         Ok(())
     }
 
-    /// 從一篇文章裡找出每個目標詞出現的那一句。
-    ///
-    /// 一個字只記**第一句**：同一篇文章裡出現三次，三句都記下來只是把
-    /// 複習畫面塞滿同一篇文章的內容。
+    /// 一篇文章的每一句都存下來，各自配上那一句的譯文。
     #[allow(clippy::too_many_arguments)]
-    async fn link_passage(
+    async fn store_passage(
         &self,
         profile_id: i64,
         exercise_id: i64,
         passage: &str,
         translation: Option<&str>,
         given: &[SentencePair],
-        words: &[String],
         origin: &str,
         now: OffsetDateTime,
     ) -> Result<()> {
-        if passage.trim().is_empty() || words.is_empty() {
+        if passage.trim().is_empty() {
             return Ok(());
         }
         // 模型給的逐句對照（出題時已經驗過接得回原文）優先；
@@ -147,21 +152,10 @@ impl PracticeEngine<'_> {
                 .collect()
         };
 
-        for word in words {
-            let forms: HashSet<String> = lemmas::forms(self.db, &self.target_lang, word)
-                .await?
-                .into_iter()
-                .collect();
-            let found = pairs.iter().find(|(sentence, _)| {
-                wordforge_core::text::mentions_any(sentence, &forms, &self.target_lang)
-            });
-            let Some((sentence, sentence_translation)) = found else {
-                continue;
-            };
-            self.link_one(
+        for (sentence, sentence_translation) in pairs {
+            self.store_sentence(
                 profile_id,
                 exercise_id,
-                word,
                 sentence,
                 sentence_translation.as_deref(),
                 origin,
@@ -174,28 +168,22 @@ impl PracticeEngine<'_> {
         Ok(())
     }
 
-    /// 記一句。字典查不到那個字就跳過——連結要指到 lemma，
-    /// 不然「查 ran 看得到練 run 的句子」不成立。
+    /// 記一句，並把它連到句子裡出現的每個詞條。
     #[allow(clippy::too_many_arguments)]
-    async fn link_one(
+    async fn store_sentence(
         &self,
         profile_id: i64,
         exercise_id: i64,
-        word: &str,
         text: &str,
         translation: Option<&str>,
         origin: &str,
         item_index: Option<i64>,
         now: OffsetDateTime,
     ) -> Result<()> {
-        let Some(lemma) = lemmas::base_form(self.db, &self.target_lang, word).await? else {
-            return Ok(());
-        };
-        word_sentences::record(
+        let stored = word_sentences::record(
             self.db,
             NewSentence {
                 profile_id: ProfileId(profile_id),
-                lemma_id: lemma,
                 exercise_id,
                 text,
                 translation,
@@ -205,7 +193,41 @@ impl PracticeEngine<'_> {
             now,
         )
         .await?;
+        let Some(sentence_id) = stored else {
+            return Ok(());
+        };
+        let lemma_ids = self.lemmas_in(text).await?;
+        word_sentences::index(self.db, sentence_id, &lemma_ids).await?;
         Ok(())
+    }
+
+    /// 這一句裡出現了哪些詞條。
+    ///
+    /// **不看使用者的牌組**：今天才學的字，回頭要查得到三個月前做過、
+    /// 明明用到它的句子。只索引牌組裡的字就是把「連哪些字」這個決定
+    /// 又寫死回出題當下。
+    ///
+    /// 片語也要查（n-gram）：字典裡有 69 萬個多詞條目，`search for`
+    /// 拆成兩個字分開查得不到「尋找」那個意思。
+    ///
+    /// 詞形交給 `base_forms` 決定，跟讀取端的 `family` 走同一份字典——
+    /// 兩邊挑到不同的詞條的話，句子存進去了卻查不出來，而畫面上
+    /// 只是少一塊。
+    async fn lemmas_in(&self, text: &str) -> Result<Vec<LemmaId>> {
+        let tokens = wordforge_core::text::tokenize(text);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut forms = tokens.clone();
+        forms.extend(wordforge_core::text::ngrams(
+            &tokens,
+            &self.target_lang,
+            MAX_PHRASE_LEN,
+        ));
+        let found = lemmas::base_forms(self.db, &self.target_lang, &forms).await?;
+        // 同一個詞條會從好幾個詞形連過來（`run` / `ran`），去重
+        let unique: HashSet<LemmaId> = found.into_values().collect();
+        Ok(unique.into_iter().collect())
     }
 
     /// 把既有練習的句子補進連結表。
@@ -247,7 +269,7 @@ impl PracticeEngine<'_> {
                 let Ok(body) = serde_json::from_str::<ExerciseBody>(&record.payload_json) else {
                     continue;
                 };
-                self.link_sentences(profile_id, record.id, &body, &record.target_words, now)
+                self.link_sentences(profile_id, record.id, &body, now)
                     .await?;
                 done += 1;
             }
