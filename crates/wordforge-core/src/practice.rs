@@ -235,13 +235,30 @@ pub const DESIRED_POS: &[&str] = &["verb", "noun", "adj", "verb", "noun", "adv"]
 ///
 /// 兩者都湊不齊時用剩下的補滿：生詞太少會讓文章太簡單，那才是
 /// 真正要避免的事。
-pub fn balance_by_pos(candidates: &[NewWord], desired: &[&str], budget: usize) -> Vec<NewWord> {
+pub fn balance_by_pos(
+    candidates: &[NewWord],
+    desired: &[&str],
+    budget: usize,
+    seed: u64,
+) -> Vec<NewWord> {
     if budget == 0 || candidates.is_empty() || desired.is_empty() {
         return Vec::new();
     }
 
     let mut sorted: Vec<&NewWord> = candidates.iter().collect();
     sorted.sort_by_key(|c| (c.freq_rank, c.lemma_id));
+
+    // **每一段內部先打散**。切段是為了讓難度分散，但段內若總是取第一個
+    // 符合詞性的字，同一個牌組每次都會拿到一模一樣的候選——實測連兩次
+    // 選字結果完全相同，第一個永遠是 `andrews`。
+    //
+    // 打散只發生在段內，所以「難度分散」這件事不受影響：換掉的是
+    // 「同一個難度帶裡挑誰」。
+    let slice_for_shuffle = sorted.len().div_ceil(budget).max(1);
+    let mut state = seed | 1;
+    for chunk in sorted.chunks_mut(slice_for_shuffle) {
+        shuffle_in_place(chunk, &mut state);
+    }
 
     let mut picked: Vec<NewWord> = Vec::new();
     let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -608,6 +625,38 @@ mod tests {
         }
     }
 
+    /// 這條測試存在的理由是它曾經是錯的：切段之後段內取第一個符合詞性的字，
+    /// 於是同一個牌組每次都拿到一模一樣的候選——實測連兩次選字結果完全相同，
+    /// 第一個永遠是 `andrews`。模型挑掉的那幾個字就永遠輪不到。
+    ///
+    /// 打散只發生在段內，所以「難度分散」不受影響（見 `new_words_spread_across_the_difficulty_range`）。
+    #[test]
+    fn a_different_seed_picks_different_words_from_the_same_pool() {
+        let candidates: Vec<NewWord> = (0..40)
+            .map(|i| word(i, &format!("w{i}"), &["noun", "verb"], 5000 + i * 10))
+            .collect();
+
+        let a = balance_by_pos(&candidates, DESIRED_POS, 6, 1);
+        let b = balance_by_pos(&candidates, DESIRED_POS, 6, 999);
+        let overlap = a
+            .iter()
+            .filter(|w| b.iter().any(|x| x.text == w.text))
+            .count();
+
+        assert!(
+            overlap < a.len(),
+            "換一個 seed 該挑到不同的字，不然每次出題都是同一批：\n{:?}\n{:?}",
+            a.iter().map(|w| &w.text).collect::<Vec<_>>(),
+            b.iter().map(|w| &w.text).collect::<Vec<_>>()
+        );
+        // 同一個 seed 要穩定：重試同一份練習時不該換一批字
+        assert_eq!(
+            balance_by_pos(&candidates, DESIRED_POS, 6, 1),
+            a,
+            "同一個 seed 要給同樣的結果"
+        );
+    }
+
     /// 照詞頻挑會挑出一整排名詞，那樣的文章句型不會有變化。
     #[test]
     fn new_words_span_several_parts_of_speech() {
@@ -620,7 +669,7 @@ mod tests {
             word(6, "infect", &["verb"], 5200),
         ];
 
-        let picked = balance_by_pos(&candidates, DESIRED_POS, 4);
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 4, 7);
         let kinds: std::collections::HashSet<&str> = picked
             .iter()
             .flat_map(|w| w.pos.iter().map(|p| p.as_str()))
@@ -641,7 +690,7 @@ mod tests {
             word(3, "appetite", &["noun"], 300),
         ];
 
-        let picked = balance_by_pos(&candidates, DESIRED_POS, 3);
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 3, 7);
         let ids: std::collections::HashSet<i64> = picked.iter().map(|w| w.lemma_id).collect();
         assert_eq!(ids.len(), 3, "重複選了同一個字：{picked:?}");
     }
@@ -660,7 +709,7 @@ mod tests {
             candidates.push(word(i + 1, &format!("w{i}"), &[pos], 5_000 + i));
         }
 
-        let picked = balance_by_pos(&candidates, DESIRED_POS, 12);
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 12, 7);
         let verbs = picked.iter().filter(|w| w.pos[0] == "verb").count();
         assert_eq!(picked.len(), 12);
         assert!(verbs >= 3, "循環之後動詞還是要夠多：{picked:?}");
@@ -679,7 +728,7 @@ mod tests {
             ));
         }
 
-        let picked = balance_by_pos(&candidates, DESIRED_POS, 10);
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 10, 7);
         let ranks: Vec<i64> = picked.iter().map(|w| w.freq_rank).collect();
         let spread = ranks.iter().max().unwrap() - ranks.iter().min().unwrap();
 
@@ -699,13 +748,13 @@ mod tests {
             word(3, "hostility", &["noun"], 30),
         ];
 
-        let picked = balance_by_pos(&candidates, DESIRED_POS, 3);
+        let picked = balance_by_pos(&candidates, DESIRED_POS, 3, 7);
         assert_eq!(picked.len(), 3, "寧可全是名詞也不要少給");
     }
 
     #[test]
     fn an_empty_pool_yields_nothing() {
-        assert!(balance_by_pos(&[], DESIRED_POS, 5).is_empty());
+        assert!(balance_by_pos(&[], DESIRED_POS, 5, 7).is_empty());
     }
 
     /// 常用的字優先——學習者比較可能再遇到。
@@ -715,7 +764,7 @@ mod tests {
             word(1, "rare_verb", &["verb"], 9000),
             word(2, "common_verb", &["verb"], 5200),
         ];
-        let picked = balance_by_pos(&candidates, &["verb"], 1);
+        let picked = balance_by_pos(&candidates, &["verb"], 1, 7);
         assert_eq!(picked[0].text, "common_verb");
     }
 

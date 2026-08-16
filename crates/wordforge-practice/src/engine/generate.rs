@@ -215,11 +215,15 @@ impl PracticeEngine<'_> {
         // 候選給兩倍，讓模型挑得動：給剛好 budget 個等於逼它每個都塞進去，
         // 而有些字在那個情境下寫不自然。實際要用幾個由覆蓋率決定，
         // 不是數字說了算——那才是「固定比例的新字」真正的意思。
-        let target_words: Vec<String> =
-            practice::balance_by_pos(pool, practice::DESIRED_POS, budget * PROSE_CHOICE_FACTOR)
-                .into_iter()
-                .map(|w| w.text)
-                .collect();
+        let target_words: Vec<String> = practice::balance_by_pos(
+            pool,
+            practice::DESIRED_POS,
+            budget * PROSE_CHOICE_FACTOR,
+            shuffle_seed(now),
+        )
+        .into_iter()
+        .map(|w| w.text)
+        .collect();
 
         // 「順便複習」用的是**快忘掉的字**而不是「今天到期的字」。
         //
@@ -431,14 +435,27 @@ impl PracticeEngine<'_> {
         // 逾期三週的字在句子裡再想起來一次，價值比剛好今天到期的高。
         // 候選給兩倍，模型挑 CLOZE_BLANKS 個挖空（至少 CLOZE_MIN_BLANKS 個）
         let choices = CLOZE_BLANKS * PROSE_CHOICE_FACTOR as i64;
-        let mut blanks = cards::shaky_words(
+
+        // 撈的比要的更多再打散。`shaky_words` 照衰退程度排序，是**完全
+        // 決定性**的——牌組沒動的話連兩次拿到一模一樣的候選，模型每次
+        // 挑掉的那幾個字就永遠輪不到。
+        //
+        // 打散只發生在「最該複習的那一批」內部（撈兩倍再抽），所以
+        // 「急迫的優先」沒有消失：換掉的是同一個急迫程度裡挑誰。
+        let pool = cards::shaky_words(
             self.db,
             ProfileId(profile_id),
             &self.target_lang,
             now,
-            choices,
+            choices * 2,
         )
         .await?;
+        let order = practice::shuffle_order(pool.len(), shuffle_seed(now));
+        let mut blanks: Vec<String> = order
+            .into_iter()
+            .take(choices as usize)
+            .map(|i| pool[i].clone())
+            .collect();
         // 補不夠時拿今天到期的，但**只拿學過的**。
         //
         // `due_words` 不看 reps：牌組裡剛加進去、他從來沒看過的新卡
