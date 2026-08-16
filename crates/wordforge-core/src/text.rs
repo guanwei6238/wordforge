@@ -61,6 +61,48 @@ pub fn ngrams(tokens: &[String], lang: &str, max_n: usize) -> Vec<String> {
     out
 }
 
+/// 這段文字裡有沒有用到這組詞形之一。
+///
+/// `forms` 是同一個字的整個家族（`run` / `runs` / `ran` / `running`），
+/// 已經正規化過——比對只認詞形，因為「有沒有練到 run」不能靠字面比對：
+/// 題目句子寫的是 `ran`，而學習者要練的是 `run`。
+///
+/// 多詞條目（`search for`、「気にする」）比對 n-gram：只比單一詞元的話，
+/// 片語永遠對不上，而字典裡有 69 萬個多詞條目。
+pub fn mentions_any(text: &str, forms: &std::collections::HashSet<String>, lang: &str) -> bool {
+    if forms.is_empty() {
+        return false;
+    }
+    let tokens = tokenize(text);
+    if tokens.iter().any(|t| forms.contains(t)) {
+        return true;
+    }
+
+    // n-gram 只展開到「最長的那個詞形真的有多長」為止。整份展開到固定深度
+    // 是白做的：家族裡全是單字時，一個 n-gram 都不需要。
+    let max_n = forms
+        .iter()
+        .map(|f| form_length(f, lang))
+        .max()
+        .unwrap_or(1);
+    if max_n < 2 {
+        return false;
+    }
+    ngrams(&tokens, lang, max_n)
+        .iter()
+        .any(|gram| forms.contains(gram))
+}
+
+/// 一個詞形佔幾個詞元。跟 [`ngrams`] 的拼法要一致，否則長度算錯，
+/// n-gram 就展不到那個片語真正需要的深度。
+fn form_length(form: &str, lang: &str) -> usize {
+    if joins_with_space(lang) {
+        form.split_whitespace().count().max(1)
+    } else {
+        form.chars().count().max(1)
+    }
+}
+
 /// 計算文本有幾個詞元（token）與幾個相異詞（type）。
 pub fn token_type_counts(text: &str) -> (usize, usize) {
     let tokens = tokenize(text);
@@ -130,6 +172,66 @@ mod tests {
     fn tokenize_drops_numbers_and_punctuation() {
         let t = tokenize("The cat sat on 3 mats -- really!");
         assert_eq!(t, vec!["the", "cat", "sat", "on", "mats", "really"]);
+    }
+
+    fn forms(list: &[&str]) -> std::collections::HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 「這一題有沒有練到 run」不能靠字面比對：句子裡寫的是 `ran`。
+    #[test]
+    fn an_inflected_form_counts_as_a_mention() {
+        let family = forms(&["run", "runs", "ran", "running"]);
+        assert!(mentions_any("She ran to the station.", &family, "en"));
+        assert!(!mentions_any("She walked to the station.", &family, "en"));
+    }
+
+    /// 標點與大小寫不該讓比對失敗——句尾的那個字最常是要練的字。
+    #[test]
+    fn punctuation_and_case_do_not_hide_a_mention() {
+        assert!(mentions_any("Did you RUN?", &forms(&["run"]), "en"));
+    }
+
+    /// 片語只比單一詞元的話永遠對不上，而字典裡有 69 萬個多詞條目。
+    #[test]
+    fn a_multiword_entry_is_matched_across_tokens() {
+        assert!(mentions_any(
+            "I will search for the key.",
+            &forms(&["search for"]),
+            "en"
+        ));
+        assert!(!mentions_any(
+            "I will search the room.",
+            &forms(&["search for"]),
+            "en"
+        ));
+    }
+
+    /// 中日文的片語沒有空格，拼法跟 `ngrams` 一致才對得上。
+    ///
+    /// 順帶驗到一件不能用直覺假設的事：`tokenize` 對日文是**逐字**切的
+    /// （`昨日は公園に…` → `昨` `日` `は` `公` `園` …），所以連
+    /// 「公園」這種兩個字的普通名詞都得靠 n-gram 才比得到。
+    #[test]
+    fn a_japanese_phrase_is_matched_without_spaces() {
+        assert!(mentions_any("それは気にする", &forms(&["気にする"]), "ja"));
+        assert!(mentions_any(
+            "昨日は公園に行きました",
+            &forms(&["公園"]),
+            "ja"
+        ));
+        assert!(!mentions_any(
+            "昨日は海に行きました",
+            &forms(&["公園"]),
+            "ja"
+        ));
+    }
+
+    /// 查不到詞形時回 `false`，呼叫端才有辦法分辨「沒用到」與「驗不了」——
+    /// 把驗不了當成沒用到會讓只匯詞頻表的人每一題都被退回去重出。
+    #[test]
+    fn an_empty_family_never_matches() {
+        assert!(!mentions_any("anything at all", &forms(&[]), "en"));
     }
 
     #[test]

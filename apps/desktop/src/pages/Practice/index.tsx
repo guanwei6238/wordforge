@@ -1,11 +1,9 @@
 import type React from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   addWord,
-  BLANK_PATTERN,
   currentLanguages,
   deleteExercise,
-  DIFFICULTY_LABELS,
   errorMessage,
   exerciseLabels,
   type ExerciseKind,
@@ -13,7 +11,6 @@ import {
   type ExerciseView,
   type Feedback,
   generateExercise,
-  type GlossaryNote,
   getStudySettings,
   gradeExercise,
   languageName,
@@ -29,17 +26,43 @@ import {
   type PracticeStatus,
   type ProfileLanguages,
   updateStudySettings,
-} from "../api";
-import LlmSetup from "../components/LlmSetup";
-import SpeakButton from "../components/SpeakButton";
+} from "../../api";
+import { Choices } from "./choices";
+import LlmSetup from "../../components/LlmSetup";
+import SpeakButton from "../../components/SpeakButton";
+import { FeedbackPanel, SubmitRow } from "./feedback";
+import { History, HISTORY_PAGE, MaterialPicker } from "./history";
+import {
+  ClozePassage,
+  FONT_MAX,
+  FONT_MIN,
+  normalizeWord,
+  PassageHeader,
+  WordNotes,
+} from "./passage";
 
-/** 一步調幾 px。太細要按很多次，太粗會跳過剛好的那一級。 */
-const FONT_STEP = 1;
-const FONT_MIN = 12;
-const FONT_MAX = 32;
 
-/** 練習紀錄一頁幾筆。一頁塞太多就等於沒有分頁。 */
-const HISTORY_PAGE = 10;
+
+/**
+ * 文法點依「學到哪」分組，給「練哪個文法」的選單用。
+ *
+ * 這個函式存在的理由是它曾經不存在：選單原本寫死
+ * `.filter((g) => g.state != null)`，也就是**練過的才選得到**。
+ * 使用者自己新增或匯入的點 `state` 一律是 `null`，於是永遠不會出現在
+ * 選單裡——想練它就得先在別的地方錯一次，而文法題本來就只會考
+ * 「該複習的點」，那一次永遠不會發生。「匯入什麼就能學什麼」
+ * 對文法等於沒有兌現。
+ *
+ * 分組而不是攤平：全部列出來會是四十幾個點的一長串，
+ * 學到哪一段看不出來。
+ */
+function grammarGroups(points: GrammarView[]): { label: string; items: GrammarView[] }[] {
+  return [
+    { label: "學習中", items: points.filter((g) => g.state != null && !isGrammarKnown(g)) },
+    { label: "還沒練過", items: points.filter((g) => g.state == null) },
+    { label: "已學會", items: points.filter(isGrammarKnown) },
+  ].filter((group) => group.items.length > 0);
+}
 
 /**
  * AI 練習頁。
@@ -346,14 +369,16 @@ export default function Practice() {
                     disabled={busy !== null}
                   >
                     <option value="">隨機（從該複習的挑）</option>
-                    {grammarPoints
-                      .filter((g) => g.state != null)
-                      .map((g) => (
-                        <option key={g.point} value={g.point}>
-                          {g.name}
-                          {isGrammarKnown(g) ? "（已學會）" : ""}
-                        </option>
-                      ))}
+                    {grammarGroups(grammarPoints).map((group) => (
+                      <optgroup key={group.label} label={group.label}>
+                        {group.items.map((g) => (
+                          <option key={g.point} value={g.point}>
+                            {g.name}
+                            {g.level ? `（${g.level}）` : ""}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
                   </select>
                 </label>
               )}
@@ -689,618 +714,6 @@ export default function Practice() {
           )}
         </>
       )}
-    </div>
-  );
-}
-
-/** 跟後端 `wordforge_core::text::normalize` 對得上的比對鍵。 */
-function normalizeWord(raw: string): string {
-  return raw.replace(/[^\p{L}\p{N}'-]/gu, "").toLowerCase();
-}
-
-/** 標題與字級調整。閱讀與克漏字共用。 */
-function PassageHeader({
-  title,
-  fontSize,
-  onFontSize,
-}: {
-  title: string;
-  fontSize: number;
-  onFontSize: (next: number) => void;
-}) {
-  return (
-    <div className="row title-row">
-      <h2>{title}</h2>
-      <span className="font-size">
-        <button
-          onClick={() => onFontSize(fontSize - FONT_STEP)}
-          disabled={fontSize <= FONT_MIN}
-          title="縮小文章字級"
-        >
-          A−
-        </button>
-        <span className="muted">{fontSize}px</span>
-        <button
-          onClick={() => onFontSize(fontSize + FONT_STEP)}
-          disabled={fontSize >= FONT_MAX}
-          title="放大文章字級"
-        >
-          A+
-        </button>
-      </span>
-    </div>
-  );
-}
-
-/**
- * 送出按鈕。全部答完才能按。
- *
- * 漏掉一題送出去，批改會把它算成答錯，而那不是他的本意——
- * 而且錯誤會被記進文法弱點，之後一直出那個文法點的題目。
- */
-function SubmitRow({
-  unanswered,
-  busy,
-  onSubmit,
-  what,
-}: {
-  unanswered: number;
-  busy: string | null;
-  onSubmit: () => void;
-  what: string;
-}) {
-  return (
-    <div className="row submit-row">
-      <button
-        className="primary"
-        onClick={onSubmit}
-        disabled={busy !== null || unanswered > 0}
-      >
-        {busy === "grading" ? "批改中…" : "送出"}
-      </button>
-      {unanswered > 0 && (
-        <span className="muted">
-          還有 {unanswered} {what}沒作答
-        </span>
-      )}
-    </div>
-  );
-}
-
-/** 克漏字的短文，空格處顯示編號或已填的字。 */
-function ClozePassage({
-  passage,
-  items,
-  choices,
-  feedback,
-  lookup,
-  onLookup,
-  marked,
-  onToggleMark,
-}: {
-  passage: string;
-  items: { options: string[]; answer_index: number }[];
-  choices: (number | null)[];
-  feedback: Feedback | null;
-  /** 解析時點開的那個字。作答前是 null——那時候給翻譯等於送答案 */
-  lookup: string | null;
-  onLookup: (term: string | null) => void;
-  marked: string[];
-  onToggleMark: (word: string) => void;
-}) {
-  // 依 {{n}} 切開。用 split 保留分隔符，一次走完不必自己算位置。
-  const parts = useMemo(() => passage.split(new RegExp(BLANK_PATTERN.source, "g")), [passage]);
-
-  return (
-    <p className="passage">
-      {parts.map((part, i) => {
-        // split 帶捕獲群組時，奇數索引是空格編號
-        // 偶數段是文章本文。跟閱讀測驗同一套規則：作答前點字是標記
-        // 「我不會」，批改後才是查釋義——作答前給翻譯等於直接送答案。
-        // 空格本身不在這裡，所以標記不會洩漏任何一題的答案。
-        if (i % 2 === 0) {
-          return (
-            <span key={i}>
-              {part.split(/(\s+)/).map((chunk, j) => {
-                if (!chunk.trim()) return chunk;
-                const word = normalizeWord(chunk);
-                const isMarked = marked.some((w) => w.toLowerCase() === word);
-                return (
-                  <span
-                    key={j}
-                    className={[
-                      "token",
-                      isMarked ? "marked" : "",
-                      feedback && lookup === word ? "looking" : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" ")}
-                    onClick={() =>
-                      feedback ? onLookup(lookup === word ? null : word) : onToggleMark(chunk)
-                    }
-                  >
-                    {chunk}
-                  </span>
-                );
-              })}
-            </span>
-          );
-        }
-
-        const n = Number(part);
-        const item = items[n - 1];
-        const picked = choices[n - 1];
-        const correct = item != null && picked === item.answer_index;
-        const filled = item != null && picked != null ? item.options[picked] : null;
-
-        return (
-          <span
-            key={i}
-            className={[
-              "blank",
-              filled ? "filled" : "",
-              feedback ? (correct ? "right" : "wrong") : "",
-            ]
-              .filter(Boolean)
-              .join(" ")}
-          >
-            <sup>{n}</sup>
-            {/* 批改後直接顯示正確答案，才對得起旁邊的解說 */}
-            {feedback && item ? item.options[item.answer_index] : (filled ?? "＿＿＿")}
-          </span>
-        );
-      })}
-    </p>
-  );
-}
-
-/** 點到的那個字的釋義，以及包含它的片語。 */
-function WordNotes({
-  term,
-  glossary,
-  onClose,
-  onAdd,
-  added,
-}: {
-  term: string;
-  glossary: GlossaryNote[];
-  onClose: () => void;
-  /** 覆盤時才發現不會的字，這裡補加進牌組。作答前的標記走 marked_unknown */
-  onAdd: (word: string) => void;
-  added: string[];
-}) {
-  // 片語也要跳出來：`search for` 分開查兩個字都得不到「尋找」
-  const hits = useMemo(
-    () =>
-      glossary.filter(
-        (g) => g.term === term || (g.is_phrase && g.term.split(/\s+/).includes(term)),
-      ),
-    [glossary, term],
-  );
-
-  return (
-    <div className="word-notes">
-      <div className="row title-row">
-        <strong>{term}</strong>
-        <button onClick={onClose} title="關閉">
-          ✕
-        </button>
-      </div>
-      {hits.length === 0 ? (
-        <p className="muted">
-          你匯入的字典裡沒有這個詞條。換一份涵蓋更廣的字典就查得到。
-        </p>
-      ) : (
-        <dl>
-          {hits.map((g, i) => {
-            const isAdded = added.some((w) => w.toLowerCase() === g.term.toLowerCase());
-            return (
-              <div key={i} className="gloss-row">
-                <dt>
-                  {g.text}
-                  {g.is_phrase && (
-                    <span className="tag" title="片語：單看每個字查不出這個意思">
-                      片語
-                    </span>
-                  )}
-                  <SpeakButton text={g.text} />
-                  <button
-                    className="add-review"
-                    disabled={isAdded}
-                    onClick={() => onAdd(g.term)}
-                    title={isAdded ? "已經在牌組裡了" : "把這個詞加進複習牌組"}
-                  >
-                    {isAdded ? "已加入" : "＋複習"}
-                  </button>
-                </dt>
-                <dd>
-                  {/* 翻譯與目標語言定義來自不同字典，兩個都給。
-                      相同的話只顯示一次——ECDICT 兩邊都填了同一句。 */}
-                  {g.translation && <span className="translation">{g.translation}</span>}
-                  {g.gloss && g.gloss !== g.translation && (
-                    <span className="gloss">{g.gloss}</span>
-                  )}
-                  {!g.translation && !g.gloss && <span className="muted">查無釋義</span>}
-                </dd>
-              </div>
-            );
-          })}
-        </dl>
-      )}
-    </div>
-  );
-}
-
-/** 練習紀錄。做過的題目整份叫回來重做，批改照常走一次。 */
-function History({
-  items,
-  total,
-  page,
-  labels,
-  disabled,
-  currentId,
-  onPage,
-  onRedo,
-  onDelete,
-}: {
-  items: ExerciseSummary[];
-  total: number;
-  page: number;
-  labels: Record<ExerciseKind, string>;
-  disabled: boolean;
-  currentId: number | null;
-  onPage: (page: number) => void;
-  onRedo: (id: number) => void;
-  onDelete: (id: number) => void;
-}) {
-  // 刪除要二次確認，但不用彈窗——按一下變成「確定刪除」，
-  // 按別的地方或再點一次別份就恢復
-  const [confirming, setConfirming] = useState<number | null>(null);
-  const pages = Math.max(1, Math.ceil(total / HISTORY_PAGE));
-
-  if (total === 0) {
-    return (
-      <section className="panel">
-        <h2>練習紀錄</h2>
-        <p className="muted">還沒有做過練習。做完的題目會留在這裡，可以整份再做一次。</p>
-      </section>
-    );
-  }
-
-  return (
-    <section className="panel">
-      <h2>練習紀錄</h2>
-      <ul className="history">
-        {items.map((it) => (
-          <li key={it.exercise_id} className={it.exercise_id === currentId ? "current" : ""}>
-            <div>
-              <span className="tag">{labels[it.kind] ?? it.kind}</span>
-              <span className="history-title">{it.title}</span>
-            </div>
-            <div className="muted history-meta">
-              {formatWhen(it.created_at)}
-              {it.score != null ? `　·　${Math.round(it.score)} 分` : "　·　沒作答"}
-              {it.coverage != null && `　·　覆蓋率 ${Math.round(it.coverage * 100)}%`}
-            </div>
-            <div className="history-actions">
-              <button onClick={() => onRedo(it.exercise_id)} disabled={disabled}>
-                再做一次
-              </button>
-              {confirming === it.exercise_id ? (
-                <>
-                  <button
-                    className="destructive"
-                    onClick={() => {
-                      setConfirming(null);
-                      onDelete(it.exercise_id);
-                    }}
-                    disabled={disabled}
-                  >
-                    確定刪除
-                  </button>
-                  <button onClick={() => setConfirming(null)}>取消</button>
-                </>
-              ) : (
-                <button onClick={() => setConfirming(it.exercise_id)} disabled={disabled}>
-                  刪除
-                </button>
-              )}
-            </div>
-          </li>
-        ))}
-      </ul>
-
-      {pages > 1 && (
-        <div className="row pager">
-          <button onClick={() => onPage(page - 1)} disabled={page === 0 || disabled}>
-            上一頁
-          </button>
-          <span className="muted">
-            第 {page + 1} / {pages} 頁　·　共 {total} 份
-          </span>
-          <button onClick={() => onPage(page + 1)} disabled={page + 1 >= pages || disabled}>
-            下一頁
-          </button>
-        </div>
-      )}
-
-      <p className="muted hint">
-        重做的是同一份題目，不會再花一次出題的額度；送出後一樣由模型批改，
-        舊的那次批改也留著。刪掉的話那份題目與所有作答一起消失，沒有復原。
-      </p>
-    </section>
-  );
-}
-
-/** 資料庫存的是 RFC 3339 的 UTC，顯示成本地時間。 */
-function formatWhen(iso: string): string {
-  const d = new Date(iso.endsWith("Z") ? iso : `${iso}Z`);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function MaterialPicker({
-  materials,
-  value,
-  onChange,
-  disabled,
-}: {
-  materials: Material[];
-  value: number | null;
-  onChange: (id: number | null) => void;
-  disabled: boolean;
-}) {
-  return (
-    <label>
-      取材範圍
-      <select
-        value={value ?? ""}
-        onChange={(e) => onChange(e.target.value ? Number(e.target.value) : null)}
-        disabled={disabled}
-      >
-        <option value="">自由出題</option>
-        {materials.map((m) => (
-          <option key={m.id} value={m.id}>
-            只從《{m.title}》出題
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
-/** 批改結果。有文章的題型擺在右欄，其他擺在下面。 */
-function FeedbackPanel({
-  feedback,
-  materials,
-  materialId,
-  setMaterialId,
-  busy,
-  onNext,
-}: {
-  feedback: Feedback;
-  materials: Material[];
-  materialId: number | null;
-  setMaterialId: (id: number | null) => void;
-  busy: string | null;
-  onNext: () => void;
-}) {
-  // 解析不再把整份字表攤出來——那是一大塊沒有人會逐條讀的東西。
-  // 這裡只提「這篇有幾個你不會的字」，要看意思就去點文章裡的那個字。
-  const unknown = feedback.glossary?.filter((g) => g.is_unknown) ?? [];
-
-  return (
-    <section className="panel">
-      <h2>
-        批改結果
-        {feedback.score != null && <span className="score"> {Math.round(feedback.score)} 分</span>}
-      </h2>
-
-      {feedback.corrections.length > 0 && (
-        <ul className="corrections">
-          {feedback.corrections.map((c, i) => (
-            <li key={i}>
-              <span className="wrong">{c.original}</span>
-              {" → "}
-              <span className="right">{c.corrected}</span>
-              {c.grammar_point && <span className="tag">{c.grammar_point}</span>}
-              {c.explanation && <p className="muted">{c.explanation}</p>}
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {unknown.length > 0 && (
-        <p className="muted hint">
-          這篇有 {unknown.length} 個你還不熟的字或片語（
-          {unknown.slice(0, 8).map((g) => g.text).join("、")}
-          {unknown.length > 8 && " …"}
-          ）。點文章裡的那個字就會出現釋義，來源是你自己匯入的字典，不是 AI 寫的。
-        </p>
-      )}
-
-      {feedback.taught_words?.length > 0 && (
-        <p className="muted">
-          這篇教的新字：{feedback.taught_words.join("、")}
-          ——都已排進複習，之後的文章不會再拿同一批。
-        </p>
-      )}
-
-      {feedback.added_to_deck.length > 0 ? (
-        <p className="ok">
-          已把 {feedback.added_to_deck.length} 個你不熟的字排進複習：
-          {feedback.added_to_deck.join("、")}
-        </p>
-      ) : (
-        feedback.unknown_words.length > 0 && (
-          <p className="muted">
-            判斷你不熟的字：{feedback.unknown_words.join("、")}
-            （都已經在牌組裡了）
-          </p>
-        )
-      )}
-
-      <div className="row">
-        {materials.length > 0 && (
-          <MaterialPicker
-            materials={materials}
-            value={materialId}
-            onChange={setMaterialId}
-            disabled={busy !== null}
-          />
-        )}
-        <button className="primary" onClick={onNext} disabled={busy !== null}>
-          下一題
-        </button>
-      </div>
-    </section>
-  );
-}
-
-/** 選擇題，閱讀測驗、克漏字與文法練習共用。 */
-function Choices({
-  items,
-  choices,
-  setChoices,
-  feedback,
-  numbered = false,
-  compact = false,
-}: {
-  items: {
-    question: string;
-    options: string[];
-    option_notes: string[];
-    answer_index: number;
-    explanation: string | null;
-    difficulty: string | null;
-  }[];
-  choices: (number | null)[];
-  setChoices: (fn: (c: (number | null)[]) => (number | null)[]) => void;
-  feedback: Feedback | null;
-  /** 克漏字要標「第 N 格」才對得回文章裡的空格 */
-  numbered?: boolean;
-  /**
-   * 選項橫排。
-   *
-   * 克漏字的選項就是幾個單字或片語，一個一列的話一題佔掉四行，
-   * 八格要捲很久。閱讀與文法的選項是整句話，橫排會擠成一團，
-   * 所以這件事不能一體適用，要由呼叫端決定。
-   */
-  compact?: boolean;
-}) {
-  return (
-    <ol className={numbered ? "questions blanks" : "questions"}>
-      {items.map((q, i) => (
-        <li key={i}>
-          <p className="prompt">
-            {numbered && <span className="blank-no">第 {i + 1} 格</span>}
-            {q.question}
-            {q.difficulty && (
-              <span className={`tag difficulty ${q.difficulty}`}>
-                {DIFFICULTY_LABELS[q.difficulty] ?? q.difficulty}
-              </span>
-            )}
-          </p>
-          <div className={compact ? "options compact" : "options"}>
-            {q.options.map((option, j) => (
-              <label
-                key={j}
-                className={[
-                  "option",
-                  feedback && j === q.answer_index ? "right" : "",
-                  feedback && choices[i] === j && j !== q.answer_index ? "picked-wrong" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-              >
-                <input
-                  type="radio"
-                  name={`q${i}`}
-                  checked={choices[i] === j}
-                  disabled={feedback !== null}
-                  onChange={() => setChoices((c) => c.map((v, k) => (k === i ? j : v)))}
-                />
-                {option}
-              </label>
-            ))}
-          </div>
-          {feedback && (
-            <Verdict
-              item={q}
-              picked={choices[i] ?? null}
-              comment={feedback.items[i]?.comment ?? null}
-            />
-          )}
-        </li>
-      ))}
-    </ol>
-  );
-}
-
-/**
- * 一題的講評。
- *
- * 重點是**先講你選的那一個**。只講「正確答案為什麼對」對答錯的人沒有
- * 用——他要知道的是自己那條路錯在哪，不然下次還是會被同一個選項騙到。
- *
- * 三個來源，由具體到一般：
- *
- * 1. `option_notes[你選的]`——出題時就替每個選項各備一句。選擇題在
- *    本地判分，模型沒看過你的作答，所以這是唯一「認得出你選了什麼」
- *    而且不必多打一次模型的來源。
- * 2. `comment`——批改時模型寫的。只有閱讀與翻譯有（那兩種會真的送去
- *    批改），而且它看得到你的作答。
- * 3. `explanation`——整題在考什麼，跟你選什麼無關。
- */
-function Verdict({
-  item,
-  picked,
-  comment,
-}: {
-  item: { options: string[]; option_notes: string[]; answer_index: number; explanation: string | null };
-  picked: number | null;
-  comment: string | null;
-}) {
-  const note = (index: number | null) =>
-    index == null ? null : (item.option_notes[index]?.trim() || null);
-
-  const correct = picked === item.answer_index;
-  const pickedNote = correct ? null : note(picked);
-  const answerNote = note(item.answer_index);
-
-  // 模型的講評跟出題時的說明有時會撞在一起，一模一樣就只留一份
-  const extra =
-    comment && comment.trim() && comment.trim() !== item.explanation?.trim()
-      ? comment.trim()
-      : null;
-
-  return (
-    <div className="verdict">
-      {!correct && (
-        <p className="error">
-          {picked == null ? (
-            <>沒有作答</>
-          ) : (
-            <>
-              你選了「{item.options[picked]}」
-              {pickedNote && <span className="muted">：{pickedNote}</span>}
-            </>
-          )}
-        </p>
-      )}
-      {answerNote && (
-        <p className={correct ? "ok" : "muted"}>
-          {correct ? "✓ " : ""}
-          正解「{item.options[item.answer_index]}」：{answerNote}
-        </p>
-      )}
-      {extra && <p className="muted">{extra}</p>}
-      {item.explanation && <p className="muted">{item.explanation}</p>}
     </div>
   );
 }

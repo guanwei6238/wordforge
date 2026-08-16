@@ -87,10 +87,10 @@ async fn query() -> Option<String> {
     detach_from_terminal(&mut cmd);
 
     let output = tokio::time::timeout(TIMEOUT, cmd.output())
-    .await
-    .inspect_err(|_| tracing::debug!(%shell, "查 PATH 逾時"))
-    .ok()?
-    .ok()?;
+        .await
+        .inspect_err(|_| tracing::debug!(%shell, "查 PATH 逾時"))
+        .ok()?
+        .ok()?;
 
     extract(&String::from_utf8_lossy(&output.stdout))
 }

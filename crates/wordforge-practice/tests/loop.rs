@@ -16,10 +16,15 @@ use wordforge_db::repo::{NewLemma, cards, lemmas, profiles};
 use wordforge_llm::{ChatRequest, ChatResponse, LlmProvider};
 use wordforge_practice::{GradeInput, PracticeEngine};
 
+/// 翻譯出題 prompt 裡「一題配一個字」那份清單的標題。
+const ASSIGNMENT_HEADER: &str = "照這個配對出題：";
+
 /// 依序回傳預設答案的假模型，同時記下收到的 prompt。
 struct FakeLlm {
     responses: Mutex<Vec<String>>,
     seen: Mutex<Vec<String>>,
+    /// 翻譯出題要不要照著配對清單即席回答，見 [`FakeLlm::translating`]
+    echo_translation: bool,
 }
 
 impl FakeLlm {
@@ -27,6 +32,24 @@ impl FakeLlm {
         Self {
             responses: Mutex::new(responses.iter().rev().map(|s| s.to_string()).collect()),
             seen: Mutex::new(Vec::new()),
+            echo_translation: false,
+        }
+    }
+
+    /// 翻譯出題時照著 prompt 裡的配對清單回題目，其他呼叫仍照 `responses` 供應。
+    ///
+    /// 為什麼需要這個：翻譯的驗收會**實際檢查**每一題有沒有用到配到的字。
+    /// 固定回一句 `{"source":"S","target_word":"alpha","reference":"R"}`
+    /// 在真的跑起來時會被退回去重寫，然後把後面幾個回應一起吃掉，
+    /// 測試以「回應裡沒有 items」爆掉。那不是程式壞了，是假資料不像真的
+    /// ——真的模型看得到配對清單，會照著它出題。
+    ///
+    /// 而且指派到哪幾個字是選字邏輯決定的（到期的一半、隨機抽的一半），
+    /// 測試沒辦法先知道。照著 prompt 回答才是這裡唯一穩定的做法。
+    fn translating(responses: &[&str]) -> Self {
+        Self {
+            echo_translation: true,
+            ..Self::new(responses)
         }
     }
 
@@ -42,22 +65,63 @@ impl FakeLlm {
     fn call_count(&self) -> usize {
         self.seen.lock().unwrap().len()
     }
+
+    /// 第 n 次收到的 prompt。重試會蓋掉 `last_prompt`，
+    /// 要驗第一次送出去的內容就得指名。
+    fn seen_prompt(&self, n: usize) -> String {
+        self.seen
+            .lock()
+            .unwrap()
+            .get(n)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// 照著配對清單組一份翻譯題的回應。
+///
+/// 每一題的兩個句子都放進配到的字：兩個方向的驗收各看一邊
+/// （母語 → 目標語看 `reference`，反過來看 `source`），
+/// 兩邊都寫上去，這個假模型就對兩個方向都成立。
+fn echoed_translation(prompt: &str) -> String {
+    let words: Vec<&str> = match prompt.split_once(ASSIGNMENT_HEADER) {
+        Some((_, rest)) => rest
+            .lines()
+            .skip(1)
+            .map_while(|line| {
+                let (num, word) = line.trim().split_once(". ")?;
+                num.chars()
+                    .all(|c| c.is_ascii_digit())
+                    .then_some(word.trim())
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let items: Vec<String> = words
+        .iter()
+        .map(|w| {
+            format!(r#"{{"source":"Please {w} it.","target_word":"{w}","reference":"I {w} it."}}"#)
+        })
+        .collect();
+    format!(r#"{{"items":[{}]}}"#, items.join(","))
 }
 
 #[async_trait]
 impl LlmProvider for FakeLlm {
     async fn chat(&self, req: &ChatRequest) -> wordforge_llm::Result<ChatResponse> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push(req.messages.iter().map(|m| m.content.clone()).collect());
+        let prompt: String = req.messages.iter().map(|m| m.content.clone()).collect();
+        self.seen.lock().unwrap().push(prompt.clone());
 
-        let text = self
-            .responses
-            .lock()
-            .unwrap()
-            .pop()
-            .unwrap_or_else(|| "{}".to_string());
+        let text = if self.echo_translation && prompt.contains(ASSIGNMENT_HEADER) {
+            echoed_translation(&prompt)
+        } else {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_else(|| "{}".to_string())
+        };
         Ok(ChatResponse {
             text,
             input_tokens: None,
@@ -877,6 +941,48 @@ async fn the_retry_shows_the_model_its_previous_attempt() {
     assert!(retry.contains("ubiquitous"), "也要指名哪些詞超標");
 }
 
+/// 這條測試存在的理由是它曾經是錯的：使用者指定的文法點只是被塞進
+/// 「這位學習者最近常錯的文法點」，模型讀到的是「他常錯這個」而不是
+/// 「這次只練這個」。拿回來的是一份摻著別的點的綜合練習，而使用者
+/// 按下去的時候要的是把那一個點練到會。
+#[tokio::test]
+async fn a_chosen_grammar_point_is_what_the_drill_actually_practises() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+
+    let strayed = r#"{"items":[
+             {"prompt":"a","options":["x","y"],"option_notes":["n1","n2"],
+              "answer_index":0,"grammar_point":"tense"}
+           ]}"#;
+    let on_point = r#"{"items":[
+             {"prompt":"I saw ___ cat","options":["a","the"],"option_notes":["n1","n2"],
+              "answer_index":0,"grammar_point":"articles"}
+           ]}"#;
+    let llm = FakeLlm::new(&[strayed, on_point]);
+    let engine = PracticeEngine::new(&db, &llm).with_grammar_focus(Some("articles".into()));
+
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let first = llm.seen_prompt(0);
+    assert!(
+        first.contains("每一題都要考這個點"),
+        "指定了點卻沒有講死：\n{first}"
+    );
+    assert!(
+        first.contains("冠詞 a / an / the"),
+        "沒把定義帶過去，識別碼是使用者可以自己取的，模型只能猜：\n{first}"
+    );
+    assert_eq!(llm.call_count(), 2, "考成別的點卻沒有退回去重出");
+
+    let wordforge_practice::payload::ExerciseBody::Choices { items } = &exercise.body else {
+        panic!("該是選擇題");
+    };
+    assert_eq!(items[0].grammar_point.as_deref(), Some("articles"));
+}
+
 /// 模型對同一個文法點的各種說法，必須收斂成一筆。
 ///
 /// 沒有這一步的話，`tense`、`past tense`、`Verb Tense` 會變成三個
@@ -969,14 +1075,12 @@ async fn the_profile_language_drives_prompts_and_lookups() {
     set_vocabulary(&db, profile, 300).await;
     put_in_deck(&db, profile, 1).await;
 
-    let llm = FakeLlm::new(&[
-        r#"{"items":[{"source":"昨日は公園に行きました","target_word":"公園",
-                      "reference":"I went to the park yesterday"}]}"#,
-        r#"{"score":50,
+    // 出題照配對清單回答（驗收會檢查那個字有沒有真的用上），
+    // 這裡剩下的是批改的回應
+    let llm = FakeLlm::translating(&[r#"{"score":50,
             "items":[{"index":1,"correct":false}],
             "corrections":[],
-            "unknown_words":["勤勉"]}"#,
-    ]);
+            "unknown_words":["勤勉"]}"#]);
 
     let engine = PracticeEngine::for_profile(&db, &llm, profile)
         .await
@@ -1610,8 +1714,7 @@ async fn the_translation_direction_reaches_the_prompt() {
     set_vocabulary(&db, profile, 1_000).await;
     put_in_deck(&db, profile, 1).await;
 
-    let items = r#"{"items":[{"source":"S","target_word":"park","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items, items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     engine
@@ -1661,8 +1764,7 @@ async fn translation_does_not_quiz_words_the_learner_has_never_studied() {
         put_in_deck(&db, profile, id).await;
     }
 
-    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     // 往後推，讓學過的字真的到期（`study` 給 Easy，下次複習排得很遠）
@@ -1708,8 +1810,7 @@ async fn two_translations_in_a_row_do_not_reuse_the_same_words() {
         study(&db, profile, id).await;
     }
 
-    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items, items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     let later = t0() + Duration::days(400);
@@ -1757,8 +1858,7 @@ async fn a_small_deck_repeats_words_rather_than_running_out() {
         study(&db, profile, id).await;
     }
 
-    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items, items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     let later = t0() + Duration::days(400);
@@ -1796,8 +1896,7 @@ async fn translation_topics_rotate_between_exercises() {
         study(&db, profile, id).await;
     }
 
-    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items, items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     let later = t0() + Duration::days(400);
@@ -1865,8 +1964,7 @@ async fn a_topic_the_learner_added_is_the_one_that_reaches_the_prompt() {
     .await
     .unwrap();
 
-    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     engine
@@ -1906,8 +2004,7 @@ async fn deleting_every_topic_still_produces_an_exercise() {
         topics::delete(&db, "en", t.id).await.unwrap();
     }
 
-    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     let exercise = engine
@@ -1943,8 +2040,7 @@ async fn too_few_studied_words_shrinks_the_exercise_instead_of_using_new_cards()
         put_in_deck(&db, profile, id).await;
     }
 
-    let items = r#"{"items":[{"source":"S","target_word":"alpha","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     engine
@@ -1978,8 +2074,7 @@ async fn a_brand_new_deck_still_produces_a_translation_exercise() {
         put_in_deck(&db, profile, id).await;
     }
 
-    let items = r#"{"items":[{"source":"S","target_word":"fresh1","reference":"R"}]}"#;
-    let llm = FakeLlm::new(&[items]);
+    let llm = FakeLlm::translating(&[]);
     let engine = PracticeEngine::new(&db, &llm);
 
     engine
@@ -1994,6 +2089,85 @@ async fn a_brand_new_deck_still_produces_a_translation_exercise() {
             .any(|w| prompt.contains(w)),
         "沒有可用的字時仍然要拿新卡頂上，不然這一頁對新使用者是空的：\n{prompt}"
     );
+}
+
+/// 這條測試存在的理由是它曾經完全沒有被驗過：prompt 一直有列出要練的字，
+/// 但那只是請求。模型常常寫出一句通順、自然、跟那個字沒有關係的句子，
+/// 而系統照收——題目是好題目，只是那個字沒練到，`target_words` 還照樣
+/// 記成「這次練了它」。使用者的原話是「本來要練某個單字，結果練到別的」。
+#[tokio::test]
+async fn a_translation_that_never_uses_the_assigned_word_is_sent_back() {
+    // 只有一個字學過，所以指派的一定是 alpha——測試才知道該檢查什麼
+    let (db, profile) = setup(&["alpha", "never1"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    study(&db, profile, 1).await;
+    put_in_deck(&db, profile, 2).await;
+
+    let strayed = r#"{"items":[{"source":"我今天很好","target_word":"alpha","reference":"I am fine today."}]}"#;
+    let fixed = r#"{"items":[{"source":"這是我的 alpha","target_word":"alpha","reference":"This is my alpha."}]}"#;
+    let llm = FakeLlm::new(&[strayed, fixed]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "沒有用到指定的字卻沒退回去重出");
+    let retry = llm.last_prompt();
+    assert!(
+        retry.contains("I am fine today."),
+        "回問要把它自己寫的句子附回去，非交互式的後端不記得寫過什麼：\n{retry}"
+    );
+
+    let wordforge_practice::payload::ExerciseBody::Translation { items, .. } = &exercise.body
+    else {
+        panic!("該是翻譯題");
+    };
+    assert!(
+        items[0]
+            .reference
+            .as_deref()
+            .unwrap_or_default()
+            .contains("alpha"),
+        "最後交出去的仍然是沒練到那個字的版本：{items:?}"
+    );
+}
+
+/// 但驗收不是閘門：修不好也要交得出東西。
+///
+/// 這是這個專案在別的地方已經踩過的取捨——「四題壞了一題」不該變成
+/// 「什麼都沒有」。連兩次都沒用到那個字時，仍然把題目給他，
+/// 少練一個字比整頁空白好。
+#[tokio::test]
+async fn a_translation_that_stays_off_target_is_still_handed_over() {
+    let (db, profile) = setup(&["alpha", "never1"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    study(&db, profile, 1).await;
+    put_in_deck(&db, profile, 2).await;
+
+    let strayed = r#"{"items":[{"source":"我今天很好","target_word":"alpha","reference":"I am fine today."}]}"#;
+    let llm = FakeLlm::new(&[strayed, strayed]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .expect("驗收不過也要交得出題目");
+
+    let wordforge_practice::payload::ExerciseBody::Translation { items, .. } = &exercise.body
+    else {
+        panic!("該是翻譯題");
+    };
+    assert_eq!(items.len(), 1);
 }
 
 /// 解析要能給出全文翻譯；模型沒給的時候不能變成一段空白。

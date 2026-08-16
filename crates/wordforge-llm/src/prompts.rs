@@ -487,12 +487,43 @@ pub fn writing_feedback(
     }
 }
 
+/// 一個文法點的定義，出題時附給模型看。
+///
+/// 只帶識別碼是不夠的：`grammar_def` 是使用者可以自己加的，
+/// 匯進來的點可能叫 `te-form`、`se-passive`、或者任何一個只有作者
+/// 看得懂的字串。模型對那些字串只能用猜的，猜出來的題目考的
+/// 常常不是使用者想練的東西。名稱與說明本來就存在資料表裡，
+/// 帶上去就不必猜。
+#[derive(Debug, Clone, Copy)]
+pub struct PointBrief<'a> {
+    /// 受控識別碼，也是 `grammar_point` 欄位要填的值
+    pub point: &'a str,
+    /// 使用者看得懂的名稱，通常是母語寫的
+    pub name: &'a str,
+    /// 這個點在講什麼。自訂的點常常沒填，那時只能靠名稱。
+    pub explanation: Option<&'a str>,
+}
+
+/// 這份文法練習要練什麼。
+///
+/// 兩者不是同一件事，先前卻塞在同一個欄位裡：不管使用者有沒有指定，
+/// prompt 都寫「這位學習者最近常錯的文法點」。指定一個點的時候，
+/// 模型讀到的是「他常錯這個」而不是「這次只練這個」——出來的題目
+/// 摻著別的點，指定等於一個建議。
+#[derive(Debug, Clone, Copy)]
+pub enum DrillFocus<'a> {
+    /// 使用者指定的點：整份練習每一題都考它
+    Point(PointBrief<'a>),
+    /// 沒指定：拿最近常錯的點出綜合練習
+    Weak(&'a [String]),
+}
+
 /// 文法練習出題。針對學習者的錯誤紀錄出題，而不是隨機出題。
 pub fn grammar_drill(
     target_lang: &str,
     native_lang: &str,
     points: &[String],
-    weak_points: &[String],
+    focus: DrillFocus<'_>,
     known_sample: &[String],
     question_count: usize,
     material_excerpt: Option<&str>,
@@ -502,17 +533,39 @@ pub fn grammar_drill(
         target = target_lang
     );
 
-    let mut prompt = format!(
-        "# 這位學習者最近常錯的文法點\n{points}\n\n\
-         # 用字限制\n\
+    let mut prompt = match focus {
+        // 指定了就要講死：「每一題都考這個」而且「`grammar_point` 一律填這個」。
+        // 光說「請練 articles」模型會出一份摻著時態與介系詞的綜合練習，
+        // 而使用者按下去的時候要的是把冠詞練到會。
+        DrillFocus::Point(brief) => format!(
+            "# 這份練習只練一個文法點\n\
+             {name}（標籤 `{point}`）\n{explanation}\n\
+             {n} 題**每一題都要考這個點**，`grammar_point` 欄位一律填 `{point}`。\n\
+             出成別的點就是出錯了——使用者是指定要練這個才按下出題的。\n\
+             同一個點要從不同角度考：換時態、換句型、換常見的陷阱，\n\
+             不要只是把同一題的單字換掉。\n\n",
+            name = brief.name,
+            point = brief.point,
+            n = question_count,
+            explanation = match brief.explanation {
+                Some(text) if !text.trim().is_empty() => format!("{}\n", text.trim()),
+                _ => String::new(),
+            },
+        ),
+        DrillFocus::Weak([]) => {
+            "# 這位學習者最近常錯的文法點\n（沒有紀錄，請出基礎綜合練習）\n\n".to_string()
+        }
+        DrillFocus::Weak(weak_points) => format!(
+            "# 這位學習者最近常錯的文法點\n{points}\n\n",
+            points = weak_points.join("、"),
+        ),
+    };
+
+    prompt.push_str(&format!(
+        "# 用字限制\n\
          題目請盡量使用這些學習者已經會的字，避免因為單字不會而答錯文法題：\n{sample}\n\n",
-        points = if weak_points.is_empty() {
-            "（沒有紀錄，請出基礎綜合練習）".to_string()
-        } else {
-            weak_points.join("、")
-        },
         sample = known_sample.join("、"),
-    );
+    ));
 
     if let Some(excerpt) = material_excerpt {
         prompt.push_str(&format!(
@@ -520,19 +573,28 @@ pub fn grammar_drill(
         ));
     }
 
+    // 指定了點的時候，這裡不能再給一份「從清單挑一個」的規則：
+    // 那句話等於允許它挑別的。
+    let (point_rule, point_example) = match focus {
+        DrillFocus::Point(brief) => (
+            format!("`grammar_point` 每一題都填 `{}`，不要填別的。", brief.point),
+            brief.point.to_string(),
+        ),
+        DrillFocus::Weak(_) => (grammar_point_rule(points), "tense".to_string()),
+    };
+
     prompt.push_str(&format!(
         "# 輸出格式\n\
-         出 {n} 題，每題聚焦一個文法點。{points}\n\
+         出 {n} 題，每題聚焦一個文法點。{point_rule}\n\
          {{\n\
          \x20 \"items\": [{{\"prompt\": \"題目（含填空）\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \
          \"option_notes\": [\"每個選項各一句{native}說明\"], \
-         \"answer_index\": 0, \"grammar_point\": \"tense\", \
+         \"answer_index\": 0, \"grammar_point\": \"{point_example}\", \
          \"explanation\": \"用{native}說明這一題在考什麼文法\"}}]\n\
          }}\n\
          {notes}",
         n = question_count,
         native = native_lang,
-        points = grammar_point_rule(points),
         notes = option_notes_rule(native_lang),
     ));
 
@@ -704,28 +766,52 @@ pub fn translation_task(
         (target_lang, native_lang)
     };
 
+    // 一題一個字，而且**指名道姓**。原本只給一整份清單說「用其中之一」，
+    // 模型會挑好寫的那幾個反覆用，剩下的字整份都沒出現——那些字是照複習
+    // 進度挑出來的，沒出現就等於這次沒練到。編號配對之後每個字都有歸屬。
+    //
+    // 一個字都沒有時整段拿掉。新使用者（剛匯完字典、還沒學過任何字）
+    // 走的是自由造句那條路，留一段「照這個配對出題：」後面空無一物
+    // 只會讓模型自己編幾個字出來配。
+    let word_rule = if words.is_empty() {
+        String::new()
+    } else {
+        let assignments: String = words
+            .iter()
+            .take(count)
+            .enumerate()
+            .map(|(i, word)| format!("{}. {word}\n", i + 1))
+            .collect();
+        format!(
+            "# 每一題各練一個字\n\
+             這些字是照著他的複習進度挑出來的，一題配一個，照這個配對出題：\n\
+             {assignments}\
+             `target_word` 就填那一題配到的字，不要換成別的字，也不要兩題用同一個。\n\
+             方向是{target} → {native}時，那個字直接出現在題目句子（`source`）裡；\n\
+             方向是{native} → {target}時，題目句子要寫成翻出來自然會用到它，\n\
+             參考答案（`reference`）裡就會有這個字。\n\
+             **出題之後系統會實際檢查**那個字（或它的變化形）有沒有出現在{target}那一句裡，\n\
+             沒有的話這一題會被退回來重寫。變化形算數：配到 borrow，句子寫 borrowed 沒問題。\n\n",
+            native = native_lang,
+            target = target_lang,
+        )
+    };
+
     let mut prompt = format!(
         "# 出題要求\n\
          練習方向是「{source} → {answer}」：\n\
          請出 {count} 個**{source}**句子，讓學習者翻譯成{answer}。\n\
          `source` 欄位一定要是{source}，寫成{answer}就是出錯了，這一題會作廢。\n\
-         每個句子要自然、日常，並且**必須**用到下列{target}單字之一\n\
-         （學習者翻譯時就等於練到了這個字）：\n{words}\n\
-         這些字是照著他的複習進度挑出來的，所以**一題用一個、盡量不要重複**，\n\
-         剛好把清單用完。\n\
-         方向是{target} → {native}時，那個字直接出現在題目句子裡；\n\
-         方向是{native} → {target}時，題目句子要寫成翻出來自然會用到它。\n\n\
+         每個句子要自然、日常。\n\n\
+         {word_rule}\
          # 情境要有變化\n\
          每一題的**場合、說話的人、想達成的事都要不一樣**。\n\
          同一個字在不同情境下的用法不同，換情境等於多練一次；\n\
          每題都寫成同一個場景的話，這份練習就只練到一種用法。\n\
          也不要每題都是同一個句型（都是問句、都是「我昨天…」）。\n\n",
         count = count,
-        native = native_lang,
-        target = target_lang,
         source = source_lang,
         answer = answer_lang,
-        words = words.join("、"),
     );
 
     // 主題只是起點，不是限制：真正要的是題目之間有差異。
@@ -1117,7 +1203,7 @@ mod tests {
                 "English",
                 "繁體中文",
                 &english_points(),
-                &weak,
+                DrillFocus::Weak(&weak),
                 &known,
                 5,
                 None,
@@ -1307,7 +1393,7 @@ mod tests {
             "English",
             "繁體中文",
             &english_points(),
-            &weak,
+            DrillFocus::Weak(&weak),
             &known,
             5,
             None,
@@ -1321,12 +1407,76 @@ mod tests {
             "English",
             "繁體中文",
             &english_points(),
-            &[],
+            DrillFocus::Weak(&[]),
             &known,
             3,
             None,
         );
         assert!(fallback.messages[0].content.contains("基礎綜合練習"));
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：指定的點跟「最近常錯的點」
+    /// 塞在同一個欄位裡，prompt 一律寫成「這位學習者最近常錯的文法點」。
+    /// 模型讀到的是「他常錯這個」，不是「這次只練這個」——指定一個點
+    /// 拿回來的仍然是一份摻著別的點的綜合練習。
+    #[test]
+    fn a_chosen_point_is_the_whole_drill_not_a_hint() {
+        let known = sample_words();
+        let req = grammar_drill(
+            "English",
+            "繁體中文",
+            &english_points(),
+            DrillFocus::Point(PointBrief {
+                point: "articles",
+                name: "冠詞 a / an / the",
+                explanation: Some("可數單數名詞前面要有限定詞"),
+            }),
+            &known,
+            5,
+            None,
+        );
+        let text = &req.messages[0].content;
+
+        assert!(text.contains("每一題都要考這個點"), "{text}");
+        assert!(
+            !text.contains("最近常錯"),
+            "指定了還說「最近常錯」等於把指定降級成一個提示：{text}"
+        );
+        // 識別碼可能是使用者自己取的，名稱與說明不帶過去模型只能猜
+        assert!(text.contains("冠詞 a / an / the"), "{text}");
+        assert!(text.contains("可數單數名詞前面要有限定詞"), "{text}");
+        // 「從清單挑一個」在這裡等於允許它挑別的
+        assert!(
+            !text.contains("只能從下面這份清單挑一個"),
+            "指定之後不該再給一份可以挑別的點的清單：{text}"
+        );
+        assert!(
+            text.contains("`grammar_point` 每一題都填 `articles`"),
+            "{text}"
+        );
+    }
+
+    /// 自訂的點常常只有名稱沒有說明（`grammar_def` 的 explanation 可以是空的），
+    /// 那時不能留下一段空白的說明段落。
+    #[test]
+    fn a_chosen_point_without_an_explanation_still_reads_cleanly() {
+        let known = sample_words();
+        let req = grammar_drill(
+            "English",
+            "繁體中文",
+            &english_points(),
+            DrillFocus::Point(PointBrief {
+                point: "te-form",
+                name: "て形",
+                explanation: None,
+            }),
+            &known,
+            3,
+            None,
+        );
+        let text = &req.messages[0].content;
+        assert!(text.contains("て形（標籤 `te-form`）"), "{text}");
+        assert!(!text.contains("\n\n\n"), "多留了一段空白：{text}");
     }
 
     #[test]
