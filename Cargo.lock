@@ -6244,7 +6244,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "wordforge-cli"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -6260,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-core"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -6271,7 +6271,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-db"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -6285,7 +6285,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-desktop"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -6310,7 +6310,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-dict"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "csv",
  "serde",
@@ -6322,7 +6322,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-import"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "futures",
  "pdf-extract",
@@ -6342,7 +6342,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-llm"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "async-trait",
  "libc",
@@ -6357,7 +6357,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-practice"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -6375,7 +6375,7 @@ dependencies = [
 
 [[package]]
 name = "wordforge-tts"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
