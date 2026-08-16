@@ -292,16 +292,19 @@ pub async fn new_word_candidates(
                 freq_rank,
             }
         })
-        // 詞性表裡出現 `name` 就整個排掉。
+        // 只有**純粹**的專有名詞才排掉：詞性表裡除了 `name` 沒有別的。
         //
-        // 原本只排除「只有 name」的字，結果 `gould`（姓氏，詞性被標成
-        // adj,noun,name）混進了學習者的生詞清單。維基詞典對專有名詞
-        // 常常同時標上普通詞性，所以「只有 name」這條線攔不住。
+        // 這裡原本是「出現 `name` 就整個排掉」，理由是 `gould`（姓氏，
+        // 詞性標成 adj,noun,name）曾經混進生詞清單。但那條線的代價實測是
+        // **19%**：oval、mule、hurdle、canoe、sturdy、broaden、parsley、
+        // goddess、verge、sergeant、batch、deter、ivory、rag… 這些全是
+        // 好生詞，只因為有同名的姓氏就學不到（3206 個候選裡排掉 624 個）。
         //
-        // 代價是 `comet`（noun,name）這種好字也會被丟掉。可以接受：
-        // 候選池有幾百個字而一篇只要幾個，寧可少幾個好字，
-        // 也不要讓學習者背一個姓氏。
-        .filter(|w| !w.pos.iter().any(|p| p == "name"))
+        // 換過來的代價是 gould、simpson、wiltshire 這類會留在候選裡。
+        // 那是可以承受的：一篇只挑幾個字，而挑哪些由模型決定——prompt
+        // 講明「用法要正確」，它不會為了一個姓氏編出用法。反過來，
+        // 一個好字被永久排除，使用者是永遠學不到的。
+        .filter(|w| w.pos.is_empty() || w.pos.iter().any(|p| p != "name"))
         // 查不到詞性的**不排除**。
         //
         // 詞性來自 Wiktionary；只匯入 ECDICT 的人整份字典的 pos 都是
