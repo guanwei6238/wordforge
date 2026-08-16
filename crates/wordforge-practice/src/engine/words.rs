@@ -413,19 +413,31 @@ impl PracticeEngine<'_> {
                        WHERE c.profile_id = ?1 AND c.lemma_id = lemma.id
                          AND c.state = 'new'
                    )
-                   -- **排除專有名詞**。實測這個池子有 29.7% 是人名與地名
-                   -- （charles、powell、raf…），而同一份 prompt 第 4 點
-                   -- 正好寫著「不要使用專有名詞」——等於白燒三成的 token
-                   -- 去給模型一份它不該用的清單。
+                   -- **排除純粹的專有名詞**。這個池子原本有 29.7% 是人名與地名
+                   -- （marx、powell、windsor…），而同一份 prompt 正好寫著
+                   -- 「不要使用專有名詞」——白燒三成的 token 給模型一份
+                   -- 它不該用的清單。
                    --
-                   -- 判斷方式跟 `new_word_candidates` 一致：詞性表裡出現
-                   -- `name` 就整個排掉。維基詞典對專有名詞常常同時標上
-                   -- 普通詞性（edward 是 name,noun），只排「只有 name」
-                   -- 的話攔不住。
-                   AND NOT EXISTS (
-                       SELECT 1 FROM lemma p
-                       WHERE p.lang = lemma.lang AND p.normalized = lemma.normalized
-                         AND p.pos LIKE '%name%'
+                   -- 條件是「**只有** name 詞性」，不能寫成「出現 name 就排」。
+                   -- `new_word_candidates` 用的是後者，那對它成立（生詞落在
+                   -- 罕見的詞頻帶，同時標 name 的多半主要就是人名），
+                   -- 但對這個池子是災難：維基詞典連 `you`、`for`、`say`、
+                   -- `this`、`but` 都收了同名的姓氏，一律排掉的話會刪掉
+                   -- 1798 個字，包含詞頻前 100 的核心詞彙。
+                   --
+                   -- 改成只排純 name 之後排掉 137 個，全是 marx、dorothy、
+                   -- cornwall 這種，常用字一個都沒少。
+                   AND NOT (
+                       EXISTS (
+                           SELECT 1 FROM lemma p
+                           WHERE p.lang = lemma.lang AND p.normalized = lemma.normalized
+                             AND p.pos LIKE '%name%'
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM lemma q
+                           WHERE q.lang = lemma.lang AND q.normalized = lemma.normalized
+                             AND q.pos <> '' AND q.pos NOT LIKE '%name%'
+                       )
                    )
              ),
              banded AS (

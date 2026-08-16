@@ -163,8 +163,9 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
             你不確定它在這個情境的搭配詞或介系詞、或者它粗俗冒犯不適合教材。\n\
             **寧可少教一個字，也不要寫出「為了用這個字而存在」的句子，\n\
             更不要造一個看起來很像但錯的用法。**\n\
-         4. 白名單與上面那份已知詞清單以外，不要使用專有名詞、縮寫、俚語或罕見字。\n\
-            （清單裡本來就有的專有名詞是他自己學過的，用得上就用。）\n\
+         4. 白名單以外，不要使用**他不會的**專有名詞、縮寫、俚語或罕見字。\n\
+            上面那份抽樣只是程度參考，不是白名單——他會的字遠不止那些，\n\
+            裡面出現的專有名詞是他自己學過的，用得上就用。\n\
          5. 文章要有完整的起承轉合，不要像單字例句的拼貼。\n\
          6. **題目與選項一律用{target}寫**，因為那是他要練的語言；\n\
             只有 explanation 與 gloss 用{native}。\n\n",
@@ -308,10 +309,13 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
     let mut prompt = format!(
         "# 學習者程度\n\
          - 已掌握約 {known} 個{target}單字\n\
-         - 已知詞抽樣（僅供你感受用字範圍）：{sample}\n\n\
+         - 已知詞抽樣（僅供你感受用字範圍，不必全用）：{sample}\n\
+           這是**抽樣**，他會的字遠不止這些——不要把它當成白名單，\n\
+           也不必刻意把清單裡的字塞進文章。\n\n\
          # 硬性要求\n\
          1. 寫一篇約 {words} 個詞的{target}短文，內容連貫、有頭有尾。\n\
-         2. 除了要挖掉的字以外，**只用學習者已經會的字**。\n\
+         2. 除了要挖掉的字以外，**只用學習者已經會的字**\n\
+            （程度參考上面那份抽樣，不是只能用清單裡那些）。\n\
             克漏字考的是「想不想得起來這個字」，不是「看不看得懂這篇」；\n\
             旁邊出現生詞的話，答不出來就分不清是哪個原因。\n\
          3. 從下面這些字裡**挑 {n} 個**（至少 {min} 個），各在文章裡用剛好一次，\n\
@@ -1464,6 +1468,12 @@ mod tests {
             text.contains("題數要跟你實際挖的空格數一樣"),
             "題數要對得上空格數：{text}"
         );
+        // 可用池是「程度參考」不是白名單——配上一份三百字的清單，
+        // 「只用他會的字」很容易被讀成「只能用清單裡的字」，那會把文章綁死
+        assert!(
+            text.contains("不要把它當成白名單"),
+            "可用池不能讀起來像白名單：{text}"
+        );
         assert!(
             text.contains("只用學習者已經會的字"),
             "克漏字考的是想不想得起來，不是看不看得懂：{text}"
@@ -1637,6 +1647,65 @@ mod tests {
         let text = &req.messages[0].content;
         assert!(text.contains("て形（標籤 `te-form`）"), "{text}");
         assert!(!text.contains("\n\n\n"), "多留了一段空白：{text}");
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：prompt 組候選清單時有一行
+    /// `.take(count)`，把 8 個候選砍回 5 個——「給 8 挑 5」實際上變成
+    /// 「給 5 挑 5」，那個放寬從來沒生效。
+    ///
+    /// **這種洞產出端抓不到**：模型照樣寫出合格的題目，驗收全過，
+    /// 只是它手上從頭到尾就沒有選擇空間。唯一問得出來的地方是
+    /// 「候選有沒有真的送到 prompt 上」，所以三個題型各釘一條。
+    #[test]
+    fn every_candidate_reaches_the_prompt() {
+        let words: Vec<String> = (1..=8).map(|i| format!("cand{i}")).collect();
+        let req = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: true,
+            material_excerpt: None,
+            topic: "",
+            words: &words,
+            usable: &[],
+            count: 5,
+        });
+        let text = &req.messages[0].content;
+
+        for w in &words {
+            assert!(text.contains(w), "候選 {w} 沒有進到 prompt：{text}");
+        }
+        assert!(text.contains("挑 5 個"), "要講清楚挑幾個：{text}");
+    }
+
+    /// 同上：克漏字的候選字全部都要列出來。
+    #[test]
+    fn every_blank_candidate_reaches_the_prompt() {
+        let candidates: Vec<String> = (1..=16).map(|i| format!("cand{i}")).collect();
+        let known = sample_words();
+        let mut spec = cloze_spec(&candidates, &known, None, None);
+        spec.blanks_wanted = 8;
+        spec.blanks_min = 6;
+        let text = cloze_passage(&spec).messages[0].content.clone();
+
+        for w in &candidates {
+            assert!(text.contains(w), "候選 {w} 沒有進到 prompt：{text}");
+        }
+        assert!(text.contains("挑 8 個"), "{text}");
+        assert!(text.contains("至少 6 個"), "{text}");
+    }
+
+    /// 同上：閱讀的生詞白名單全部都要列出來。
+    #[test]
+    fn every_new_word_candidate_reaches_the_prompt() {
+        let targets: Vec<String> = (1..=12).map(|i| format!("cand{i}")).collect();
+        let known = sample_words();
+        let text = reading_comprehension(&spec(&targets, &known, None)).messages[0]
+            .content
+            .clone();
+
+        for w in &targets {
+            assert!(text.contains(w), "候選 {w} 沒有進到 prompt：{text}");
+        }
     }
 
     #[test]
