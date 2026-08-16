@@ -2250,6 +2250,73 @@ async fn bumping_the_backfill_version_recomputes_old_links() {
     );
 }
 
+/// 「這一句我錯在哪個文法點」要接得回句子。
+///
+/// 批改一直都有標文法點，而且那些標籤已經在驅動文法題的排程——缺的只是
+/// 對回句子。這條測試同時驗到兩條路：模型有給題號時照用，漏填時靠
+/// `original` 比對回作答（實測九條修正全部對得回去）。
+#[tokio::test]
+async fn a_sentence_carries_the_grammar_points_you_tripped_on() {
+    use wordforge_db::word_sentences;
+
+    let (db, profile) = setup(&["alpha", "beta"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    study(&db, profile, 1).await;
+    study(&db, profile, 2).await;
+
+    // 第一條有題號，第二條沒有——第二條要靠 original 對回第 2 題
+    let graded = r#"{"score":40,
+        "items":[{"index":1,"correct":false},{"index":2,"correct":false}],
+        "corrections":[
+          {"index":1,"original":"I would like prepare","corrected":"I would like to prepare",
+           "grammar_point":"gerund-infinitive","severity":"major"},
+          {"original":"After club end","corrected":"After the club ended",
+           "grammar_point":"articles","severity":"major"}],
+        "unknown_words":[]}"#;
+    let llm = FakeLlm::translating(&[graded]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let now = t0() + Duration::days(400);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), now)
+        .await
+        .unwrap();
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![
+                    "I would like prepare three reasons.".into(),
+                    "After club end, we cancelled it.".into(),
+                ],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            now,
+        )
+        .await
+        .unwrap();
+
+    let first = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        first[0].grammar_points,
+        vec!["gerund-infinitive".to_string()],
+        "有題號的那條要掛在第 1 題"
+    );
+
+    let second = word_sentences::for_lemma(&db, ProfileId(profile), LemmaId(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        second[0].grammar_points,
+        vec!["articles".to_string()],
+        "沒題號的那條要靠 original 對回第 2 題"
+    );
+}
+
 /// 「這句我錯過幾次」要在句子練起來之後**還留著**。
 ///
 /// 次數本來記在排程那張表，但句子寫對之後那一列會被刪掉——那正是

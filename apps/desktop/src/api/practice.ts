@@ -230,6 +230,8 @@ export interface ItemResult {
 }
 
 export interface Correction {
+  /** 第幾題（從 1 起算）。模型漏填時後端會用 original 比對回去 */
+  index: number | null;
   original: string;
   corrected: string;
   grammar_point: string | null;
@@ -361,6 +363,12 @@ export interface WordSentence {
   translation: string | null;
   /** translation / reading / cloze */
   origin: string;
+  /**
+   * 這一句踩過哪些文法點（識別碼，如 `articles`）。
+   *
+   * 名稱要到文法頁的清單查——那份清單使用者可以改，存副本只會漂移。
+   */
+  grammar_points: string[];
   /**
    * 這一句錯過幾次。
    *

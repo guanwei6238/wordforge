@@ -145,6 +145,8 @@ pub(super) fn grade_choices(items: &[ChoiceItem], input: &GradeInput) -> Feedbac
             correct_count += 1;
         } else if let Some(point) = item.grammar_point.as_ref().filter(|p| !p.trim().is_empty()) {
             corrections.push(Correction {
+                // 選擇題的對錯是本地判的，題號一直都知道
+                index: Some(i + 1),
                 original: picked
                     .and_then(|idx| item.options.get(idx).cloned())
                     .unwrap_or_else(|| "（沒有作答）".to_string()),

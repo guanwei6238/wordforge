@@ -183,6 +183,7 @@ use choices::{
     shuffle_answers, shuffle_seed,
 };
 use links::checked_sentences;
+use points::attribute_corrections;
 
 impl<'a> PracticeEngine<'a> {
     pub fn new(db: &'a Db, llm: &'a dyn LlmProvider) -> Self {

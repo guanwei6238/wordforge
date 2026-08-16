@@ -660,6 +660,8 @@ pub fn translation_feedback(
          # 批改要求\n\
          - 意思對就算對，不要為了語法完美而挑剔可接受的說法。\n\
          - 每個問題都要標註文法點。{points}\n\
+         - 每條修正都要帶 `index`：那是**第幾題**（從 1 起算）。\n\
+           少了它就說不出「這一句你錯在哪個文法點」——那正是複習時最有用的訊息。\n\
          - **判斷學習者不懂哪些字**：翻錯、漏譯、或用了明顯繞路的說法，\n\
            都代表他不會那個字。把那些{target_lang}單字列在 unknown_words，\n\
            系統會自動排進他的複習。\n\
@@ -670,7 +672,7 @@ pub fn translation_feedback(
          \x20 \"score\": 0 到 100 的整數,\n\
          \x20 \"items\": [{{\"index\": 1, \"correct\": true, \"reference\": \"參考答案\", \
          \"comment\": \"用{native_lang}說明，答對就寫得簡短\"}}],\n\
-         \x20 \"corrections\": [{{\"original\": \"原句\", \"corrected\": \"修正後\", \
+         \x20 \"corrections\": [{{\"index\": 1, \"original\": \"原句\", \"corrected\": \"修正後\", \
          \"grammar_point\": \"tense\", \"severity\": \"minor\", \
          \"explanation\": \"用{native_lang}說明\"}}],\n\
          \x20 \"unknown_words\": [\"他不會的{target_lang}單字\"]\n\

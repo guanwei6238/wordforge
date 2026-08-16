@@ -163,6 +163,13 @@ pub struct ItemResult {
 /// 一處需要修正的地方。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Correction {
+    /// 第幾題（從 1 起算）。
+    ///
+    /// 有了它才說得出「這一句你錯在哪個文法點」。模型偶爾會漏填，
+    /// 那時靠 `original` 比對回作答（見 `engine::attribute_corrections`）——
+    /// 那個欄位存的就是使用者當時寫的句子片段。
+    #[serde(default)]
+    pub index: Option<usize>,
     #[serde(default)]
     pub original: String,
     #[serde(default)]

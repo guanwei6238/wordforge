@@ -24,6 +24,10 @@ pub struct WordSentence {
     pub translation: Option<String>,
     /// translation / reading / cloze
     pub origin: String,
+    /// 這一句踩過哪些文法點（識別碼，如 `articles`）。
+    ///
+    /// 名稱在 `grammar_def` 裡查，不存副本——那份清單使用者可以改。
+    pub grammar_points: Vec<String>,
     /// 這一句錯過幾次。
     ///
     /// 累計在這裡而不是讀 `sentence_review`：那張表是排程，句子寫對之後
@@ -132,7 +136,8 @@ pub async fn for_lemmas(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT id, exercise_id, text, translation, origin, misses, created_at
+        "SELECT id, exercise_id, text, translation, origin, misses,
+                grammar_points_json, created_at
          FROM word_sentence
          WHERE profile_id = ? AND lemma_id IN ({placeholders})
          ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
@@ -155,10 +160,52 @@ pub async fn for_lemmas(
             text: row.get("text"),
             translation: row.get("translation"),
             origin: row.get("origin"),
+            grammar_points: serde_json::from_str(&row.get::<String, _>("grammar_points_json"))
+                .unwrap_or_default(),
             misses: row.get("misses"),
             created_at: row.get("created_at"),
         })
         .collect())
+}
+
+/// 記下這一句踩到的文法點。
+///
+/// 合併而不是覆蓋：同一句練好幾次，每次錯的點不一定一樣，而使用者要看的
+/// 是「這句我在哪些地方栽過」。
+pub async fn add_grammar_points(
+    db: &Db,
+    profile_id: ProfileId,
+    exercise_id: i64,
+    item_index: i64,
+    points: &[String],
+) -> Result<()> {
+    if points.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, grammar_points_json FROM word_sentence
+         WHERE profile_id = ? AND exercise_id = ? AND item_index = ?",
+    )
+    .bind(profile_id.0)
+    .bind(exercise_id)
+    .bind(item_index)
+    .fetch_all(db.pool())
+    .await?;
+
+    for (id, existing) in rows {
+        let mut merged: Vec<String> = serde_json::from_str(&existing).unwrap_or_default();
+        for point in points {
+            if !merged.iter().any(|p| p == point) {
+                merged.push(point.clone());
+            }
+        }
+        sqlx::query("UPDATE word_sentence SET grammar_points_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into()))
+            .bind(id)
+            .execute(db.pool())
+            .await?;
+    }
+    Ok(())
 }
 
 /// 這一句又錯了一次。

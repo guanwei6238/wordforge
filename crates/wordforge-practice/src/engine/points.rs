@@ -138,3 +138,129 @@ impl PracticeEngine<'_> {
         Ok(())
     }
 }
+
+/// 把每一條修正歸到它屬於的那一題。
+///
+/// ## 為什麼需要兩條路
+///
+/// prompt 要求每條修正帶 `index`，但那只是請求——模型漏填的時候，
+/// 「這一句你錯在哪個文法點」就整個說不出來。
+///
+/// 好在 `original` 存的是**使用者當時寫的句子片段**，拿它去比對作答就
+/// 對得回題號。實測一份五題的翻譯練習，九條修正全部對得回去。
+///
+/// 兩條都不成立時就丟掉那一條：寧可少一個標籤，也不要把「你在冠詞上
+/// 錯過」掛到一句根本沒有冠詞問題的話上——那種錯畫面上看不出來。
+///
+/// 回傳 `(題號從 0 起算, 文法點識別碼)`，同一題可能有好幾個。
+pub(super) fn attribute_corrections(
+    corrections: &[Correction],
+    answers: &[String],
+) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for correction in corrections {
+        let Some(point) = correction
+            .grammar_point
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+
+        // 模型給的題號優先，但要在範圍內——超出範圍的 index 比沒有更糟
+        let by_index = correction
+            .index
+            .and_then(|n| n.checked_sub(1))
+            .filter(|i| *i < answers.len());
+
+        let by_text = || {
+            let needle = correction.original.trim();
+            if needle.is_empty() {
+                return None;
+            }
+            answers.iter().position(|a| a.contains(needle))
+        };
+
+        if let Some(item) = by_index.or_else(by_text) {
+            out.push((item, point.to_string()));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn correction(index: Option<usize>, original: &str, point: &str) -> Correction {
+        Correction {
+            index,
+            original: original.into(),
+            corrected: String::new(),
+            grammar_point: Some(point.into()),
+            severity: None,
+            explanation: None,
+        }
+    }
+
+    #[test]
+    fn a_correction_with_an_index_goes_to_that_item() {
+        let answers = vec!["第一句".to_string(), "第二句".to_string()];
+        let got = attribute_corrections(&[correction(Some(2), "第二句", "tense")], &answers);
+        assert_eq!(got, vec![(1, "tense".to_string())]);
+    }
+
+    /// 這條路是實測出來的：模型漏填 index 時，`original` 存的是使用者
+    /// 當時寫的片段，拿它比對作答就對得回去（實測九條全中）。
+    #[test]
+    fn a_correction_without_an_index_is_matched_by_what_you_wrote() {
+        let answers = vec![
+            "In debate class, I would like prepare three reasons.".to_string(),
+            "After club end, we cancelled it.".to_string(),
+        ];
+        let got = attribute_corrections(
+            &[
+                correction(None, "I would like prepare", "gerund-infinitive"),
+                correction(None, "After club end", "articles"),
+            ],
+            &answers,
+        );
+        assert_eq!(
+            got,
+            vec![
+                (0, "gerund-infinitive".to_string()),
+                (1, "articles".to_string())
+            ]
+        );
+    }
+
+    /// 超出範圍的題號比沒有更糟：會把標籤掛到不存在的題目上。
+    #[test]
+    fn an_out_of_range_index_falls_back_to_matching() {
+        let answers = vec!["I would like prepare it.".to_string()];
+        let got = attribute_corrections(
+            &[correction(
+                Some(9),
+                "I would like prepare",
+                "gerund-infinitive",
+            )],
+            &answers,
+        );
+        assert_eq!(got, vec![(0, "gerund-infinitive".to_string())]);
+    }
+
+    /// 兩條路都不成立就丟掉：把標籤掛到錯的句子上，畫面看不出來。
+    #[test]
+    fn a_correction_that_matches_nothing_is_dropped() {
+        let answers = vec!["完全不相干".to_string()];
+        assert!(
+            attribute_corrections(&[correction(None, "something else", "tense")], &answers)
+                .is_empty()
+        );
+        // 沒有文法點的修正本來就沒有東西可以掛
+        assert!(
+            attribute_corrections(&[correction(Some(1), "完全不相干", "  ")], &answers).is_empty()
+        );
+    }
+}

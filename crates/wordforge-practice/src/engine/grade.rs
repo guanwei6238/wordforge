@@ -111,6 +111,8 @@ impl PracticeEngine<'_> {
             let indices: Vec<usize> = (0..items.len()).collect();
             self.schedule_sentences(profile_id, input.exercise_id, &indices, &feedback, now)
                 .await?;
+            self.tag_sentences(profile_id, input.exercise_id, &feedback, &input.answers)
+                .await?;
         }
 
         let answer_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
@@ -295,6 +297,8 @@ impl PracticeEngine<'_> {
         let touched: Vec<usize> = redone.iter().map(|(i, _)| *i).collect();
         self.schedule_sentences(profile_id, exercise_id, &touched, &merged, now)
             .await?;
+        self.tag_sentences(profile_id, exercise_id, &merged, &input.answers)
+            .await?;
 
         let answer_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
         let feedback_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".into());
@@ -309,6 +313,44 @@ impl PracticeEngine<'_> {
         .await?;
 
         Ok(merged)
+    }
+
+    /// 把「這一句錯在哪個文法點」記到句子上。
+    ///
+    /// 批改本來就會標文法點，而且那些標籤已經在驅動文法題的排程——
+    /// 缺的只是對回句子。對不回去的就丟掉：把「你在冠詞上錯過」掛到
+    /// 一句根本沒有冠詞問題的話上，畫面看不出來。
+    async fn tag_sentences(
+        &self,
+        profile_id: i64,
+        exercise_id: i64,
+        feedback: &Feedback,
+        answers: &[String],
+    ) -> Result<()> {
+        let points = self.grammar_points(OffsetDateTime::now_utc()).await?;
+        let mut by_item: std::collections::HashMap<usize, Vec<String>> =
+            std::collections::HashMap::new();
+
+        for (item, raw) in attribute_corrections(&feedback.corrections, answers) {
+            // 收斂到受控清單，理由跟排程那邊一樣：不收的話同一個點會散成
+            // tense / past tense / Verb Tense 好幾個標籤
+            let Some(point) = self.normalize_point(&points, &raw) else {
+                continue;
+            };
+            by_item.entry(item).or_default().push(point);
+        }
+
+        for (item, points) in by_item {
+            word_sentences::add_grammar_points(
+                self.db,
+                ProfileId(profile_id),
+                exercise_id,
+                item as i64,
+                &points,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// 把翻譯的每一句排進（或移出）複習。

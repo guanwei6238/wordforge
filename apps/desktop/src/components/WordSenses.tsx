@@ -151,6 +151,13 @@ function MySentences({ lemmaId }: { lemmaId: number }) {
             <span className="tag">{SENTENCE_ORIGIN_LABELS[s.origin] ?? s.origin}</span>
             {/* 錯過幾次是複習時最有用的訊號：這句我卡過三次 */}
             {s.misses > 0 && <span className="tag miss">錯過 {s.misses} 次</span>}
+            {/* 這一句踩過的文法點。用識別碼——名稱在文法頁的清單裡，
+                使用者可以改，存副本只會漂移 */}
+            {s.grammar_points.map((p) => (
+              <span key={p} className="tag point">
+                {p}
+              </span>
+            ))}
           </li>
         ))}
       </ul>

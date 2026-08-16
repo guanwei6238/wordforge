@@ -1319,6 +1319,12 @@ button.link {
   color: var(--error);
 }
 
+/* 文法點標籤：跟「錯過幾次」並排，但不要一樣搶眼 */
+.tag.point {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.65rem;
+}
+
 .sentence-pager {
   align-items: center;
   gap: 0.5rem;
