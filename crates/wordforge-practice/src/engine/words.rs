@@ -250,6 +250,124 @@ impl PracticeEngine<'_> {
         Ok(words)
     }
 
+    /// 白名單裡有哪些字**沒有**出現在文章裡。
+    ///
+    /// 「出現」認的是整個詞族：這篇教 `establish`，文章寫 `established`
+    /// 也算教到了。字面比對會把那種情況誤判成沒用到，然後要求模型多寫一次，
+    /// 而它已經寫了。
+    pub(super) async fn unused_targets(
+        &self,
+        passage: &str,
+        targets: &[String],
+    ) -> Result<Vec<String>> {
+        let mut unused = Vec::new();
+        for word in targets {
+            let forms: std::collections::HashSet<String> =
+                lemmas::forms(self.db, &self.target_lang, word)
+                    .await?
+                    .into_iter()
+                    .collect();
+            if !wordforge_core::text::mentions_any(passage, &forms, &self.target_lang) {
+                unused.push(word.clone());
+            }
+        }
+        Ok(unused)
+    }
+
+    /// 出題時給模型的**可用池**：這些字他都會，可以用、不必用。
+    ///
+    /// 兩段組成：
+    ///
+    /// 1. 學過但**還沒有例句**的字（上限 `NO_SENTENCE_SHARE`）——那些字複習時
+    ///    只看得到釋義，讓模型有機會把它們寫進一句真的句子裡
+    /// 2. 其餘從已知詞分帶隨機抽（[`known_sample`]），維持程度分布
+    ///
+    /// 第一段實際填幾個取「比例」與「真的有幾個」的小者：使用者的資料
+    /// 現在只有 54 個沒例句的字，硬填會變成同一批重複。
+    ///
+    /// [`known_sample`]: Self::known_sample
+    pub(super) async fn usable_pool(
+        &self,
+        profile_id: i64,
+        vocabulary: i64,
+        size: i64,
+    ) -> Result<Vec<String>> {
+        let want_fresh = ((size as f64) * NO_SENTENCE_SHARE) as i64;
+        let mut pool = cards::words_without_sentences(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            want_fresh,
+        )
+        .await?;
+
+        // 其餘用分帶抽樣補滿。多抽一些，因為要扣掉上面已經有的
+        let sampled = self
+            .known_sample(profile_id, vocabulary, size - pool.len() as i64)
+            .await?;
+        for word in sampled {
+            if pool.len() as i64 >= size {
+                break;
+            }
+            if !pool.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
+                pool.push(word);
+            }
+        }
+        Ok(pool)
+    }
+
+    /// 翻譯題的可用池：題目句子可以用哪些字。
+    ///
+    /// 跟文章類的差別是**證據等級**。文章要能寫得下去，所以可用池收進
+    /// 「詞頻在估計詞彙量以內」的字——那是推定會，沒有證據。翻譯不行：
+    /// 題目句子他要讀得懂才翻得出來，讀不懂的話那一題考的是別的東西。
+    ///
+    /// 所以順序是「真的學過的」優先（有卡片、已進入複習），不夠才用
+    /// 推定的補。牌組小的時候補得多，那也是沒辦法的事——總不能因此
+    /// 出不了題。
+    pub(super) async fn sentence_pool(
+        &self,
+        profile_id: i64,
+        vocabulary: i64,
+        size: i64,
+    ) -> Result<Vec<String>> {
+        let want_fresh = ((size as f64) * NO_SENTENCE_SHARE) as i64;
+        let mut pool = cards::words_without_sentences(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            want_fresh,
+        )
+        .await?;
+
+        // 真的學過的字優先
+        let studied = cards::sample_known_words(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            &pool,
+            size - pool.len() as i64,
+        )
+        .await?;
+        pool.extend(studied);
+
+        // 還不夠才用推定會的補
+        if (pool.len() as i64) < size {
+            let sampled = self
+                .known_sample(profile_id, vocabulary, size - pool.len() as i64)
+                .await?;
+            for word in sampled {
+                if pool.len() as i64 >= size {
+                    break;
+                }
+                if !pool.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
+                    pool.push(word);
+                }
+            }
+        }
+        Ok(pool)
+    }
+
     /// 已知詞的抽樣，讓模型感受用字範圍。
     ///
     /// 兩個要點：
@@ -263,8 +381,9 @@ impl PracticeEngine<'_> {
         &self,
         profile_id: i64,
         vocabulary: i64,
+        size: i64,
     ) -> Result<Vec<String>> {
-        let per_band = (KNOWN_SAMPLE / SAMPLE_BANDS).max(1);
+        let per_band = (size / SAMPLE_BANDS).max(1);
         let upper = vocabulary.max(1);
 
         // 分層的邊界依估計詞彙量等比切開，程度低的人不會全部落在同一層
@@ -286,6 +405,14 @@ impl PracticeEngine<'_> {
                  WHERE lang = ?7 AND freq_rank IS NOT NULL AND freq_rank <= ?2
                    AND text = lower(text) AND length(text) >= 3
                    AND text NOT LIKE '% %'
+                   -- **排除牌組裡還沒學過的字**。詞頻低不代表他會——
+                   -- 那些字是他自己排進來要學的，把它們寫進「他讀得懂的字」
+                   -- 等於用他還不會的字出題。這條是測試抓到的。
+                   AND NOT EXISTS (
+                       SELECT 1 FROM card c
+                       WHERE c.profile_id = ?1 AND c.lemma_id = lemma.id
+                         AND c.state = 'new'
+                   )
              ),
              banded AS (
                  SELECT text, freq_rank,

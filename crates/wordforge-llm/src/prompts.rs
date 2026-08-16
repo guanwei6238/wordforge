@@ -155,10 +155,14 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
          1. 文章長度約 {words} 個詞（±10%）。\n\
          2. 學習者不認識的詞元不可超過 {budget} 個，也就是已知詞覆蓋率至少 {cov:.0}%。\n\
          3. 唯一允許出現的新詞是下列白名單：{targets}\n\
-            每個新詞請自然地出現 {repeats} 次以上，並讓上下文足以推敲其意思。\n\
-            **白名單裡的字盡量全部用到**——少用一個，這篇就少教一個字。\n\
-            唯一的例外：某個字如果粗俗、冒犯，或明顯不適合出現在\n\
-            學習教材裡，就跳過它，不要為了湊數硬寫進去。\n\
+            **從裡面挑得動的用，不必全用**——清單給的比需要的多，就是讓你挑的。\n\
+            挑到的每個新詞請自然地出現 {repeats} 次以上，並讓上下文足以推敲其意思。\n\
+            用幾個由第 2 點的覆蓋率決定：新詞太少這篇就沒東西可學，\n\
+            太多他會讀不下去。\n\
+            跳過一個字的時機：放進去會讓句子變奇怪、需要硬轉話題、\n\
+            你不確定它在這個情境的搭配詞或介系詞、或者它粗俗冒犯不適合教材。\n\
+            **寧可少教一個字，也不要寫出「為了用這個字而存在」的句子，\n\
+            更不要造一個看起來很像但錯的用法。**\n\
          4. 白名單以外，不要使用專有名詞、縮寫、俚語或罕見字。\n\
          5. 文章要有完整的起承轉合，不要像單字例句的拼貼。\n\
          6. **題目與選項一律用{target}寫**，因為那是他要練的語言；\n\
@@ -258,7 +262,12 @@ pub struct ClozeSpec<'a> {
     pub known_sample: &'a [String],
     /// 要挖成空格的字。這些是他**已經學過**的字，不是生詞——
     /// 克漏字考的是想不想得起來，放生詞會變成考閱讀。
+    /// 可以挖空的候選字。**比要挖的格數多**——給剛好的數量等於逼模型
+    /// 把每個字都塞進文章，而有些字在那個情境下寫不自然。
     pub blank_words: &'a [String],
+    /// 要挖幾格（目標）與至少幾格（下限）
+    pub blanks_wanted: usize,
+    pub blanks_min: usize,
     pub topic: Option<&'a str>,
     /// 自訂教材摘錄。有值時模型只能用這份材料的內容與用字。
     pub material_excerpt: Option<&'a str>,
@@ -282,6 +291,8 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
         known_word_count,
         known_sample,
         blank_words,
+        blanks_wanted,
+        blanks_min,
         topic,
         material_excerpt,
     } = *spec;
@@ -292,7 +303,7 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
         target = target_lang
     );
 
-    let n = blank_words.len();
+    let n = blanks_wanted.min(blank_words.len());
     let mut prompt = format!(
         "# 學習者程度\n\
          - 已掌握約 {known} 個{target}單字\n\
@@ -302,9 +313,12 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
          2. 除了要挖掉的字以外，**只用學習者已經會的字**。\n\
             克漏字考的是「想不想得起來這個字」，不是「看不看得懂這篇」；\n\
             旁邊出現生詞的話，答不出來就分不清是哪個原因。\n\
-         3. 下面這 {n} 個字各在文章裡用剛好一次，並且把它挖成空格：\n{words_list}\n\
+         3. 從下面這些字裡**挑 {n} 個**（至少 {min} 個），各在文章裡用剛好一次，\n\
+            並且把它挖成空格：\n{words_list}\n\
             空格寫成 {{{{1}}}}、{{{{2}}}}… 依序編號，編號要跟 items 的順序一致。\n\
             **不要跳號、不要重複，也不要出現沒有對應題目的空格。**\n\
+            清單是「可以挑」不是「必須全用」：某個字硬要放進這篇會讓句子變奇怪，\n\
+            就換一個字。寧可少挖一格，也不要寫出「為了挖這個洞而存在」的句子。\n\
          4. 每一格的空缺處要有足夠線索能推出答案：前後文、搭配詞、時態。\n\
             四個選項都要是同一個詞類、看起來都放得進去，只有一個真的對。\n\
             拿另外三個要挖的字互相當選項是不行的——那樣一格答錯會連累好幾格。\n\n",
@@ -313,6 +327,7 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
         sample = known_sample.join("、"),
         words = word_count,
         n = n,
+        min = blanks_min.min(n),
         words_list = blank_words.join("、"),
     );
 
@@ -339,11 +354,10 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
          \"option_notes\": [\"每個選項各一句{native}說明\"], \
          \"explanation\": \"用{native}說明這一格在考什麼\"}}]\n\
          }}\n\
-         items 要剛好 {n} 題，第 k 題對應 {{{{k}}}} 那一格。\n\
+         items 的題數要跟你實際挖的空格數一樣，第 k 題對應 {{{{k}}}} 那一格。\n\
          {notes}",
         target = target_lang,
         native = native_lang,
-        n = n,
         notes = option_notes_rule(native_lang),
     ));
 
@@ -743,20 +757,43 @@ pub fn reading_feedback(
 /// `direction_to_target` 決定題目句子要用哪個語言寫。**這件事一定要
 /// 講到 prompt 裡**：先前不管哪個方向都說「請出 N 個{母語}句子」，
 /// 於是「英翻中」出來的題目也是中文句子，那個題型等於不存在。
-pub fn translation_task(
-    target_lang: &str,
-    native_lang: &str,
-    direction_to_target: bool,
-    material_excerpt: Option<&str>,
-    // 這次的情境主題，空字串表示不指定（有教材時就該是空的）。
-    // 沒有這個東西時，模型拿到一組日常單字只會反覆寫出同一批場景——
-    // 閱讀早就在輪換主題了，翻譯漏掉了。
-    topic: &str,
-    // 這次要練到的字。一部分是今天到期的，一部分是從學過的字裡隨機抽的
-    // （見 `practice::translation_mix`），所以文案不能寫「今天該複習的」。
-    words: &[String],
-    count: usize,
-) -> ChatRequest {
+/// 翻譯出題的規格。跟 [`ReadingSpec`]、[`ClozeSpec`] 同一個形狀——
+/// 參數多到一排 `&str` 分不清誰是誰時就該收成 struct。
+#[derive(Debug, Clone)]
+pub struct TranslationSpec<'a> {
+    pub target_lang: &'a str,
+    pub native_lang: &'a str,
+    /// 題目句子要用哪個語言寫
+    pub direction_to_target: bool,
+    pub material_excerpt: Option<&'a str>,
+    /// 這次的情境主題，空字串表示不指定（有教材時就該是空的）。
+    /// 沒有這個東西時，模型拿到一組日常單字只會反覆寫出同一批場景——
+    /// 閱讀早就在輪換主題了，翻譯漏掉了。
+    pub topic: &'a str,
+    /// 這次可以練到的字。一部分是今天到期的，一部分是從學過的字裡隨機抽的
+    /// （見 `practice::translation_mix`），所以文案不能寫「今天該複習的」。
+    ///
+    /// **給的比要用的多**：給剛好的數量等於逼模型把每個字都塞進句子，
+    /// 而有些字在那個情境下就是寫不自然。
+    pub words: &'a [String],
+    /// 題目句子還可以用哪些字。他讀得懂的字，可用可不用——
+    /// 讀不懂的話那一題考的是別的東西。
+    pub usable: &'a [String],
+    /// 要出幾題
+    pub count: usize,
+}
+
+pub fn translation_task(spec: &TranslationSpec) -> ChatRequest {
+    let TranslationSpec {
+        target_lang,
+        native_lang,
+        direction_to_target,
+        material_excerpt,
+        topic,
+        words,
+        usable,
+        count,
+    } = *spec;
     let system = format!(
         "你是一位{target}翻譯練習出題老師。你只輸出 JSON。",
         target = target_lang
@@ -788,16 +825,35 @@ pub fn translation_task(
             .collect();
         format!(
             "# 每一題各練一個字\n\
-             這些字是照著他的複習進度挑出來的，一題配一個，照這個配對出題：\n\
+             下面這些字都可以練，**挑 {count} 個**用，一題一個。\n\
+             可以挑的字：\n\
              {assignments}\
-             `target_word` 就填那一題配到的字，不要換成別的字，也不要兩題用同一個。\n\
+             `target_word` 就填那一題挑到的字，不要換成清單以外的字，\n\
+             也不要兩題用同一個。\n\
              方向是{target} → {native}時，那個字直接出現在題目句子（`source`）裡；\n\
              方向是{native} → {target}時，題目句子要寫成翻出來自然會用到它，\n\
              參考答案（`reference`）裡就會有這個字。\n\
              **出題之後系統會實際檢查**那個字（或它的變化形）有沒有出現在{target}那一句裡，\n\
-             沒有的話這一題會被退回來重寫。變化形算數：配到 borrow，句子寫 borrowed 沒問題。\n\n",
+             沒有的話這一題會被退回來重寫。變化形算數：挑到 borrow，句子寫 borrowed 沒問題。\n\n\
+             # 用字取捨\n\
+             清單是「可以挑」不是「必須全用」。哪個字寫得出自然的句子就挑哪個：\n\
+             - 一個字硬要放進去會讓句子變得奇怪、或需要硬轉話題，就換一個字。\n\
+             - 不確定這個字在這個情境的搭配詞或介系詞，也換一個——\n\
+               寧可少練一個字，也不要教他一個看起來很像但錯的用法。\n\
+             {usable_note}\n",
+            count = count,
             native = native_lang,
             target = target_lang,
+            usable_note = if usable.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n# 句子裡的其他字\n\
+                     題目句子的其他部分請用他讀得懂的字。下面這些是他會的，\n\
+                     可以用也可以不用（不必刻意塞進去）：\n{list}\n",
+                    list = usable.join("、")
+                )
+            },
         )
     };
 
@@ -924,6 +980,40 @@ pub fn option_notes_retry(
 /// 產生的文章沒通過本地覆蓋率驗收時，用這個追加訊息要求重寫。
 ///
 /// 帶上實際超標的詞，比單純說「太難了」有效得多。
+/// 生詞太少時的重試訊息。
+///
+/// 跟 [`coverage_retry`] 是相反方向的問題，所以**不能共用那一則**：
+/// 那則說的是「把難字換掉」，拿來處理一篇太簡單的文章只會讓它更簡單。
+///
+/// 這一則要講的是「白名單裡還有這些字沒用到，多寫幾句用上它們」——
+/// 90% 法則的重點正是那不足 10%，一篇全是他會的字的文章讀起來很順，
+/// 但什麼都沒學到。
+pub fn few_new_words_retry(
+    actual_coverage: f64,
+    target_coverage: f64,
+    unused: &[String],
+    previous_passage: &str,
+) -> Message {
+    Message::user(format!(
+        "這篇文章太簡單了：已知詞覆蓋率 {actual:.1}%，而目標是 {target:.1}%——
+         也就是新字放得太少，他讀完學不到東西。
+
+         你上一次寫的是：
+---
+{previous_passage}
+---
+
+         下面這些是這篇該教、但你沒有用到的字：{unused}
+         請改寫，讓其中幾個自然地出現在文章裡（每個字最好出現兩次，
+         而且前後文要推得出它的意思），其餘內容與情節盡量保留，
+         並重新輸出完整 JSON。
+         **挑得動的才用**：硬塞會讓句子變得奇怪，那比少教一個字更糟。",
+        actual = actual_coverage * 100.0,
+        target = target_coverage * 100.0,
+        unused = unused.join("、"),
+    ))
+}
+
 pub fn coverage_retry(
     actual_coverage: f64,
     target_coverage: f64,
@@ -998,6 +1088,8 @@ mod tests {
             known_word_count: 2_000,
             known_sample,
             blank_words,
+            blanks_wanted: blank_words.len(),
+            blanks_min: blank_words.len().saturating_sub(2).max(1),
             topic,
             material_excerpt: excerpt,
         }
@@ -1037,9 +1129,18 @@ mod tests {
         assert!(text.contains("hierarchy"));
         assert!(text.contains("apple"));
         assert!(text.contains("順便複習"), "{text}");
+        // 這裡原本要求「白名單盡量全部用到」，理由是「不然模型會挑著用」。
+        // 現在**刻意讓它挑**：候選給得比需要的多，全部用上等於逼它把每個字
+        // 都塞進去，而有些字在那個情境下就是寫不自然（實測一篇克漏字為了用
+        // 掉 fall，寫出「In fall, the room was quiet」）。
+        // 用幾個由覆蓋率決定，那才是「固定比例的新字」真正的意思。
         assert!(
-            text.contains("盡量全部用到"),
-            "新詞要講明必須全用，不然模型會挑著用：{text}"
+            text.contains("不必全用"),
+            "候選是給模型挑的，不是要它全部塞進去：{text}"
+        );
+        assert!(
+            text.contains("為了用這個字而存在"),
+            "「不要硬塞」要給得出可操作的判準，光說「自然一點」沒有作用：{text}"
         );
         assert!(
             text.contains("粗俗"),
@@ -1145,21 +1246,31 @@ mod tests {
     #[test]
     fn translation_can_be_confined_to_a_material() {
         let due = vec!["weather".to_string()];
-        let req = translation_task(
-            "English",
-            "繁體中文",
-            true,
-            Some("Lesson 3: At the market."),
-            "",
-            &due,
-            3,
-        );
+        let req = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: true,
+            material_excerpt: Some("Lesson 3: At the market."),
+            topic: "",
+            words: &due,
+            usable: &[],
+            count: 3,
+        });
         let text = req.messages[0].content.clone();
         assert!(text.contains("At the market."));
         assert!(text.contains("只能"), "沒有講清楚是硬限制：{text}");
 
         // 沒指定教材時整段不該出現，否則模型會看到一個空的「指定教材」
-        let free = translation_task("English", "繁體中文", true, None, "", &due, 3);
+        let free = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: true,
+            material_excerpt: None,
+            topic: "",
+            words: &due,
+            usable: &[],
+            count: 3,
+        });
         assert!(!free.messages[0].content.contains("指定教材"));
     }
 
@@ -1171,7 +1282,16 @@ mod tests {
     fn translation_asks_for_a_different_scene_in_every_item() {
         let due = vec!["weather".to_string()];
 
-        let with_topic = translation_task("English", "繁體中文", true, None, "旅行：訂房", &due, 3);
+        let with_topic = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: true,
+            material_excerpt: None,
+            topic: "旅行：訂房",
+            words: &due,
+            usable: &[],
+            count: 3,
+        });
         let text = with_topic.messages[0].content.clone();
         assert!(text.contains("旅行：訂房"), "主題沒進 prompt：{text}");
         assert!(
@@ -1180,7 +1300,16 @@ mod tests {
         );
 
         // 沒有主題時「情境要有變化」仍然要講——那時候收斂得更嚴重
-        let no_topic = translation_task("English", "繁體中文", true, None, "", &due, 3);
+        let no_topic = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: true,
+            material_excerpt: None,
+            topic: "",
+            words: &due,
+            usable: &[],
+            count: 3,
+        });
         let text = no_topic.messages[0].content.clone();
         assert!(text.contains("場合"), "沒主題時更需要這段：{text}");
         assert!(
@@ -1260,7 +1389,16 @@ mod tests {
     fn the_source_sentence_language_follows_the_direction() {
         let due = vec!["weather".to_string()];
 
-        let to_target = translation_task("English", "繁體中文", true, None, "", &due, 3);
+        let to_target = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: true,
+            material_excerpt: None,
+            topic: "",
+            words: &due,
+            usable: &[],
+            count: 3,
+        });
         let text = &to_target.messages[0].content;
         assert!(
             text.contains("繁體中文 → English"),
@@ -1271,7 +1409,16 @@ mod tests {
             "中翻英的題目句子該是中文：{text}"
         );
 
-        let to_native = translation_task("English", "繁體中文", false, None, "", &due, 3);
+        let to_native = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: false,
+            material_excerpt: None,
+            topic: "",
+            words: &due,
+            usable: &[],
+            count: 3,
+        });
         let text = &to_native.messages[0].content;
         assert!(text.contains("English → 繁體中文"), "{text}");
         assert!(
@@ -1305,9 +1452,15 @@ mod tests {
         let text = &req.messages[0].content;
 
         assert!(text.contains("borrow"));
-        assert!(text.contains("這 2 個字"), "{text}");
+        // 候選比要挖的多，所以講的是「挑幾個」而不是「這幾個字」——
+        // 給剛好的數量等於逼模型把每個字都塞進文章
+        assert!(text.contains("挑 2 個"), "{text}");
+        assert!(text.contains("至少"), "要給下限，否則挑一個也算數：{text}");
         assert!(text.contains("{{1}}"), "沒有講清楚空格怎麼寫：{text}");
-        assert!(text.contains("剛好 2 題"), "題數要對得上空格數：{text}");
+        assert!(
+            text.contains("題數要跟你實際挖的空格數一樣"),
+            "題數要對得上空格數：{text}"
+        );
         assert!(
             text.contains("只用學習者已經會的字"),
             "克漏字考的是想不想得起來，不是看不看得懂：{text}"
@@ -1486,7 +1639,16 @@ mod tests {
     #[test]
     fn translation_task_reuses_due_words() {
         let due = vec!["borrow".to_string(), "return".to_string()];
-        let req = translation_task("English", "繁體中文", true, None, "", &due, 3);
+        let req = translation_task(&TranslationSpec {
+            target_lang: "English",
+            native_lang: "繁體中文",
+            direction_to_target: true,
+            material_excerpt: None,
+            topic: "",
+            words: &due,
+            usable: &[],
+            count: 3,
+        });
         let text = &req.messages[0].content;
         assert!(text.contains("borrow"));
         assert!(text.contains("出 3 個"));

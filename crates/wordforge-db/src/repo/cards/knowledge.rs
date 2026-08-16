@@ -134,6 +134,44 @@ pub async fn shaky_words(
     Ok(words)
 }
 
+/// 學過、但還沒有任何例句的字。
+///
+/// 「例句」指的是使用者自己做過的句子（`word_sentence`），不是字典收錄的。
+/// 這些字他學過、也複習過，卻從來沒有在一句真的句子裡用到——複習時
+/// 只看得到釋義，印象最薄。出題時優先把它們放進可用池，讓模型有機會用上。
+///
+/// 隨機排序：這是個偏好而不是排程，每次拿同一批的話，模型跳過的那幾個
+/// 就永遠輪不到。
+pub async fn words_without_sentences(
+    db: &Db,
+    profile_id: ProfileId,
+    lang: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let words: Vec<String> = sqlx::query_scalar(
+        "SELECT l.text
+         FROM card c JOIN lemma l ON l.id = c.lemma_id
+         WHERE c.profile_id = ?1 AND c.suspended = 0
+           AND l.lang = ?2 AND c.state = 'review'
+           AND NOT EXISTS (
+               SELECT 1 FROM word_sentence w
+               WHERE w.profile_id = ?1 AND w.lemma_id = c.lemma_id
+           )
+         GROUP BY l.text
+         ORDER BY RANDOM()
+         LIMIT ?3",
+    )
+    .bind(profile_id.0)
+    .bind(lang)
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(words)
+}
+
 /// 從「已經學會的字」裡隨機抽幾個。
 ///
 /// 跟 [`shaky_words`] 和 `due_words` 都不一樣：那兩個都是**有順序的**
@@ -374,6 +412,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shaky, vec!["weak", "strong"]);
+    }
+
+    /// 學過但還沒在任何句子裡用過的字要挑得出來——出題時優先給模型用，
+    /// 那些字複習時只看得到釋義，印象最薄。
+    #[tokio::test]
+    async fn words_without_sentences_finds_the_ones_never_used() {
+        let (db, profile) = setup().await;
+        let used = add_word(&db, "borrow", 100).await;
+        let unused = add_word(&db, "reluctant", 200).await;
+        for lemma in [used, unused] {
+            let card = cards::ensure(&db, profile, lemma, CardKind::Recognition, t0())
+                .await
+                .unwrap();
+            let scheduler = wordforge_core::srs::Scheduler::default();
+            let (next, log) = scheduler.review(&card, Rating::Easy, t0(), None);
+            cards::record_review(&db, &next, &log).await.unwrap();
+        }
+
+        // 只有 borrow 在句子裡用過
+        let exercise = crate::exercises::create(
+            &db,
+            crate::exercises::NewExercise {
+                profile_id: profile,
+                kind: "translation_to_target",
+                payload_json: "{}",
+                target_words: &[],
+                coverage: None,
+                model: None,
+                material_id: None,
+                topic: None,
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+        crate::word_sentences::record(
+            &db,
+            crate::word_sentences::NewSentence {
+                profile_id: profile,
+                lemma_id: used,
+                exercise_id: exercise.0,
+                text: "I borrowed a book.",
+                translation: None,
+                origin: "translation",
+                item_index: Some(0),
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let got = cards::words_without_sentences(&db, profile, "en", 10)
+            .await
+            .unwrap();
+        assert_eq!(got, vec!["reluctant".to_string()], "用過的字不該再排進來");
     }
 
     /// 沒學過的新卡不算「不熟」——那是「不會」，屬於生詞白名單那條路。

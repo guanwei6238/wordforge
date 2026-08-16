@@ -16,8 +16,8 @@ use wordforge_db::repo::{NewLemma, cards, lemmas, profiles};
 use wordforge_llm::{ChatRequest, ChatResponse, LlmProvider};
 use wordforge_practice::{GradeInput, PracticeEngine};
 
-/// 翻譯出題 prompt 裡「一題配一個字」那份清單的標題。
-const ASSIGNMENT_HEADER: &str = "照這個配對出題：";
+/// 翻譯出題 prompt 裡那份候選字清單的標題。
+const ASSIGNMENT_HEADER: &str = "可以挑的字：";
 
 /// 依序回傳預設答案的假模型，同時記下收到的 prompt。
 struct FakeLlm {
@@ -84,6 +84,14 @@ impl FakeLlm {
 /// （母語 → 目標語看 `reference`，反過來看 `source`），
 /// 兩邊都寫上去，這個假模型就對兩個方向都成立。
 fn echoed_translation(prompt: &str) -> String {
+    // 候選比要用的多，所以假模型也要**挑**——出滿候選數的話，
+    // 測試就驗不到「給 8 個挑 5 個」這件事
+    let want: usize = prompt
+        .split_once("挑 ")
+        .and_then(|(_, rest)| rest.split_once(' '))
+        .and_then(|(n, _)| n.trim_end_matches('*').parse().ok())
+        .unwrap_or(usize::MAX);
+
     let words: Vec<&str> = match prompt.split_once(ASSIGNMENT_HEADER) {
         Some((_, rest)) => rest
             .lines()
@@ -100,6 +108,7 @@ fn echoed_translation(prompt: &str) -> String {
 
     let items: Vec<String> = words
         .iter()
+        .take(want)
         .map(|w| {
             format!(r#"{{"source":"Please {w} it.","target_word":"{w}","reference":"I {w} it."}}"#)
         })
@@ -1602,7 +1611,9 @@ async fn a_word_already_taught_is_never_offered_as_new_again() {
     make_rare(&db, 4, 3_500).await;
     make_rare(&db, 5, 3_600).await;
 
-    let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat.",
+    // 文章要真的教到那個生詞：全是已知詞的話覆蓋率會漂亮到被判「太簡單」，
+    // 而這條測的是「教過的字不會再被當成新字」
+    let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat solitary.",
         "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let graded = r#"{"score":100,"items":[{"index":1,"correct":true}],"unknown_words":[]}"#;
     let llm = FakeLlm::new(&[passage, graded, passage, graded, passage]);
@@ -1814,10 +1825,18 @@ async fn two_translations_in_a_row_do_not_reuse_the_same_words() {
     let engine = PracticeEngine::new(&db, &llm);
 
     let later = t0() + Duration::days(400);
+    // 只看**硬性池**那一段（「可以挑的字」底下的編號清單）。
+    // 可用池是「他讀得懂的字」，整個牌組本來就都在裡面，
+    // 掃整份 prompt 會把那些也算進來。
     let used = |prompt: &str| -> Vec<String> {
+        let pool = prompt
+            .split_once(ASSIGNMENT_HEADER)
+            .and_then(|(_, rest)| rest.split_once("`target_word`"))
+            .map(|(list, _)| list.to_string())
+            .unwrap_or_default();
         words
             .iter()
-            .filter(|w| prompt.contains(**w))
+            .filter(|w| pool.contains(**w))
             .map(|w| w.to_string())
             .collect()
     };
@@ -2742,7 +2761,9 @@ async fn cloze_does_not_flush_the_reading_word_history() {
     }
     study(&db, profile, 4).await;
 
-    let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat.",
+    // 文章要真的教到一個生詞：全是已知詞的話覆蓋率會漂亮到被判「太簡單」，
+    // 那是另一條驗收（這條測的是記憶視窗）
+    let passage = r#"{"title":"T","passage":"The cat sat. The cat sat. The cat sat. The cat sat rare00.",
         "questions":[{"question":"Q","options":["A","B"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
     let cloze = r#"{"title":"C","passage":"Please {{1}} it.",
         "items":[{"options":["borrow","lend"],"option_notes":["note1","note2"],"answer_index":0}]}"#;
@@ -2798,14 +2819,16 @@ async fn blanks_written_out_of_order_are_renumbered_not_rejected() {
         study(&db, profile, lemma).await;
     }
 
-    // 空格照 2、4、1、3 的順序出現，選項用可辨識的字串標記原本的題號
+    // 空格照 2、4、1、3 的順序出現。正解用真的候選字（a1…a4）——
+    // 挖空的字必須來自候選，那是驗收的一部分，假字串在真實情況不會發生。
+    // 第 k 題的正解是 a{k}，所以重排之後對不對得上一眼就看得出來。
     let llm = FakeLlm::new(&[r#"{"title":"T",
         "passage":"w {{2}} x {{4}} y {{1}} z {{3}}.",
         "items":[
-          {"options":["one-right","one-wrong"],"option_notes":["note1","note2"],"answer_index":0},
-          {"options":["two-right","two-wrong"],"option_notes":["note1","note2"],"answer_index":0},
-          {"options":["three-right","three-wrong"],"option_notes":["note1","note2"],"answer_index":0},
-          {"options":["four-right","four-wrong"],"option_notes":["note1","note2"],"answer_index":0}
+          {"options":["a1","wrong1"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["a2","wrong2"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["a3","wrong3"],"option_notes":["note1","note2"],"answer_index":0},
+          {"options":["a4","wrong4"],"option_notes":["note1","note2"],"answer_index":0}
         ]}"#]);
 
     let engine = PracticeEngine::new(&db, &llm);
@@ -2834,7 +2857,7 @@ async fn blanks_written_out_of_order_are_renumbered_not_rejected() {
         .collect();
     assert_eq!(
         answered,
-        vec!["two-right", "four-right", "one-right", "three-right"],
+        vec!["a2", "a4", "a1", "a3"],
         "題目沒有跟著空格的順序重排"
     );
 }

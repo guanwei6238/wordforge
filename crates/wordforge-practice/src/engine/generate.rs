@@ -18,7 +18,10 @@ impl PracticeEngine<'_> {
         now: OffsetDateTime,
     ) -> Result<ExerciseView> {
         let count = practice::translation_count(learner.vocabulary);
-        let words = self.translation_words(profile_id, count, now).await?;
+        // 硬性池比題數多：給剛好的數量等於逼模型把每個字都塞進句子，
+        // 而有些字在那個情境下就是寫不自然
+        let choices = ((count as f64) * SENTENCE_CHOICE_FACTOR).ceil() as usize;
+        let words = self.translation_words(profile_id, choices, now).await?;
         // 湊不出那麼多字就少出幾題。硬湊只能拿沒學過的字填，
         // 那等於要他寫出從沒見過的單字——寧可這次只練三題。
         // 一個字都沒有時保持原題數：那時模型是自由造句，不受單字限制。
@@ -27,6 +30,11 @@ impl PracticeEngine<'_> {
         } else {
             count.min(words.len())
         };
+
+        // 題目句子的其他用字要是他讀得懂的——讀不懂的話那一題考的是別的東西
+        let usable = self
+            .sentence_pool(profile_id, learner.vocabulary, SENTENCE_WORD_POOL)
+            .await?;
 
         let excerpt = self
             .material_excerpt(&words, now.unix_timestamp() as u64)
@@ -45,15 +53,16 @@ impl PracticeEngine<'_> {
                 .await?
         };
 
-        let mut req = prompts::translation_task(
-            self.target_name(),
-            self.native_name(),
-            kind == ExerciseKind::TranslationToTarget,
-            excerpt.as_deref(),
-            topic.as_deref().unwrap_or(""),
-            &words,
+        let mut req = prompts::translation_task(&prompts::TranslationSpec {
+            target_lang: self.target_name(),
+            native_lang: self.native_name(),
+            direction_to_target: kind == ExerciseKind::TranslationToTarget,
+            material_excerpt: excerpt.as_deref(),
+            topic: topic.as_deref().unwrap_or(""),
+            words: &words,
+            usable: &usable,
             count,
-        );
+        });
 
         // 每個字的家族詞形先查好，驗收才問得出「這句有沒有真的練到它」。
         // 查在迴圈外：驗收本身要是同步的（`ask_valid_json` 每次重試都會
@@ -98,6 +107,10 @@ impl PracticeEngine<'_> {
             return Err(PracticeError::BadResponse("一題都沒產出來".into()));
         }
 
+        // 存的是**真的用到的字**，不是整個池子。沒被挑中的字記成「練過了」
+        // 的話，輪換會跳過它，而它其實一次都還沒練到。
+        let practised: Vec<String> = items.iter().filter_map(|i| i.target_word.clone()).collect();
+
         let body = ExerciseBody::Translation {
             to_target: kind == ExerciseKind::TranslationToTarget,
             items,
@@ -105,8 +118,16 @@ impl PracticeEngine<'_> {
         // 主題一定要存回去，否則 `recent_topics` 永遠是空的、`pick_topic`
         // 永遠從同一個位置挑，輪換等於沒有開。空字串存成 NULL——
         // 存進去的話它會佔掉一個記憶名額，還會被當成「用過的主題」。
-        self.store(profile_id, kind, body, words, None, topic.as_deref(), now)
-            .await
+        self.store(
+            profile_id,
+            kind,
+            body,
+            practised,
+            None,
+            topic.as_deref(),
+            now,
+        )
+        .await
     }
 
     pub(super) async fn generate_reading(
@@ -126,7 +147,9 @@ impl PracticeEngine<'_> {
             KNOWN_STABILITY_DAYS,
         )
         .await?;
-        let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
+        let known_sample = self
+            .usable_pool(profile_id, learner.vocabulary, PROSE_WORD_POOL)
+            .await?;
         let word_count = practice::reading_length(learner.vocabulary);
 
         // 覆蓋率目標由使用者設定。90% 是常被引用的數字，但多少最舒服
@@ -184,8 +207,11 @@ impl PracticeEngine<'_> {
             &fresh
         };
 
+        // 候選給兩倍，讓模型挑得動：給剛好 budget 個等於逼它每個都塞進去，
+        // 而有些字在那個情境下寫不自然。實際要用幾個由覆蓋率決定，
+        // 不是數字說了算——那才是「固定比例的新字」真正的意思。
         let target_words: Vec<String> =
-            practice::balance_by_pos(pool, practice::DESIRED_POS, budget)
+            practice::balance_by_pos(pool, practice::DESIRED_POS, budget * PROSE_CHOICE_FACTOR)
                 .into_iter()
                 .map(|w| w.text)
                 .collect();
@@ -256,9 +282,15 @@ impl PracticeEngine<'_> {
                 "覆蓋率驗收"
             );
 
-            // 只有「太難」才重寫。太簡單也不理想（這次學不到新字），
-            // 但重試訊息講的是「把難字換掉」，拿去處理太簡單的文章只會更糟；
-            // 而且對學習者來說，讀一篇太簡單的文章無害，讀不懂的才是災難。
+            // 兩個方向都要驗，但**各有各的重試訊息**：
+            //
+            //   太難   → 把難字換掉（`coverage_retry`）
+            //   太簡單 → 白名單裡的字沒用夠（`few_new_words_retry`）
+            //
+            // 共用一則會更糟——「把難字換掉」拿去處理一篇太簡單的文章，
+            // 只會讓它更簡單。太簡單以前是放過的，但那等於這一篇沒東西可學，
+            // 而 90% 法則的重點正是那不足 10%。
+            //
             // 完全沒有已知詞資料時（還沒做分級測驗、牌組也是空的），
             // 覆蓋率必定是 0，重寫幾次都一樣。與其燒兩次額度，不如接受。
             let no_baseline = known.is_empty();
@@ -269,7 +301,14 @@ impl PracticeEngine<'_> {
             // 「太難」要跟著設定走。原本用寫死的難度帶（<90% 才算太難），
             // 使用者把目標設成 98% 的話那個判斷完全不會生效。
             let too_hard = coverage.ratio() < target_coverage - COVERAGE_TOLERANCE;
-            let acceptable = !too_hard || no_baseline || attempt == COVERAGE_RETRIES;
+            // 「太簡單」的界線跟著目標走，不寫死：生詞量少於目標的一半就算不夠。
+            // 目標 96%（生詞 4%）時界線是 98%（生詞 2%）；目標 90% 時是 95%。
+            //
+            // 沒有生詞白名單時不檢查——那時要求「多用幾個白名單的字」是在
+            // 要求一件做不到的事（候選被牌組排光的新使用者就是這種狀態）。
+            let too_easy = !target_words.is_empty()
+                && coverage.ratio() > target_coverage + (1.0 - target_coverage) / 2.0;
+            let acceptable = (!too_hard && !too_easy) || no_baseline || attempt == COVERAGE_RETRIES;
             if acceptable {
                 let mut questions: Vec<ChoiceItem> = parse_choice_items(&value, "questions");
 
@@ -334,6 +373,20 @@ impl PracticeEngine<'_> {
                     .await;
             }
 
+            // 太簡單是相反的問題：白名單裡的字沒用夠。要講出「哪幾個沒用到」，
+            // 光說「太簡單」模型只會再寫一篇差不多的
+            if too_easy {
+                let unused = self.unused_targets(&passage, &target_words).await?;
+                tracing::info!(ratio = coverage.ratio(), ?unused, "生詞不足，要求多用幾個");
+                req.messages.push(prompts::few_new_words_retry(
+                    coverage.ratio(),
+                    target_coverage,
+                    &unused,
+                    &passage,
+                ));
+                continue;
+            }
+
             // 帶著實際超標的詞重試，比單純說「太難了」有效得多
             let offenders: Vec<String> = coverage
                 .unknown_types
@@ -371,12 +424,14 @@ impl PracticeEngine<'_> {
     ) -> Result<ExerciseView> {
         // 挖「快忘掉的字」優先，補不夠再拿今天到期的。
         // 逾期三週的字在句子裡再想起來一次，價值比剛好今天到期的高。
+        // 候選給兩倍，模型挑 CLOZE_BLANKS 個挖空（至少 CLOZE_MIN_BLANKS 個）
+        let choices = CLOZE_BLANKS * PROSE_CHOICE_FACTOR as i64;
         let mut blanks = cards::shaky_words(
             self.db,
             ProfileId(profile_id),
             &self.target_lang,
             now,
-            CLOZE_BLANKS,
+            choices,
         )
         .await?;
         // 補不夠時拿今天到期的，但**只拿學過的**。
@@ -384,11 +439,8 @@ impl PracticeEngine<'_> {
         // `due_words` 不看 reps：牌組裡剛加進去、他從來沒看過的新卡
         // 也算「到期」。拿那種字來挖空，考的就不是「想不想得起來」，
         // 而是「猜不猜得中」——四個選項裡他一個都沒學過。
-        for word in self
-            .studied_due_words(profile_id, CLOZE_BLANKS, now)
-            .await?
-        {
-            if blanks.len() >= CLOZE_BLANKS as usize {
+        for word in self.studied_due_words(profile_id, choices, now).await? {
+            if blanks.len() >= choices as usize {
                 break;
             }
             if !blanks.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
@@ -402,7 +454,9 @@ impl PracticeEngine<'_> {
             ));
         }
 
-        let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
+        let known_sample = self
+            .usable_pool(profile_id, learner.vocabulary, PROSE_WORD_POOL)
+            .await?;
         let excerpt = self
             .material_excerpt(&blanks, now.unix_timestamp() as u64)
             .await?;
@@ -413,6 +467,12 @@ impl PracticeEngine<'_> {
         // 指定教材時取材範圍由課本決定，主題輪換就不該再插手
         let topic = if excerpt.is_some() { None } else { topic };
 
+        // 下限要跟著候選數走，而且**要留餘裕**：牌組小的時候只湊得出三個字，
+        // 要求全挖等於又回到「每個字都得塞進去」。取候選的一半與
+        // CLOZE_MIN_BLANKS 的小者——候選滿額（16）時就是 6 格。
+        // 這條的形狀是測試抓出來的。
+        let min_blanks = CLOZE_MIN_BLANKS.min(blanks.len() / 2).max(1);
+
         let mut req = prompts::cloze_passage(&prompts::ClozeSpec {
             target_lang: self.target_name(),
             native_lang: self.native_name(),
@@ -420,16 +480,19 @@ impl PracticeEngine<'_> {
             known_word_count: learner.vocabulary as usize,
             known_sample: &known_sample,
             blank_words: &blanks,
+            blanks_wanted: CLOZE_BLANKS as usize,
+            blanks_min: min_blanks,
             topic: topic.as_deref(),
             material_excerpt: excerpt.as_deref(),
         });
+        // 挖的字必須來自候選：模型挖了別的字時畫面上完全正常，
+        // 只是他複習到的不是他該複習的那些字
         let value = self
-            .ask_valid_json(
-                profile_id,
-                "generate",
-                &mut req,
-                crate::validate::check_cloze,
-            )
+            .ask_valid_json(profile_id, "generate", &mut req, |v| {
+                let mut problems = crate::validate::check_cloze(v);
+                problems.extend(crate::validate::check_blank_words(v, &blanks, min_blanks));
+                problems
+            })
             .await?;
 
         let passage = value
@@ -543,7 +606,9 @@ impl PracticeEngine<'_> {
             None => prompts::DrillFocus::Weak(&learner.weak_grammar),
         };
 
-        let known_sample = self.known_sample(profile_id, learner.vocabulary).await?;
+        let known_sample = self
+            .known_sample(profile_id, learner.vocabulary, KNOWN_SAMPLE)
+            .await?;
         let excerpt = self
             .material_excerpt(&wanted, now.unix_timestamp() as u64)
             .await?;

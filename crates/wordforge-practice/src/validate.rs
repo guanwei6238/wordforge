@@ -234,6 +234,63 @@ pub struct TranslationSpec<'a> {
     pub target_lang: &'a str,
 }
 
+/// 克漏字挖的字必須來自候選清單，而且不能挖太少。
+///
+/// prompt 講的是「從這些字裡挑 n 個」，但那只是請求。模型挖了別的字時
+/// 畫面上完全正常——每一格都有四個選項、都答得出來——只是他複習到的
+/// 不是他該複習的那些字，而那正是這個題型存在的理由。
+///
+/// 挖太少也要抓：一篇 300 詞的文章挖三個洞，做起來像順便填空。
+pub fn check_blank_words(value: &Value, candidates: &[String], min_blanks: usize) -> Vec<Problem> {
+    let Some(items) = value.get("items").and_then(|v| v.as_array()) else {
+        // 陣列本身的問題由 `check_cloze` 報，這裡不重複講一次
+        return Vec::new();
+    };
+
+    // 用**文章裡真的有幾個空格**判斷，不是題數：模型偶爾會多寫幾題沒有
+    // 對應空格的，那些在本地就會被截掉（`renumber_blanks`），
+    // 不該讓它們把「挖了幾格」灌水。
+    let passage = value.get("passage").and_then(|p| p.as_str()).unwrap_or("");
+    let blanks = wordforge_core::practice::blank_numbers(passage).len();
+
+    let mut problems = Vec::new();
+    if blanks < min_blanks {
+        problems.push(Problem::new(
+            "/passage",
+            format!(
+                "只挖了 {blanks} 格，至少要 {min_blanks} 格。挖太少的話做起來\
+                 像順便填空，考不到「在句子裡想不想得起來」。"
+            ),
+        ));
+    }
+
+    let known = |word: &str| {
+        let normalized = wordforge_core::text::normalize(word);
+        candidates
+            .iter()
+            .any(|c| wordforge_core::text::normalize(c) == normalized)
+    };
+
+    // 同樣只看有對應空格的那幾題
+    for (i, item) in items.iter().take(blanks).enumerate() {
+        let Ok(parsed) = serde_json::from_value::<ChoiceItem>(item.clone()) else {
+            continue; // 格式問題由 `check_cloze` 報
+        };
+        let Some(answer) = parsed.options.get(parsed.answer_index) else {
+            continue;
+        };
+        if !known(answer) {
+            problems.push(Problem::new(
+                format!("/items/{i}/options/{}", parsed.answer_index),
+                format!(
+                    "正解是「{answer}」，但它不在可以挖的字裡面。                     這些空格要考的是他正在複習的字，換成清單裡的字。"
+                ),
+            ));
+        }
+    }
+    problems
+}
+
 /// 翻譯題的回應。
 ///
 /// ## 為什麼要驗「有沒有用到那個字」
@@ -507,6 +564,59 @@ mod tests {
             word: word.to_string(),
             forms: forms.iter().map(|f| f.to_string()).collect(),
         }
+    }
+
+    /// 這條測試存在的理由是它曾經完全沒有被驗過：prompt 說「從這些字裡挑」，
+    /// 但模型挖了別的字時畫面上完全正常——每一格都有四個選項、都答得出來——
+    /// 只是他複習到的不是他該複習的那些字，而那正是這個題型存在的理由。
+    #[test]
+    fn a_blank_outside_the_candidates_is_reported() {
+        let candidates = ["borrow".to_string(), "return".to_string()];
+        let v = json!({
+            "passage": "Please {{1}} it back. I will {{2}} later.",
+            "items": [
+                {"options": ["return", "lend"], "answer_index": 0},
+                {"options": ["sing", "dance"], "answer_index": 0},
+            ]
+        });
+        let problems = check_blank_words(&v, &candidates, 2);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].path, "/items/1/options/0");
+        assert!(problems[0].detail.contains("sing"), "要講出挖到的是哪個字");
+    }
+
+    /// 挖太少要抓：一篇文章挖兩個洞，做起來像順便填空。
+    /// 用**文章裡真的有幾個空格**判斷，不是題數——多出來的題目本地會截掉。
+    #[test]
+    fn too_few_blanks_is_reported_by_the_passage_not_the_item_count() {
+        let candidates = ["borrow".to_string()];
+        let v = json!({
+            "passage": "Please {{1}} it.",
+            "items": [
+                {"options": ["borrow", "lend"], "answer_index": 0},
+                {"options": ["borrow", "lend"], "answer_index": 0},
+                {"options": ["borrow", "lend"], "answer_index": 0},
+            ]
+        });
+        let problems = check_blank_words(&v, &candidates, 3);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].path, "/passage");
+        assert!(problems[0].detail.contains("只挖了 1 格"));
+    }
+
+    /// 挑得比候選少是**允許的**——那正是「給 m 個挑 n 個」的重點。
+    #[test]
+    fn using_fewer_words_than_offered_is_fine() {
+        let candidates = [
+            "borrow".to_string(),
+            "return".to_string(),
+            "lend".to_string(),
+        ];
+        let v = json!({
+            "passage": "Please {{1}} it back.",
+            "items": [{"options": ["return", "sing"], "answer_index": 0}]
+        });
+        assert_eq!(check_blank_words(&v, &candidates, 1), Vec::new());
     }
 
     #[test]
