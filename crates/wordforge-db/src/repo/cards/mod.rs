@@ -25,7 +25,7 @@ pub use deck::{
     suspend_easy_new_cards, suspend_other_languages, tag_summary, unsuspend,
 };
 pub use knowledge::{
-    known_lemma_ids, known_vocabulary, sample_known_words, shaky_words, words_without_sentences,
+    known_lemma_ids, known_vocabulary, sample_known_words, shaky_words, words_with_few_sentences,
 };
 pub use queue::{QueueStatus, daily_counts, daily_queue, new_cards_introduced_today, queue_status};
 

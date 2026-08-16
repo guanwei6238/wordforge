@@ -278,12 +278,13 @@ impl PracticeEngine<'_> {
     ///
     /// 兩段組成：
     ///
-    /// 1. 學過但**還沒有例句**的字（上限 `NO_SENTENCE_SHARE`）——那些字複習時
-    ///    只看得到釋義，讓模型有機會把它們寫進一句真的句子裡
+    /// 1. 學過但**做過的句子還很少**的字（上限 `NO_SENTENCE_SHARE`，句子最少的
+    ///    優先）——那些字複習時幾乎只看得到釋義，讓模型有機會把它們寫進
+    ///    一句真的句子裡
     /// 2. 其餘從已知詞分帶隨機抽（[`known_sample`]），維持程度分布
     ///
     /// 第一段實際填幾個取「比例」與「真的有幾個」的小者：使用者的資料
-    /// 現在只有 54 個沒例句的字，硬填會變成同一批重複。
+    /// 現在只有 54 個一句都沒有的字，硬填會變成同一批重複。
     ///
     /// [`known_sample`]: Self::known_sample
     pub(super) async fn usable_pool(
@@ -293,10 +294,11 @@ impl PracticeEngine<'_> {
         size: i64,
     ) -> Result<Vec<String>> {
         let want_fresh = ((size as f64) * NO_SENTENCE_SHARE) as i64;
-        let mut pool = cards::words_without_sentences(
+        let mut pool = cards::words_with_few_sentences(
             self.db,
             ProfileId(profile_id),
             &self.target_lang,
+            FEW_SENTENCES,
             want_fresh,
         )
         .await?;
@@ -332,10 +334,11 @@ impl PracticeEngine<'_> {
         size: i64,
     ) -> Result<Vec<String>> {
         let want_fresh = ((size as f64) * NO_SENTENCE_SHARE) as i64;
-        let mut pool = cards::words_without_sentences(
+        let mut pool = cards::words_with_few_sentences(
             self.db,
             ProfileId(profile_id),
             &self.target_lang,
+            FEW_SENTENCES,
             want_fresh,
         )
         .await?;
