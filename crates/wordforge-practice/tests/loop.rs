@@ -2421,6 +2421,79 @@ async fn a_sentence_carries_the_grammar_points_you_tripped_on() {
     );
 }
 
+/// 這條測試存在的理由是它曾經是錯的：句子排程只在**批改的當下**寫入，
+/// 所以句子複習這個功能上線之前做過的練習一句都沒排進去。實測使用者的
+/// 資料庫裡 10 份翻譯練習只有最後一份有排程，前面 9 份共 35 句答錯的
+/// 永遠不會回來——而那些正是最該回來的。
+///
+/// 逐題對錯還留在 `attempt.feedback_json` 裡，所以補得回來。
+#[tokio::test]
+async fn old_exercises_get_their_wrong_sentences_back_into_review() {
+    use wordforge_db::exercises::{self, NewExercise};
+    use wordforge_db::sentences;
+
+    let (db, profile) = setup(&["alpha", "beta"]).await;
+
+    // 一份「排程功能還不存在時做過」的翻譯練習：第 0 題錯、第 1 題對
+    let payload = r#"{"kind":"translation","to_target":true,"items":[
+        {"source":"我借了一本書","reference":"I borrowed a book.","target_word":"alpha"},
+        {"source":"她跑去車站","reference":"She ran to the station.","target_word":"beta"}]}"#;
+    let exercise = exercises::create(
+        &db,
+        NewExercise {
+            profile_id: ProfileId(profile),
+            kind: "translation_to_target",
+            payload_json: payload,
+            target_words: &[],
+            coverage: None,
+            model: None,
+            material_id: None,
+            topic: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+    exercises::record_attempt(
+        &db,
+        exercise,
+        "{}",
+        Some(50.0),
+        r#"{"score":50,"items":[{"index":0,"correct":false},{"index":1,"correct":true}],
+           "corrections":[],"unknown_words":[]}"#,
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let llm = FakeLlm::new(&[]);
+    let engine = PracticeEngine::new(&db, &llm);
+    assert_eq!(
+        engine
+            .backfill_sentence_reviews(profile, t0() + Duration::days(3))
+            .await
+            .unwrap(),
+        1,
+        "答錯的那一句要補進排程"
+    );
+
+    let due = sentences::due(&db, ProfileId(profile), t0() + Duration::days(3), 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1, "寫對的那一句不該回來");
+    assert_eq!(due[0].item_index, 0);
+
+    // 版號守著：重跑不該讓錯誤次數憑空多一次
+    assert_eq!(
+        engine
+            .backfill_sentence_reviews(profile, t0() + Duration::days(3))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(due[0].misses, 1);
+}
+
 /// 「這句我錯過幾次」要在句子練起來之後**還留著**。
 ///
 /// 次數本來記在排程那張表，但句子寫對之後那一列會被刪掉——那正是

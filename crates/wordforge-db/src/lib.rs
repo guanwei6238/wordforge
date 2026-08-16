@@ -14,7 +14,9 @@ pub mod meta;
 pub mod repo;
 pub mod sentences;
 pub mod topics;
-pub(crate) mod ts;
+/// 時間戳的字串格式。公開是因為別的 crate 也要解析同一份格式——
+/// 各自複製一份 format description 遲早會漂移。
+pub mod ts;
 pub mod word_sentences;
 
 use std::path::Path;

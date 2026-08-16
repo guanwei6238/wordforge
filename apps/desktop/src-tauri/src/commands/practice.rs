@@ -304,12 +304,31 @@ pub struct DueSentenceView {
 ///
 /// 答錯的句子明天回來，答對的從此不再出現——「練到 100 分」就是
 /// 這條清單清空。
+///
+/// 第一次呼叫會順便把舊練習答錯的句子補進排程：排程是在批改的當下
+/// 寫入的，所以這個功能上線之前做過的練習一句都沒排進去。
 #[tauri::command]
 pub async fn due_sentences(
     state: tauri::State<'_, AppState>,
     profile_id: i64,
     limit: i64,
 ) -> CmdResult<Vec<DueSentenceView>> {
+    // 補寫不需要模型，但 engine 要一個 provider 才建得起來
+    if let Ok(dummy) = wordforge_llm::CliLlm::new(wordforge_llm::CliConfig::claude_code()) {
+        match PracticeEngine::for_profile(&state.db, &dummy, profile_id).await {
+            Ok(engine) => match engine
+                .backfill_sentence_reviews(profile_id, OffsetDateTime::now_utc())
+                .await
+            {
+                Ok(n) if n > 0 => tracing::info!(sentences = n, "補寫了舊練習的句子排程"),
+                Ok(_) => {}
+                // 補寫失敗不該讓「今天要練哪幾句」整條路斷掉
+                Err(e) => tracing::warn!(error = %e, "補寫句子排程失敗"),
+            },
+            Err(e) => tracing::warn!(error = %e, "補寫句子排程失敗"),
+        }
+    }
+
     let due = wordforge_db::sentences::due(
         &state.db,
         ProfileId(profile_id),

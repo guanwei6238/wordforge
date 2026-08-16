@@ -64,6 +64,19 @@ pub async fn miss(
     Ok(())
 }
 
+/// 這份練習有沒有任何一句在排程裡。
+///
+/// 補寫舊資料時用來略過已經排過的：`miss` 是 `misses + 1`，
+/// 對已經排好的練習再跑一次會讓次數憑空多一次。
+pub async fn has_any(db: &Db, exercise_id: i64) -> Result<bool> {
+    let found: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sentence_review WHERE exercise_id = ?)")
+            .bind(exercise_id)
+            .fetch_one(db.pool())
+            .await?;
+    Ok(found != 0)
+}
+
 /// 這一句練起來了，從排程裡拿掉。
 ///
 /// 刪掉而不是標記完成：這張表的意義就是「還沒練起來的句子」，

@@ -353,6 +353,72 @@ impl PracticeEngine<'_> {
         Ok(())
     }
 
+    /// 把舊練習答錯的句子補進複習排程。
+    ///
+    /// 排程是在**批改的當下**寫入的，所以句子複習這個功能上線之前做過的
+    /// 練習一句都沒排進去。實測使用者的資料庫：10 份翻譯練習裡只有功能
+    /// 上線後的那一份有排程，前面 9 份共 35 句答錯的永遠不會回來——
+    /// 而那些正是最該回來的。
+    ///
+    /// 補得回來是因為逐題對錯還留在 `attempt.feedback_json` 裡。
+    /// 用**當時的時間**排而不是現在：一句 8/12 做錯的排到 8/13，
+    /// 早就過期，開起來就能練；用現在的時間會變成「明天再說」。
+    ///
+    /// 已經有排程的練習整份跳過：`miss` 是 `misses + 1`，重跑會讓
+    /// 錯誤次數憑空多一次。
+    ///
+    /// 回傳補了幾句。
+    pub async fn backfill_sentence_reviews(
+        &self,
+        profile_id: i64,
+        now: OffsetDateTime,
+    ) -> Result<u64> {
+        let key = format!("sentence_review_backfill:{profile_id}");
+        if wordforge_db::meta::get_i64(self.db, &key).await? == Some(REVIEW_BACKFILL_VERSION) {
+            return Ok(0);
+        }
+        let pid = ProfileId(profile_id);
+
+        let mut done = 0;
+        let mut offset = 0i64;
+        loop {
+            let batch = exercises::recent(self.db, pid, 100, offset).await?;
+            if batch.is_empty() {
+                break;
+            }
+            offset += batch.len() as i64;
+
+            for record in batch {
+                // 只有翻譯題的句子是「一題」——閱讀與克漏字的句子對不回排程
+                if !record.kind.starts_with("translation") {
+                    continue;
+                }
+                if sentences::has_any(self.db, record.id).await? {
+                    continue;
+                }
+                let Some(raw) = record.feedback_json.as_deref() else {
+                    continue;
+                };
+                let Ok(feedback) = serde_json::from_str::<Feedback>(raw) else {
+                    continue;
+                };
+                let when = wordforge_db::ts::from_sql(&record.created_at).unwrap_or(now);
+                for (i, item) in feedback.items.iter().enumerate() {
+                    // 寫對的不排：那一句練起來了，這正是 `pass` 的語意
+                    if item.correct {
+                        continue;
+                    }
+                    sentences::miss(self.db, pid, record.id, i as i64, when).await?;
+                    word_sentences::mark_missed(self.db, pid, record.id, i as i64).await?;
+                    done += 1;
+                }
+            }
+        }
+
+        wordforge_db::meta::set_i64(self.db, &key, REVIEW_BACKFILL_VERSION).await?;
+        Ok(done)
+    }
+
     /// 把翻譯的每一句排進（或移出）複習。
     ///
     /// 沒有逐題結果的那幾句**不動**：模型偶爾只回一個總分，那時候
