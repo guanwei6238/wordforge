@@ -526,8 +526,14 @@ export interface SentenceAttemptPage {
   sentences: number;
 }
 
-/** 複習紀錄一頁幾**次**（不是幾句）。 */
-export const REVIEW_LOG_PAGE = 10;
+/**
+ * 複習紀錄一頁幾**次**（不是幾句）。
+ *
+ * 三次就好：一次送出最多三句，而每一句都攤著題目、你的作答、兩種語體的
+ * 參考答案、評語與逐處修正——十次會是一片捲不完的牆。這裡跟練習紀錄
+ * （一頁十份）不一樣，因為那邊一列只有一行摘要。
+ */
+export const REVIEW_LOG_PAGE = 3;
 
 /**
  * 複習紀錄，以每次送出為一組，新的在前。

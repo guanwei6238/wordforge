@@ -324,7 +324,7 @@ pub async fn attempt_batches(
              SELECT DISTINCT created_at FROM sentence_attempt
              WHERE profile_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3
          )
-         ORDER BY created_at DESC, id",
+         ORDER BY created_at DESC, id DESC",
     )
     .bind(profile_id.0)
     .bind(limit.max(0))
@@ -353,6 +353,15 @@ pub async fn attempt_batches(
                 items: vec![attempt],
             }),
         }
+    }
+
+    // SQL 那邊兩個排序鍵都是 DESC，因為索引就是那個方向——寫成
+    // `created_at DESC, id` 的話 SQLite 會補一個
+    // `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`（測試抓到的）。
+    // 但組內要照作答順序（第 1 句在最上面），所以在這裡翻回來：
+    // 一組頂多幾句，成本可以忽略。
+    for batch in &mut batches {
+        batch.items.reverse();
     }
     Ok(batches)
 }
@@ -673,6 +682,31 @@ mod tests {
         // 刪練習時 CASCADE 會照 exercise_id 找子列，那條也不能是全表掃描
         let cascade = plan(&db, "SELECT 1 FROM sentence_attempt WHERE exercise_id = 1").await;
         assert!(!cascade.contains("SCAN"), "CASCADE 會掃全表：{cascade}");
+
+        // 分組那條是另一個查詢，要另外驗——它有子查詢也有 DISTINCT，
+        // 光看「清單查詢沒問題」推不出它也沒問題
+        let grouped = plan(
+            &db,
+            "SELECT id, answer FROM sentence_attempt
+             WHERE profile_id = 1 AND created_at IN (
+                 SELECT DISTINCT created_at FROM sentence_attempt
+                 WHERE profile_id = 1 ORDER BY created_at DESC LIMIT 10 OFFSET 0
+             )
+             ORDER BY created_at DESC, id DESC",
+        )
+        .await;
+        assert!(!grouped.contains("SCAN"), "分組查詢在掃全表：{grouped}");
+        assert!(
+            !grouped.contains("TEMP B-TREE"),
+            "分組查詢的排序沒走索引：{grouped}"
+        );
+
+        let counting = plan(
+            &db,
+            "SELECT COUNT(DISTINCT created_at) FROM sentence_attempt WHERE profile_id = 1",
+        )
+        .await;
+        assert!(!counting.contains("SCAN"), "數複習次數在掃全表：{counting}");
     }
 
     /// 一次送出的三句是一組，分頁數的是組不是句。
@@ -723,6 +757,12 @@ mod tests {
                 .all(|a| a.created_at == page[0].created_at),
             "一組裡的每一句都屬於同一次送出"
         );
+
+        // 組**之間**新的在前，組**內**照作答順序——第 1 句要在最上面。
+        // SQL 兩個排序鍵都是 DESC（索引就是那個方向，寫成 id ASC 會補一個
+        // TEMP B-TREE），組內是在 Rust 裡翻回來的。這兩行釘住那個翻轉。
+        assert_eq!(page[1].items[0].answer, "第 0 輪第 0 句");
+        assert_eq!(page[1].items[2].answer, "第 0 輪第 2 句");
 
         // 一頁一組：翻頁翻的是「第幾次複習」
         let first = attempt_batches(&db, profile, 1, 0).await.unwrap();
