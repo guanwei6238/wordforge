@@ -450,6 +450,9 @@ pub struct DueSentenceResultView {
     pub reference: Option<String>,
     pub reference_formal: Option<String>,
     pub comment: Option<String>,
+    /// 逐處修正：你寫的哪一段、該改成什麼、為什麼。
+    /// `comment` 只是一句摘要，這一份才說得出該怎麼改。
+    pub corrections: Vec<wordforge_practice::payload::Correction>,
 }
 
 /// 批改這一輪的複習句子。**一次模型呼叫**，而且不寫進練習紀錄。
@@ -490,6 +493,7 @@ pub async fn grade_due_sentences(
             reference: r.reference,
             reference_formal: r.reference_formal,
             comment: r.comment,
+            corrections: r.corrections,
         })
         .collect())
 }
@@ -508,6 +512,8 @@ pub struct SentenceAttemptView {
     pub reference: Option<String>,
     pub reference_formal: Option<String>,
     pub comment: Option<String>,
+    /// 逐處修正。舊的紀錄（0020 之前）沒有這一欄，那時是空陣列。
+    pub corrections: Vec<wordforge_practice::payload::Correction>,
     pub created_at: String,
 }
 
@@ -580,6 +586,8 @@ pub async fn list_sentence_attempts(
             reference: row.reference,
             reference_formal: row.reference_formal,
             comment: row.comment,
+            // 解析不出來就當作沒有修正：一筆壞掉的紀錄不該讓整頁看不了
+            corrections: serde_json::from_str(&row.corrections_json).unwrap_or_default(),
             created_at: row.created_at,
         });
     }

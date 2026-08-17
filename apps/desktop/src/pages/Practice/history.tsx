@@ -18,6 +18,7 @@ import {
   REVIEW_LOG_PAGE,
   type SentenceAttemptPage,
 } from "../../api";
+import Corrections from "../../components/Corrections";
 import Reference from "../../components/Reference";
 
 /** 練習紀錄一頁幾筆。一頁塞太多就等於沒有分頁。 */
@@ -253,6 +254,7 @@ function ReviewLog({ labels }: { labels: Record<ExerciseKind, string> }) {
               <Reference reference={a.reference} formal={a.reference_formal} />
             </p>
             {a.comment && <p className="muted">{a.comment}</p>}
+            <Corrections items={a.corrections} />
           </li>
         ))}
       </ul>

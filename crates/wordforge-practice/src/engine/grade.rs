@@ -31,6 +31,12 @@ pub struct DueSentenceResult {
     pub reference: Option<String>,
     pub reference_formal: Option<String>,
     pub comment: Option<String>,
+    /// 這一句的逐處修正：你寫的哪一段、該改成什麼、為什麼。
+    ///
+    /// `comment` 是一句摘要（「缺少正在進行式」），這一份才說得出
+    /// 「`dealing with` 要改成 `is addressing`」。少了它，學習者知道
+    /// 自己錯了但不知道該怎麼寫。
+    pub corrections: Vec<Correction>,
 }
 
 /// 通過前置檢查、真的要送去批改的一句。
@@ -512,6 +518,8 @@ impl PracticeEngine<'_> {
                     reference: item.reference.clone(),
                     reference_formal: item.reference_formal.clone(),
                     comment: item.comment.clone(),
+                    // 修正在下面依題號分派，那時候整批才收齊
+                    corrections: Vec::new(),
                 });
             }
 
@@ -548,14 +556,28 @@ impl PracticeEngine<'_> {
                     .await?;
             }
 
-            let result = graded.unwrap_or(DueSentenceResult {
+            let mut result = graded.unwrap_or(DueSentenceResult {
                 exercise_id: item.exercise_id,
                 item_index: item.item_index,
                 correct: false,
                 reference: None,
                 reference_formal: None,
                 comment: None,
+                corrections: Vec::new(),
             });
+
+            // 這一句的逐處修正——「你寫的哪一段、該改成什麼、為什麼」。
+            // 這是整份批改裡最有教學價值的一塊，而它曾經只被拿去記文法點
+            // 就丟掉了，於是複習畫面只剩一句摘要說「缺少正在進行式」，
+            // 沒有說該怎麼改。
+            result.corrections = corrections
+                .iter()
+                .filter(|(target, _)| *target == i)
+                .map(|(_, c)| c.clone())
+                .collect();
+
+            let corrections_json =
+                serde_json::to_string(&result.corrections).unwrap_or_else(|_| "[]".into());
 
             sentences::record_attempt(
                 self.db,
@@ -568,6 +590,7 @@ impl PracticeEngine<'_> {
                     reference: result.reference.as_deref(),
                     reference_formal: result.reference_formal.as_deref(),
                     comment: result.comment.as_deref(),
+                    corrections_json: &corrections_json,
                 },
                 now,
             )

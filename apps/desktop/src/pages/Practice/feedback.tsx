@@ -3,6 +3,7 @@ import {
   type Feedback,
   type Material,
 } from "../../api";
+import Corrections from "../../components/Corrections";
 import { MaterialPicker } from "./history";
 
 /**
@@ -68,19 +69,7 @@ export function FeedbackPanel({
         {feedback.score != null && <span className="score"> {Math.round(feedback.score)} 分</span>}
       </h2>
 
-      {feedback.corrections.length > 0 && (
-        <ul className="corrections">
-          {feedback.corrections.map((c, i) => (
-            <li key={i}>
-              <span className="wrong">{c.original}</span>
-              {" → "}
-              <span className="right">{c.corrected}</span>
-              {c.grammar_point && <span className="tag">{c.grammar_point}</span>}
-              {c.explanation && <p className="muted">{c.explanation}</p>}
-            </li>
-          ))}
-        </ul>
-      )}
+      <Corrections items={feedback.corrections} />
 
       {unknown.length > 0 && (
         <p className="muted hint">

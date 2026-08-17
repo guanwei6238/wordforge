@@ -494,6 +494,25 @@ async fn reviewing_three_sentences_costs_one_call_and_no_practice_record() {
             .unwrap(),
         3
     );
+
+    // **逐處修正要留下來，而且要掛在出錯的那一句上。**
+    //
+    // 這一段存在的理由是它曾經是錯的：`corrections` 被拿去記文法點之後
+    // 就丟掉了，複習畫面只剩一句摘要「缺少正在進行式」——指出了問題，
+    // 卻沒說該怎麼改，而模型明明給了 `dealing with → is addressing`。
+    let third = log
+        .iter()
+        .find(|a| a.item_index == 2)
+        .expect("第三句應該在紀錄裡");
+    let saved: Vec<serde_json::Value> = serde_json::from_str(&third.corrections_json).unwrap();
+    assert_eq!(saved.len(), 1, "那一句的修正要存下來：{saved:?}");
+    assert_eq!(saved[0]["corrected"], "The weather is nice");
+
+    // 寫對的那兩句沒有修正，不該撿到別句的
+    for a in log.iter().filter(|a| a.item_index != 2) {
+        let none: Vec<serde_json::Value> = serde_json::from_str(&a.corrections_json).unwrap();
+        assert!(none.is_empty(), "寫對的句子不該有修正：{none:?}");
+    }
 }
 
 /// 兩個方向同時到期時，各自照自己的方向送——一份 prompt 只能講一個方向。

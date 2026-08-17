@@ -707,6 +707,13 @@ pub fn translation_feedback(
          - 每個問題都要標註文法點。{points}\n\
          - 每條修正都要帶 `index`：那是**第幾題**（從 1 起算）。\n\
            少了它就說不出「這一句你錯在哪個文法點」——那正是複習時最有用的訊息。\n\
+         - **答錯的每一處都要有一條 `corrections`**，不能只在 `comment` 裡\n\
+           籠統帶過。`comment` 是一句摘要（「缺少現在進行式」），學習者看完\n\
+           知道自己錯了卻不知道該怎麼寫；`original` 抄他寫錯的那一段、\n\
+           `corrected` 寫改好的同一段，他才對照得出差在哪。\n\
+           `explanation` 要說**為什麼**這樣改，而不是重述改了什麼。\n\
+         - 漏用「這題要練的字」也算一處錯誤，要開一條 corrections 指出來，\n\
+           `corrected` 給用上那個字的版本。\n\
          - **參考答案給兩種說法**：`reference_formal` 是正式、書面會怎麼寫，\n\
            `reference` 是日常口語會怎麼講。兩種都要道地——為了湊滿兩欄\n\
            硬寫一句不自然的話，比只給一句更糟。\n\
@@ -1832,6 +1839,37 @@ mod tests {
         assert!(
             text.contains("答對的題目一樣要給參考答案"),
             "沒有要求答對也給參考答案"
+        );
+    }
+
+    /// 答錯的每一處都要有一條逐處修正，不能只寫一句摘要。
+    ///
+    /// 這條測試存在的理由是使用者實際看到的畫面：評語寫著「缺少正在進行式，
+    /// 也沒有使用本題要練的 address」——指出了兩個問題，卻沒有一句告訴他
+    /// `dealing with` 該改成 `is addressing`。`comment` 天生只是摘要，
+    /// 「怎麼改」得靠 corrections。
+    #[test]
+    fn translation_feedback_demands_a_correction_per_mistake() {
+        let items = vec![graded(
+            "工程師正在處理網站登入系統的安全漏洞",
+            "The engineer dealing with security vulnerability for site of login system.",
+        )];
+        let text =
+            &translation_feedback("English", "繁體中文", true, &items, &[], &english_points())
+                .messages[0]
+                .content;
+
+        assert!(
+            text.contains("答錯的每一處都要有一條 `corrections`"),
+            "沒有要求逐處修正"
+        );
+        assert!(
+            text.contains("不能只在 `comment` 裡"),
+            "沒有擋掉「只寫一句摘要」這條退路"
+        );
+        assert!(
+            text.contains("漏用「這題要練的字」也算一處錯誤"),
+            "沒有把漏用目標字算成要修正的一處"
         );
     }
 

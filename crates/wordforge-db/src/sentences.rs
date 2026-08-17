@@ -199,6 +199,11 @@ pub struct SentenceAttempt {
     pub reference: Option<String>,
     pub reference_formal: Option<String>,
     pub comment: Option<String>,
+    /// 逐處修正的原始 JSON（`[{original, corrected, explanation, ...}]`）。
+    ///
+    /// 這一層不解析它：形狀由 `wordforge-practice` 的 `Correction` 定義，
+    /// 在這裡再寫一份只會有兩份會互相漂移的真相。
+    pub corrections_json: String,
     pub created_at: String,
 }
 
@@ -211,6 +216,8 @@ pub struct NewAttempt<'a> {
     pub reference: Option<&'a str>,
     pub reference_formal: Option<&'a str>,
     pub comment: Option<&'a str>,
+    /// 這一句的逐處修正，已序列化。沒有就傳 `"[]"`。
+    pub corrections_json: &'a str,
 }
 
 /// 記一句複習的作答。
@@ -223,8 +230,8 @@ pub async fn record_attempt(
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO sentence_attempt
              (profile_id, exercise_id, item_index, answer, correct,
-              reference, reference_formal, comment, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              reference, reference_formal, comment, corrections_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(profile_id.0)
@@ -235,6 +242,7 @@ pub async fn record_attempt(
     .bind(attempt.reference)
     .bind(attempt.reference_formal)
     .bind(attempt.comment)
+    .bind(attempt.corrections_json)
     .bind(ts::to_sql(now))
     .fetch_one(db.pool())
     .await?;
@@ -256,7 +264,7 @@ pub async fn attempts(
     // 編譯器也不會說話
     let rows = sqlx::query(
         "SELECT id, exercise_id, item_index, answer, correct,
-                reference, reference_formal, comment, created_at
+                reference, reference_formal, comment, corrections_json, created_at
          FROM sentence_attempt
          WHERE profile_id = ?
          ORDER BY created_at DESC, id DESC
@@ -279,6 +287,7 @@ pub async fn attempts(
             reference: row.get("reference"),
             reference_formal: row.get("reference_formal"),
             comment: row.get("comment"),
+            corrections_json: row.get("corrections_json"),
             created_at: row.get("created_at"),
         })
         .collect())
@@ -584,6 +593,7 @@ mod tests {
                     reference: None,
                     reference_formal: Some("正式說法"),
                     comment: None,
+                    corrections_json: "[]",
                 },
                 t0() + Duration::minutes(i),
             )
@@ -617,6 +627,7 @@ mod tests {
                 reference: None,
                 reference_formal: None,
                 comment: None,
+                corrections_json: "[]",
             },
             t0(),
         )

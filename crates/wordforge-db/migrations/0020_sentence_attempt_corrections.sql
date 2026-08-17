@@ -1,0 +1,29 @@
+-- 複習紀錄也要留下「你的寫法該怎麼改」。
+--
+-- ## 漏掉了什麼
+--
+-- 批改回來的 `corrections` 是逐處修正：原句片段、改成什麼、為什麼。
+-- 那是整份批改裡最有教學價值的一塊——
+--
+--   when my sister encounter conflict, she tends silent at first.
+--   → When my sister encounters conflict, she tends to remain silent at first.
+--   說明：my sister 是第三人稱單數，所以 encounter 要變成 encounters；
+--        tend 後面固定接 to + 原形動詞。
+--
+-- 0019 建 `sentence_attempt` 時只存了 answer / correct / reference /
+-- reference_formal / comment。`corrections` 在 `grade_due_sentences` 裡被
+-- 拿去記文法點之後就丟掉了，於是複習畫面只剩一句摘要：「缺少正在進行式，
+-- 也沒有使用本題要練的 address」——指出了問題，卻沒說怎麼改。
+--
+-- 使用者的原話是「llm 也沒說我的寫法要怎麼改才是正確的」。模型有說，
+-- 是我們沒存。
+--
+-- ## 為什麼是 JSON 一欄而不是一張表
+--
+-- 這些修正只跟「這一次作答」有關，永遠一起讀、一起寫，沒有人會問
+-- 「所有 tense 相關的修正有哪些」——那個問題由 `grammar` 那張表回答，
+-- 文法點本來就已經抽出去記了。拆一張 correction 表只會多一次 JOIN。
+--
+-- 形狀跟 `sentence.grammar_points_json` 一致（同一份資料的另一半）。
+
+ALTER TABLE sentence_attempt ADD COLUMN corrections_json TEXT NOT NULL DEFAULT '[]';

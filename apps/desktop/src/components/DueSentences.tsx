@@ -38,6 +38,7 @@ import {
   type ProfileLanguages,
   skipSentence,
 } from "../api";
+import Corrections from "./Corrections";
 import Reference from "./Reference";
 
 /** 一句的識別：跨練習時只有 (練習, 第幾題) 這一組指得出是哪一句。 */
@@ -242,11 +243,16 @@ export default function DueSentences({
               </div>
 
               {result && (
-                <p className={result.correct ? "ok" : "error"}>
-                  {result.correct ? "✓" : "✗"}{" "}
-                  <Reference reference={result.reference} formal={result.reference_formal} />
-                  {result.comment && <span>　{result.comment}</span>}
-                </p>
+                <>
+                  <p className={result.correct ? "ok" : "error"}>
+                    {result.correct ? "✓" : "✗"}{" "}
+                    <Reference reference={result.reference} formal={result.reference_formal} />
+                    {result.comment && <span>　{result.comment}</span>}
+                  </p>
+                  {/* 「你寫的哪一段該改成什麼」。少了這一份，畫面只說得出
+                      「缺少正在進行式」，說不出該怎麼寫。 */}
+                  <Corrections items={result.corrections} />
+                </>
               )}
               {submitted && !result && (
                 <p className="muted">

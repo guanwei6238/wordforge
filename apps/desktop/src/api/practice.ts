@@ -470,6 +470,13 @@ export interface DueSentenceResult {
   reference: string | null;
   reference_formal: string | null;
   comment: string | null;
+  /**
+   * 逐處修正：你寫的哪一段、該改成什麼、為什麼。
+   *
+   * `comment` 只是一句摘要（「缺少正在進行式」），這一份才說得出
+   * 「`dealing with` 要改成 `is addressing`」。
+   */
+  corrections: Correction[];
 }
 
 /**
@@ -499,6 +506,8 @@ export interface SentenceAttempt {
   reference: string | null;
   reference_formal: string | null;
   comment: string | null;
+  /** 逐處修正。0020 之前的紀錄沒有這一欄，那時是空陣列。 */
+  corrections: Correction[];
   created_at: string;
 }
 
