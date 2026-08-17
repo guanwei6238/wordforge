@@ -225,7 +225,16 @@ export interface ExerciseView {
 export interface ItemResult {
   index: number;
   correct: boolean;
+  /**
+   * 參考答案的口語說法——只在它跟正式說法不一樣時才有值。
+   *
+   * 舊的批改紀錄只有這一欄（那時它是唯一的參考答案，語氣不明），
+   * 選擇題也只有這一欄（正確選項沒有語體之分）。所以顯示時要能
+   * 退回它，見 `components/Reference.tsx`。
+   */
   reference: string | null;
+  /** 參考答案的正式說法。翻譯題有批改時這一欄才有。 */
+  reference_formal: string | null;
   comment: string | null;
 }
 
@@ -422,17 +431,106 @@ export interface DueSentence {
   misses: number;
 }
 
+/** 今天要練的句子：這一頁的份量，加上今天總共還有幾句。 */
+export interface DueSentencePage {
+  items: DueSentence[];
+  /** 今天總共還有幾句，不是這一頁有幾句 */
+  total: number;
+}
+
 /**
  * 今天該重練的句子。答錯的明天回來，答對的從此不再出現。
  *
  * 一句每天只出現一次——當天反覆重寫刷到全對，看起來是 100 分，
  * 實際上只是背下剛看到的參考答案。
+ *
+ * 預設一輪三句：一次把二十句攤開來只會讓人不想開始，而三句是
+ * 「看得完」與「一次模型呼叫批得完」的交集——批改是按輪送的，
+ * 一句一次等於一句燒掉一次完整的請求。
+ *
+ * 一輪只會拿到**同一個翻譯方向**的句子（批改的 prompt 開頭就寫著方向，
+ * 混在一起送等於告訴模型一件錯的事）。另一個方向不會被漏掉，
+ * 這一輪送完就輪到它。
+ *
+ * 要知道還剩幾句的話看 `total`，那個數字跟這一輪拿幾句無關。
  */
 export function dueSentences(
-  limit = 20,
+  limit = 3,
   profileId = DEFAULT_PROFILE_ID,
-): Promise<DueSentence[]> {
+): Promise<DueSentencePage> {
   return invoke("due_sentences", { profileId, limit });
+}
+
+/** 一句複習的批改結果。 */
+export interface DueSentenceResult {
+  exercise_id: number;
+  item_index: number;
+  correct: boolean;
+  /** 口語說法。只在它跟正式說法不一樣時才有值。 */
+  reference: string | null;
+  reference_formal: string | null;
+  comment: string | null;
+}
+
+/**
+ * 批改這一輪的複習句子。**一次模型呼叫**，而且不寫進練習紀錄。
+ *
+ * 跟 `regradeItems` 的分工：那個是「重寫某一份練習裡的某幾題」，會合併
+ * 回那份練習、重算分數、在練習紀錄裡多一筆；這個是複習，紀錄自己一份
+ * （`listSentenceAttempts`），練習紀錄完全不動。
+ */
+export function gradeDueSentences(
+  items: { exercise_id: number; item_index: number; answer: string }[],
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<DueSentenceResult[]> {
+  return invoke("grade_due_sentences", { profileId, items });
+}
+
+/** 複習紀錄的一列：題目、你寫了什麼、對不對。 */
+export interface SentenceAttempt {
+  id: number;
+  exercise_id: number;
+  item_index: number;
+  /** 題目那一句。那份練習被刪掉時是空字串。 */
+  source: string;
+  kind: ExerciseKind | "";
+  answer: string;
+  correct: boolean;
+  reference: string | null;
+  reference_formal: string | null;
+  comment: string | null;
+  created_at: string;
+}
+
+export interface SentenceAttemptPage {
+  items: SentenceAttempt[];
+  total: number;
+}
+
+/** 複習紀錄一頁幾筆。 */
+export const REVIEW_LOG_PAGE = 10;
+
+/** 複習過的句子，新的在前。 */
+export function listSentenceAttempts(
+  limit = REVIEW_LOG_PAGE,
+  offset = 0,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<SentenceAttemptPage> {
+  return invoke("list_sentence_attempts", { profileId, limit, offset });
+}
+
+/**
+ * 今天不寫這一句，明天再出現。
+ *
+ * 跟送出不一樣的地方：不打模型（沒作答就沒東西可批改，所以是即時的），
+ * 也**不算答錯**——錯誤次數不變，不會被記成「錯過 N 次」。
+ */
+export function skipSentence(
+  exerciseId: number,
+  itemIndex: number,
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<boolean> {
+  return invoke("skip_sentence", { profileId, exerciseId, itemIndex });
 }
 
 /**

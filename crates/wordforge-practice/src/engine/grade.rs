@@ -9,6 +9,44 @@
 
 use super::*;
 
+/// 要送去批改的一句複習：哪一份練習的第幾題、這次寫了什麼。
+#[derive(Debug, Clone)]
+pub struct DueAnswer {
+    pub exercise_id: i64,
+    pub item_index: usize,
+    pub answer: String,
+}
+
+/// 一句複習的批改結果。
+///
+/// 跟 `ItemResult` 分開的理由是**座標不一樣**：那個的 `index` 是
+/// 「這一份練習的第幾題」，而複習一次可以跨好幾份練習，只有
+/// (練習, 第幾題) 這一組才指得出是哪一句。
+#[derive(Debug, Clone)]
+pub struct DueSentenceResult {
+    pub exercise_id: i64,
+    pub item_index: usize,
+    pub correct: bool,
+    /// 口語說法。只在它跟正式說法不一樣時才有值。
+    pub reference: Option<String>,
+    pub reference_formal: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// 通過前置檢查、真的要送去批改的一句。
+struct Pending {
+    exercise_id: i64,
+    item_index: usize,
+    /// 那份練習總共幾題。標記文法點時要照這個長度鋪答案陣列。
+    items_len: usize,
+    source: String,
+    answer: String,
+    /// 這題當初刻意要練的字。複習時一樣要送給批改——同一句話隔一天
+    /// 再翻，要練的還是那個字。
+    target_word: Option<String>,
+    to_target: bool,
+}
+
 impl PracticeEngine<'_> {
     // ------------------------------------------------------------ 批改
 
@@ -224,9 +262,13 @@ impl PracticeEngine<'_> {
         }
 
         // 只把重寫的那幾題送出去
-        let pairs: Vec<(String, String)> = redone
+        let pairs: Vec<prompts::FeedbackItem> = redone
             .iter()
-            .map(|(i, text)| (items[*i].source.clone(), text.clone()))
+            .map(|(i, text)| prompts::FeedbackItem {
+                source: items[*i].source.clone(),
+                answer: text.clone(),
+                target_word: items[*i].target_word.clone(),
+            })
             .collect();
         let weak_points =
             grammar::due_points(self.db, ProfileId(profile_id), now, GRAMMAR_BATCH).await?;
@@ -266,6 +308,10 @@ impl PracticeEngine<'_> {
         // 留在上一次的紀錄裡，兩份對照著看才知道改掉了什麼
         merged.corrections = fresh.corrections;
         merged.unknown_words = fresh.unknown_words.clone();
+        // 重寫這條路也要驗：它跟第一次批改用的是同一份 prompt，
+        // 同一個毛病自然也一樣
+        self.drop_words_the_learner_wrote(*to_target, &answers, &mut merged.unknown_words)
+            .await?;
         merged.taught_words.clear();
 
         let correct = merged.items.iter().filter(|r| r.correct).count();
@@ -313,6 +359,276 @@ impl PracticeEngine<'_> {
         .await?;
 
         Ok(merged)
+    }
+
+    /// 批改一批**複習句子**。跨練習、一次一個模型呼叫、不碰練習紀錄。
+    ///
+    /// ## 為什麼不走 [`Self::regrade`]
+    ///
+    /// `regrade` 是「重寫某一份練習裡的某幾題」：它會合併回那份練習的
+    /// 批改、重算那份的分數、往 `attempt` 寫一筆。複習拿它來用會有兩個
+    /// 後果，兩個都真的發生了：
+    ///
+    /// 1. **一句一筆練習紀錄。** 畫面改成一次一句之後，複習三句就在那份
+    ///    練習底下長出三筆「第 N 次」，清單上的「做過 12 次」其實是
+    ///    複習了 12 句。
+    /// 2. **一句一次模型呼叫。** 三句就是三次完整的批改請求，而它們
+    ///    完全可以擠在同一個 prompt 裡。
+    ///
+    /// 所以複習有自己的路：排程照樣更新（`pass` / `miss`）、生詞照樣進
+    /// 牌組、文法點照樣記，但紀錄寫進 `sentence_attempt`，練習紀錄
+    /// 完全不動。
+    ///
+    /// ## 方向要分開送
+    ///
+    /// 中翻英與英翻中同時到期是常態，而 `translation_feedback` 的 prompt
+    /// 開頭就寫著這一份的翻譯方向。混在一起送等於告訴模型一件錯的事。
+    /// 所以按方向分組，各打一次——通常只有一組，兩種都有時才是兩次。
+    ///
+    /// **prompt 用的是跟練習完全同一個** `translation_feedback`：兩邊
+    /// 語氣一致，同一句話不會因為「在複習裡」而被改成另一種風格。
+    pub async fn grade_due_sentences(
+        &self,
+        profile_id: i64,
+        answers: &[DueAnswer],
+        now: OffsetDateTime,
+    ) -> Result<Vec<DueSentenceResult>> {
+        let pid = ProfileId(profile_id);
+
+        // 同一份練習只讀一次：三句常常來自同一份
+        let mut bodies: std::collections::HashMap<i64, ExerciseBody> =
+            std::collections::HashMap::new();
+        let mut pending: Vec<Pending> = Vec::new();
+
+        for want in answers {
+            if let std::collections::hash_map::Entry::Vacant(slot) = bodies.entry(want.exercise_id)
+            {
+                let Some(record) = exercises::get(self.db, ExerciseId(want.exercise_id)).await?
+                else {
+                    continue;
+                };
+                let Ok(body) = serde_json::from_str::<ExerciseBody>(&record.payload_json) else {
+                    continue;
+                };
+                slot.insert(body);
+            }
+            let Some(ExerciseBody::Translation { to_target, items }) =
+                bodies.get(&want.exercise_id)
+            else {
+                continue;
+            };
+            let Some(item) = items.get(want.item_index) else {
+                continue;
+            };
+            // 一句每天只練一次。走到這裡代表 UI 拿到了一份過期的清單
+            // （送出之後沒有重新查），靜靜地跳過比重複計一次排程好。
+            if sentences::practised_today(
+                self.db,
+                pid,
+                want.exercise_id,
+                want.item_index as i64,
+                now,
+            )
+            .await?
+            {
+                continue;
+            }
+            pending.push(Pending {
+                exercise_id: want.exercise_id,
+                item_index: want.item_index,
+                items_len: items.len(),
+                source: item.source.clone(),
+                answer: want.answer.clone(),
+                target_word: item.target_word.clone(),
+                to_target: *to_target,
+            });
+        }
+
+        if pending.is_empty() {
+            return Err(PracticeError::Unsupported(
+                "這幾句都已經不在今天的複習裡了。重新整理一次就會看到最新的清單。".into(),
+            ));
+        }
+
+        let weak_points = grammar::due_points(self.db, pid, now, GRAMMAR_BATCH).await?;
+        let points = self.grammar_points(now).await?;
+
+        let mut results: Vec<Option<DueSentenceResult>> = vec![None; pending.len()];
+        let mut unknown: Vec<String> = Vec::new();
+        // (第幾個 pending, 那一條修正)。文法點與句子標記都要用
+        let mut corrections: Vec<(usize, Correction)> = Vec::new();
+
+        for direction in [true, false] {
+            let group: Vec<usize> = pending
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.to_target == direction)
+                .map(|(i, _)| i)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+
+            let pairs: Vec<prompts::FeedbackItem> = group
+                .iter()
+                .map(|&i| prompts::FeedbackItem {
+                    source: pending[i].source.clone(),
+                    answer: pending[i].answer.clone(),
+                    target_word: pending[i].target_word.clone(),
+                })
+                .collect();
+            let req = prompts::translation_feedback(
+                self.target_name(),
+                self.native_name(),
+                direction,
+                &pairs,
+                &weak_points,
+                &points,
+            );
+            let value = self.ask_json(profile_id, "grade", &req).await?;
+            let mut fresh: Feedback = serde_json::from_value(value)
+                .map_err(|e| PracticeError::BadResponse(e.to_string()))?;
+
+            // 模型回的 index 是**這一組裡的第幾題**，要對回原本那一句。
+            // 對錯位的話使用者會看到「我翻的是第 3 句，講評卻掛在第 1 句」，
+            // 而那個畫面看起來完全正常。
+            let at = |index: Option<usize>, fallback: usize| -> Option<usize> {
+                index
+                    .and_then(|n| n.checked_sub(1))
+                    .filter(|k| *k < group.len())
+                    .or(Some(fallback))
+                    .filter(|k| *k < group.len())
+                    .map(|k| group[k])
+            };
+
+            for (k, item) in fresh.items.iter().enumerate() {
+                let Some(target) = at(Some(item.index), k) else {
+                    continue;
+                };
+                results[target] = Some(DueSentenceResult {
+                    exercise_id: pending[target].exercise_id,
+                    item_index: pending[target].item_index,
+                    correct: item.correct,
+                    reference: item.reference.clone(),
+                    reference_formal: item.reference_formal.clone(),
+                    comment: item.comment.clone(),
+                });
+            }
+
+            for (k, correction) in fresh.corrections.iter().enumerate() {
+                if let Some(target) = at(correction.index, k) {
+                    corrections.push((target, correction.clone()));
+                }
+            }
+
+            // 生詞判定同樣要在本地驗收過：他自己寫出來的字不是他不會的字
+            let written: Vec<String> = group.iter().map(|&i| pending[i].answer.clone()).collect();
+            self.drop_words_the_learner_wrote(direction, &written, &mut fresh.unknown_words)
+                .await?;
+            for word in fresh.unknown_words {
+                if !unknown.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
+                    unknown.push(word);
+                }
+            }
+        }
+
+        // 排程與紀錄。沒拿到批改結果的那幾句當作「還沒寫對」——排程照走，
+        // 但註記說得出「這次的批改沒講到這一句」，不要假裝它答錯了。
+        let mut out = Vec::with_capacity(pending.len());
+        for (i, item) in pending.iter().enumerate() {
+            let graded = results[i].take();
+            let correct = graded.as_ref().map(|r| r.correct).unwrap_or(false);
+
+            if correct {
+                sentences::pass(self.db, pid, item.exercise_id, item.item_index as i64).await?;
+            } else {
+                sentences::miss(self.db, pid, item.exercise_id, item.item_index as i64, now)
+                    .await?;
+                word_sentences::mark_missed(self.db, pid, item.exercise_id, item.item_index as i64)
+                    .await?;
+            }
+
+            let result = graded.unwrap_or(DueSentenceResult {
+                exercise_id: item.exercise_id,
+                item_index: item.item_index,
+                correct: false,
+                reference: None,
+                reference_formal: None,
+                comment: None,
+            });
+
+            sentences::record_attempt(
+                self.db,
+                pid,
+                sentences::NewAttempt {
+                    exercise_id: item.exercise_id,
+                    item_index: item.item_index as i64,
+                    answer: &item.answer,
+                    correct: result.correct,
+                    reference: result.reference.as_deref(),
+                    reference_formal: result.reference_formal.as_deref(),
+                    comment: result.comment.as_deref(),
+                },
+                now,
+            )
+            .await?;
+
+            out.push(result);
+        }
+
+        self.add_unknown_words(profile_id, &unknown, now).await?;
+
+        // 文法點只看 corrections，跟題號無關，所以整批一起記。
+        // body 只是用來選「翻譯題怎麼記」那條分支。
+        if !corrections.is_empty() {
+            let all = Feedback {
+                corrections: corrections.iter().map(|(_, c)| c.clone()).collect(),
+                ..Default::default()
+            };
+            self.record_grammar_results(
+                profile_id,
+                &ExerciseBody::Translation {
+                    to_target: true,
+                    items: Vec::new(),
+                },
+                &GradeInput::default(),
+                &all,
+                now,
+            )
+            .await?;
+        }
+
+        // 「這句錯在哪個文法點」要掛回句子，而那是按練習存的
+        let mut by_exercise: std::collections::HashMap<i64, (usize, Vec<Correction>, Vec<String>)> =
+            std::collections::HashMap::new();
+        for (target, correction) in corrections {
+            let item = &pending[target];
+            let slot = by_exercise.entry(item.exercise_id).or_insert_with(|| {
+                (
+                    item.items_len,
+                    Vec::new(),
+                    vec![String::new(); item.items_len],
+                )
+            });
+            // 題號換成那份練習裡的第幾題，講評才掛得回原本那一句
+            slot.1.push(Correction {
+                index: Some(item.item_index + 1),
+                ..correction
+            });
+            if let Some(slot_answer) = slot.2.get_mut(item.item_index) {
+                *slot_answer = item.answer.clone();
+            }
+        }
+        for (exercise_id, (_, corrections, answers)) in by_exercise {
+            let feedback = Feedback {
+                corrections,
+                ..Default::default()
+            };
+            self.tag_sentences(profile_id, exercise_id, &feedback, &answers)
+                .await?;
+        }
+
+        Ok(out)
     }
 
     /// 把「這一句錯在哪個文法點」記到句子上。
@@ -457,14 +773,15 @@ impl PracticeEngine<'_> {
         input: &GradeInput,
         weak_points: &[String],
     ) -> Result<Feedback> {
-        let pairs: Vec<(String, String)> = items
+        let pairs: Vec<prompts::FeedbackItem> = items
             .iter()
             .enumerate()
-            .map(|(i, item)| {
-                (
-                    item.source.clone(),
-                    input.answers.get(i).cloned().unwrap_or_default(),
-                )
+            .map(|(i, item)| prompts::FeedbackItem {
+                source: item.source.clone(),
+                answer: input.answers.get(i).cloned().unwrap_or_default(),
+                // 這題刻意要練的字要跟著送出去，否則模型不知道這一題
+                // 的存在理由，參考答案很可能繞開它
+                target_word: item.target_word.clone(),
             })
             .collect();
 
@@ -478,7 +795,13 @@ impl PracticeEngine<'_> {
             &points,
         );
         let value = self.ask_json(profile_id, "grade", &req).await?;
-        serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))
+        let mut feedback: Feedback =
+            serde_json::from_value(value).map_err(|e| PracticeError::BadResponse(e.to_string()))?;
+
+        let answers: Vec<String> = pairs.into_iter().map(|p| p.answer).collect();
+        self.drop_words_the_learner_wrote(to_target, &answers, &mut feedback.unknown_words)
+            .await?;
+        Ok(feedback)
     }
 
     pub(super) async fn grade_reading(
@@ -629,6 +952,57 @@ impl PracticeEngine<'_> {
         // 片語排前面：那才是查單字查不到的東西
         notes.sort_by(|a, b| b.is_phrase.cmp(&a.is_phrase).then(a.text.cmp(&b.text)));
         Ok(notes)
+    }
+
+    /// 從模型判定的生詞裡，拿掉**學習者自己寫出來**的字。
+    ///
+    /// prompt 要模型「從翻錯、漏譯、繞路的說法看出他不會哪個字」，但那
+    /// 只是請求。實際發生過的事：中翻英「為了不在期末考前熬夜，我打算
+    /// 提前一週開始複習。」這一題，使用者的答案裡明明寫著 `final`，
+    /// 模型還是把它列進 `unknown_words`——於是一個他剛剛主動用對的字
+    /// 被排進複習。畫面上看不出異狀，卡片就這樣多了一張。
+    ///
+    /// 這件事本地驗得出來，就不要只相信模型：他自己寫得出來的目標語言
+    /// 單字，不是「他不認識的字」。用錯不算——用錯了會被 `corrections`
+    /// 記成文法點，那是另一回事。
+    ///
+    /// 比對認整個詞形家族（[`lemmas::forms`]）：寫 `finals` 也算用到了
+    /// `final`，寫 `studied` 也算用到了 `study`。字面比對會把那些
+    /// 全部誤判成「沒寫到」，而這裡誤判的代價是使用者被逼著複習他已經
+    /// 會的字。
+    ///
+    /// **只在「翻成目標語言」的方向作用。** 反向的作答是母語，裡面本來
+    /// 就不會出現目標語言的單字，逐字比對只會什麼都濾不掉。而拿題目
+    /// 來濾更不行——題目裡的字正是他可能看不懂而漏譯的那些，那是這個
+    /// 功能最該抓到的情況。
+    pub(super) async fn drop_words_the_learner_wrote(
+        &self,
+        to_target: bool,
+        answers: &[String],
+        unknown: &mut Vec<String>,
+    ) -> Result<()> {
+        if !to_target || unknown.is_empty() {
+            return Ok(());
+        }
+
+        let mut kept = Vec::with_capacity(unknown.len());
+        for word in unknown.iter() {
+            let forms: std::collections::HashSet<String> =
+                lemmas::forms(self.db, &self.target_lang, word)
+                    .await?
+                    .into_iter()
+                    .collect();
+            let wrote_it = answers
+                .iter()
+                .any(|a| wordforge_core::text::mentions_any(a, &forms, &self.target_lang));
+            if wrote_it {
+                tracing::debug!(word, "學習者自己寫出來了，不算他不會的字");
+            } else {
+                kept.push(word.clone());
+            }
+        }
+        *unknown = kept;
+        Ok(())
     }
 
     /// 把不懂的字加進牌組。

@@ -21,5 +21,5 @@ pub mod engine;
 pub mod payload;
 pub mod validate;
 
-pub use engine::{PracticeEngine, PracticeError, Result};
+pub use engine::{DueAnswer, DueSentenceResult, PracticeEngine, PracticeError, Result};
 pub use payload::{ExerciseView, Feedback, GlossaryNote, GradeInput};

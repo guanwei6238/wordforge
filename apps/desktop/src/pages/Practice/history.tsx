@@ -14,7 +14,11 @@ import {
   type Material,
   type ProfileLanguages,
   currentLanguages,
+  listSentenceAttempts,
+  REVIEW_LOG_PAGE,
+  type SentenceAttemptPage,
 } from "../../api";
+import Reference from "../../components/Reference";
 
 /** 練習紀錄一頁幾筆。一頁塞太多就等於沒有分頁。 */
 export const HISTORY_PAGE = 10;
@@ -52,6 +56,9 @@ export function History({
   // 點進去看，不是就地展開。做過十次的練習攤在清單裡會長到捲不完，
   // 而且旁邊那幾份的資訊全被推走了
   const [opened, setOpened] = useState<number | null>(null);
+  // 練習與複習分開看。兩件事的單位不一樣——一邊是「一份題目做過幾次」，
+  // 一邊是「今天複習了哪幾句」，混在同一張清單裡兩邊都會被對方稀釋。
+  const [tab, setTab] = useState<"exercises" | "reviews">("exercises");
 
   function open(exerciseId: number | null) {
     setOpened(exerciseId);
@@ -70,10 +77,38 @@ export function History({
     );
   }
 
+  const tabs = (
+    <div className="row review-modes">
+      <button
+        className={tab === "exercises" ? "tab active" : "tab"}
+        onClick={() => setTab("exercises")}
+      >
+        練習{total > 0 && `（${total}）`}
+      </button>
+      <button
+        className={tab === "reviews" ? "tab active" : "tab"}
+        onClick={() => setTab("reviews")}
+      >
+        複習句子
+      </button>
+    </div>
+  );
+
+  if (tab === "reviews") {
+    return (
+      <section className="panel">
+        <h2>紀錄</h2>
+        {tabs}
+        <ReviewLog labels={labels} />
+      </section>
+    );
+  }
+
   if (total === 0) {
     return (
       <section className="panel">
-        <h2>練習紀錄</h2>
+        <h2>紀錄</h2>
+        {tabs}
         <p className="muted">還沒有做過練習。做完的題目會留在這裡，可以整份再做一次。</p>
       </section>
     );
@@ -81,7 +116,8 @@ export function History({
 
   return (
     <section className="panel">
-      <h2>練習紀錄</h2>
+      <h2>紀錄</h2>
+      {tabs}
       <ul className="history">
         {items.map((it) => (
           <li key={it.exercise_id} className={it.exercise_id === currentId ? "current" : ""}>
@@ -151,6 +187,90 @@ export function History({
         舊的那次批改也留著。刪掉的話那份題目與所有作答一起消失，沒有復原。
       </p>
     </section>
+  );
+}
+
+/**
+ * 複習句子的紀錄，新的在前。
+ *
+ * 跟練習紀錄分開的兩張表、兩個查詢，理由是**單位不一樣**：練習紀錄的
+ * 一列是「一份題目」，複習紀錄的一列是「一句」。複習曾經借用練習的
+ * `attempt` 表，於是複習三句就在那份練習底下長出三筆「第 N 次」，
+ * 清單上的「做過 12 次」其實是複習了 12 句。
+ *
+ * 這裡不提供「再做一次」：一句每天只練一次，那正是這條排程的規則。
+ */
+function ReviewLog({ labels }: { labels: Record<ExerciseKind, string> }) {
+  const [page, setPage] = useState(0);
+  const [data, setData] = useState<SentenceAttemptPage | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listSentenceAttempts(REVIEW_LOG_PAGE, page * REVIEW_LOG_PAGE)
+      .then((got) => {
+        if (!cancelled) setData(got);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(errorMessage(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [page]);
+
+  if (error) return <p className="error">{error}</p>;
+  if (!data) return <p className="muted">載入中…</p>;
+  if (data.total === 0) {
+    return (
+      <p className="muted">
+        還沒有複習過句子。翻譯題寫錯的句子隔天會回到複習頁，寫過就會留在這裡。
+      </p>
+    );
+  }
+
+  const pages = Math.max(1, Math.ceil(data.total / REVIEW_LOG_PAGE));
+
+  return (
+    <>
+      <ul className="review-log">
+        {data.items.map((a) => (
+          <li key={a.id}>
+            <div className="muted history-meta">
+              {formatWhen(a.created_at)}
+              {a.kind && `　·　${labels[a.kind] ?? a.kind}`}
+              {a.correct ? (
+                <span className="ok">　·　寫對了</span>
+              ) : (
+                <span className="error">　·　沒寫對</span>
+              )}
+            </div>
+            {/* 題目那份練習被刪掉時 source 是空的。那時候仍然要列出
+                這一筆——他寫過的東西不該因為題目沒了就整列消失 */}
+            <p className="prompt">{a.source || <span className="muted">（題目已刪除）</span>}</p>
+            <p className="attempt-mine">{a.answer}</p>
+            <p>
+              <Reference reference={a.reference} formal={a.reference_formal} />
+            </p>
+            {a.comment && <p className="muted">{a.comment}</p>}
+          </li>
+        ))}
+      </ul>
+
+      {pages > 1 && (
+        <div className="row pager">
+          <button onClick={() => setPage(page - 1)} disabled={page === 0}>
+            上一頁
+          </button>
+          <span className="muted">
+            第 {page + 1} / {pages} 頁　·　共 {data.total} 句
+          </span>
+          <button onClick={() => setPage(page + 1)} disabled={page + 1 >= pages}>
+            下一頁
+          </button>
+        </div>
+      )}
+    </>
   );
 }
 

@@ -234,6 +234,9 @@ pub struct PracticeEngine<'a> {
 mod choices;
 mod generate;
 mod grade;
+
+pub use grade::{DueAnswer, DueSentenceResult};
+
 mod links;
 mod points;
 mod words;

@@ -130,7 +130,7 @@ pub struct ExerciseView {
 }
 
 /// 使用者的作答。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GradeInput {
     pub exercise_id: i64,
     /// 翻譯題：每題的文字答案
@@ -154,8 +154,26 @@ pub struct ItemResult {
     pub index: usize,
     #[serde(default)]
     pub correct: bool,
+    /// 參考答案的**口語說法**——只在它跟正式說法不一樣時才有。
+    ///
+    /// 一句話往往有兩種都對的說法，而模型每次只挑一個：同一題
+    /// 「這個標誌的意思是禁止停車」兩次批改分別給了
+    /// `This sign means no parking.` 與
+    /// `This sign means that parking is prohibited.`，兩句都對，
+    /// 但學習者看到的是「上次那樣寫、這次這樣寫」，分不出哪個才是標準。
+    /// 兩種一起給，差別就從雜訊變成資訊。
+    ///
+    /// **兩種說法一樣時這裡是 `None`，答案只寫在 [`Self::reference_formal`]。**
+    /// 為了湊滿兩欄硬掰一句不自然的話，比只給一句更糟；而讓「有沒有值」
+    /// 本身帶意義，UI 就說得出「這句話口語跟書面會分開講」。
+    ///
+    /// 舊的批改紀錄只有這一欄（那時候它是唯一的參考答案，語氣不明），
+    /// 所以顯示時要能退回它。
     #[serde(default)]
     pub reference: Option<String>,
+    /// 參考答案的**正式／書面說法**。有參考答案時這一欄一定有。
+    #[serde(default)]
+    pub reference_formal: Option<String>,
     #[serde(default)]
     pub comment: Option<String>,
 }

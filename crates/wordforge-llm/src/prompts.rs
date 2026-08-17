@@ -629,6 +629,21 @@ pub fn grammar_drill(
     }
 }
 
+/// 批改翻譯時，一題送給模型的內容。
+///
+/// `target_word` 曾經沒有送出去，而那是一個看不出來的洞：出題時系統
+/// 刻意挑了「這題要練 beat」，畫面上也標著那個字，但批改的 prompt 裡
+/// 只有題目與作答。模型不知道這題的存在理由，給的參考答案自然可能
+/// 繞開那個字——實測 `我哥哥下棋又贏了我`（要練 `beat`）拿到的正式
+/// 說法是 `My older brother defeated me at chess`，一個好句子，
+/// 只是那一題要練的字不見了。
+pub struct FeedbackItem {
+    pub source: String,
+    pub answer: String,
+    /// 這題刻意要練的字。舊練習與複習句子可能沒有。
+    pub target_word: Option<String>,
+}
+
 /// 批改翻譯，並判斷學習者不懂哪些字。
 ///
 /// `unknown_words` 是這整套設計的關鍵：批改不只是打分數，還要看出
@@ -638,7 +653,7 @@ pub fn translation_feedback(
     target_lang: &str,
     native_lang: &str,
     direction_to_target: bool,
-    items: &[(String, String)],
+    items: &[FeedbackItem],
     known_weak_points: &[String],
     points: &[String],
 ) -> ChatRequest {
@@ -647,13 +662,21 @@ pub fn translation_feedback(
     let body: String = items
         .iter()
         .enumerate()
-        .map(|(i, (source, answer))| {
-            let answer = if answer.trim().is_empty() {
+        .map(|(i, item)| {
+            let answer = if item.answer.trim().is_empty() {
                 "（沒有作答）"
             } else {
-                answer.trim()
+                item.answer.trim()
             };
-            format!("{}. 題目：{source}\n   學習者的翻譯：{answer}\n", i + 1)
+            let word = match &item.target_word {
+                Some(w) => format!("   這題要練的字：{w}\n"),
+                None => String::new(),
+            };
+            format!(
+                "{}. 題目：{}\n{word}   學習者的翻譯：{answer}\n",
+                i + 1,
+                item.source
+            )
         })
         .collect();
 
@@ -684,6 +707,23 @@ pub fn translation_feedback(
          - 每個問題都要標註文法點。{points}\n\
          - 每條修正都要帶 `index`：那是**第幾題**（從 1 起算）。\n\
            少了它就說不出「這一句你錯在哪個文法點」——那正是複習時最有用的訊息。\n\
+         - **參考答案給兩種說法**：`reference_formal` 是正式、書面會怎麼寫，\n\
+           `reference` 是日常口語會怎麼講。兩種都要道地——為了湊滿兩欄\n\
+           硬寫一句不自然的話，比只給一句更糟。\n\
+         - **兩種說法一樣的時候，只填 `reference_formal`，`reference` 留空。**\n\
+           很多句子本來就沒有語體差別，那時候寫兩句幾乎一樣的話只會讓人\n\
+           以為它們有差。有差別時才兩欄都填，例如\n\
+           「這個標誌的意思是禁止停車」：口語 `This sign means no parking.`，\n\
+           正式 `This sign means that parking is prohibited.`。\n\
+         - **答對的題目一樣要給參考答案，而且一樣要判斷有沒有語體差別。**\n\
+           他寫對了一種說法，另一種說法正是他還沒學到的東西——那時候的\n\
+           參考答案比答錯時更有用。講評可以簡短，參考答案不能省。\n\
+         - **標了「這題要練的字」的題目，參考答案裡至少要有一句真的用到它**\n\
+           （詞形變化算，`beat` / `beats` / `beat me` 都算）。那個字就是這一題\n\
+           存在的理由，兩句參考答案都繞開它的話，這題等於沒練到。\n\
+           如果正式的說法自然不會用那個字（例如正式會寫 `defeated` 而不是\n\
+           `beat`），就讓口語那一句用它，並在 comment 裡說明正式說法為什麼\n\
+           換掉了它——那個說明本身就是這一題最值得學的東西。\n\
          - **判斷學習者不懂哪些字**：翻錯、漏譯、或用了明顯繞路的說法，\n\
            都代表他不會那個字。把那些{target_lang}單字列在 unknown_words，\n\
            系統會自動排進他的複習。\n\
@@ -692,7 +732,9 @@ pub fn translation_feedback(
          # 輸出格式\n\
          {{\n\
          \x20 \"score\": 0 到 100 的整數,\n\
-         \x20 \"items\": [{{\"index\": 1, \"correct\": true, \"reference\": \"參考答案\", \
+         \x20 \"items\": [{{\"index\": 1, \"correct\": true, \
+         \"reference_formal\": \"正式說法\", \
+         \"reference\": \"口語說法，跟正式一樣就不要這一欄\", \
          \"comment\": \"用{native_lang}說明，答對就寫得簡短\"}}],\n\
          \x20 \"corrections\": [{{\"index\": 1, \"original\": \"原句\", \"corrected\": \"修正後\", \
          \"grammar_point\": \"tense\", \"severity\": \"minor\", \
@@ -1055,6 +1097,15 @@ mod tests {
             .iter()
             .map(|(id, _, _)| id.to_string())
             .collect()
+    }
+
+    /// 一題批改內容。多數測試不在意目標字，那些用這個。
+    fn graded(source: &str, answer: &str) -> FeedbackItem {
+        FeedbackItem {
+            source: source.into(),
+            answer: answer.into(),
+            target_word: None,
+        }
     }
 
     fn sample_words() -> Vec<String> {
@@ -1743,11 +1794,8 @@ mod tests {
     #[test]
     fn translation_feedback_asks_for_unknown_words() {
         let items = vec![
-            (
-                "我昨天去了公園".to_string(),
-                "I go to park yesterday".to_string(),
-            ),
-            ("他很勤奮".to_string(), String::new()),
+            graded("我昨天去了公園", "I go to park yesterday"),
+            graded("他很勤奮", ""),
         ];
         let req = translation_feedback("English", "繁體中文", true, &items, &[], &english_points());
         let text = &req.messages[0].content;
@@ -1760,9 +1808,73 @@ mod tests {
         assert!(req.json_only);
     }
 
+    /// 參考答案要兩種語體，而且要講清楚「一樣的時候只填正式那欄」。
+    ///
+    /// 少了後面那句規則，模型會為了填滿兩欄硬掰一句幾乎一樣的話，
+    /// 學習者看到兩句只差一個字，會以為它們有語體差別。
+    #[test]
+    fn translation_feedback_asks_for_both_registers() {
+        let items = vec![graded(
+            "這個標誌的意思是禁止停車",
+            "This sign means no parking",
+        )];
+        let req = translation_feedback("English", "繁體中文", true, &items, &[], &english_points());
+        let text = &req.messages[0].content;
+
+        assert!(text.contains("reference_formal"), "要有正式說法那一欄");
+        assert!(
+            text.contains("留空") || text.contains("不要這一欄"),
+            "沒有講清楚兩種一樣時該怎麼填"
+        );
+        // 答對那一題最需要的正是「另一種說法」，而旁邊就寫著
+        // 「答對就寫得簡短」——不明講的話模型會連參考答案一起省掉。
+        // 實測資料裡答對的題目確實只拿到一欄。
+        assert!(
+            text.contains("答對的題目一樣要給參考答案"),
+            "沒有要求答對也給參考答案"
+        );
+    }
+
+    /// 批改要知道**這一題是為了練哪個字**。
+    ///
+    /// 這條測試存在的理由是它曾經是錯的：出題時系統刻意挑了「這題要練
+    /// `beat`」，畫面上也標著那個字，但批改的 prompt 裡只有題目與作答。
+    /// 模型不知道這一題的存在理由，給的參考答案就繞開了那個字——實測
+    /// 「我哥哥下棋又贏了我」拿到的正式說法是 `defeated me at chess`，
+    /// 一個好句子，只是那一題要練的字不見了。
+    #[test]
+    fn translation_feedback_says_which_word_the_item_practises() {
+        let items = vec![
+            FeedbackItem {
+                source: "我哥哥下棋又贏了我".into(),
+                answer: "My brother won me at chess".into(),
+                target_word: Some("beat".into()),
+            },
+            // 沒有指定字的題目（舊練習、複習句子）不該冒出一行空的標註
+            graded("天氣很好", "The weather is nice"),
+        ];
+        let text =
+            &translation_feedback("English", "繁體中文", true, &items, &[], &english_points())
+                .messages[0]
+                .content;
+
+        assert!(text.contains("這題要練的字：beat"), "沒有把目標字送出去");
+        // 計數要帶冒號：批改要求那條規則本身也提到「這題要練的字」，
+        // 不帶冒號會連規則一起數進去，於是這個斷言永遠是 2
+        assert_eq!(
+            text.matches("這題要練的字：").count(),
+            1,
+            "沒有指定字的題目不該有這一行"
+        );
+        assert!(
+            text.contains("參考答案裡至少要有一句真的用到它"),
+            "沒有要求參考答案用上那個字"
+        );
+    }
+
     #[test]
     fn translation_feedback_states_the_other_direction() {
-        let items = vec![("The weather is nice".to_string(), "天氣很好".to_string())];
+        let items = vec![graded("The weather is nice", "天氣很好")];
         let req =
             translation_feedback("English", "繁體中文", false, &items, &[], &english_points());
         assert!(req.messages[0].content.contains("English → 繁體中文"));
@@ -1771,7 +1883,7 @@ mod tests {
     /// 同一個錯誤重複出現，跟第一次犯的意義不同——模型要知道這件事。
     #[test]
     fn translation_feedback_carries_the_learners_history() {
-        let items = vec![("我昨天去了公園".to_string(), "I go to park".to_string())];
+        let items = vec![graded("我昨天去了公園", "I go to park")];
         let weak = vec!["tense".to_string(), "articles".to_string()];
 
         let with_history = translation_feedback(

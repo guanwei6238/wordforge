@@ -9,6 +9,7 @@ import {
   type Material,
   type ProfileLanguages,
 } from "../../api";
+import Reference from "../../components/Reference";
 import SpeakButton from "../../components/SpeakButton";
 import { Choices } from "./choices";
 import { FeedbackPanel, SubmitRow } from "./feedback";
@@ -312,10 +313,11 @@ export default function ExerciseBoard({
                       {feedback?.items[i] && (
                         <p className={feedback.items[i].correct ? "ok" : "error"}>
                           {feedback.items[i].correct ? "✓" : "✗"}{" "}
-                          {feedback.items[i].reference && (
-                            <span className="muted">參考：{feedback.items[i].reference}　</span>
-                          )}
-                          {feedback.items[i].comment}
+                          <Reference
+                            reference={feedback.items[i].reference}
+                            formal={feedback.items[i].reference_formal}
+                          />
+                          {feedback.items[i].comment && <span>　{feedback.items[i].comment}</span>}
                         </p>
                       )}
                     </div>

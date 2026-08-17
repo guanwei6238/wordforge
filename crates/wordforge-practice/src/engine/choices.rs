@@ -160,7 +160,10 @@ pub(super) fn grade_choices(items: &[ChoiceItem], input: &GradeInput) -> Feedbac
         results.push(ItemResult {
             index: i + 1,
             correct,
+            // 選擇題的參考答案就是正確選項，沒有口語／正式之分——
+            // 語體那兩欄是翻譯題才有的事
             reference: answer,
+            reference_formal: None,
             comment: item.explanation.clone(),
         });
     }

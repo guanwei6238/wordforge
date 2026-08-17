@@ -14,7 +14,7 @@ use wordforge_db::Db;
 use wordforge_db::dict::{EntryWrite, NewSense, NewSource};
 use wordforge_db::repo::{NewLemma, cards, lemmas, profiles};
 use wordforge_llm::{ChatRequest, ChatResponse, LlmProvider};
-use wordforge_practice::{GradeInput, PracticeEngine};
+use wordforge_practice::{DueAnswer, GradeInput, PracticeEngine};
 
 /// 翻譯出題 prompt 裡那份候選字清單的標題。
 const ASSIGNMENT_HEADER: &str = "可以挑的字：";
@@ -350,6 +350,321 @@ async fn unknown_words_from_grading_become_review_cards() {
     assert!(words.contains(&2), "diligent 應該進了複習佇列：{words:?}");
 }
 
+/// 直接建一份翻譯練習，並把它的每一句都排進複習。
+///
+/// 不走 `generate`：那條路的題數由選字邏輯決定（到期的一半、隨機的一半），
+/// 測試沒辦法先知道會拿到幾題，而這裡要驗的正是「三句一起送」。
+async fn overdue_translation(db: &Db, profile: i64, to_target: bool, sources: &[&str]) -> i64 {
+    let items: Vec<String> = sources
+        .iter()
+        .map(|s| format!(r#"{{"source":"{s}"}}"#))
+        .collect();
+    let payload = format!(
+        r#"{{"kind":"translation","to_target":{to_target},"items":[{}]}}"#,
+        items.join(",")
+    );
+    let exercise = wordforge_db::exercises::create(
+        db,
+        wordforge_db::exercises::NewExercise {
+            profile_id: ProfileId(profile),
+            kind: if to_target {
+                "translation_to_target"
+            } else {
+                "translation_to_native"
+            },
+            payload_json: &payload,
+            target_words: &[],
+            coverage: None,
+            model: None,
+            material_id: None,
+            topic: None,
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    for i in 0..sources.len() {
+        wordforge_db::sentences::miss(db, ProfileId(profile), exercise.0, i as i64, t0())
+            .await
+            .unwrap();
+    }
+    exercise.0
+}
+
+/// 複習三句只打一次模型，而且一筆練習紀錄都不寫。
+///
+/// 這條測試存在的理由是它曾經是錯的：句子複習原本走 `regrade`，
+/// 那條路每批改一次就往 `attempt` 寫一筆，畫面改成一次一句之後
+/// 「做過 12 次」其實是複習了 12 句，而那 12 句是 12 次完整的模型呼叫。
+#[tokio::test]
+async fn reviewing_three_sentences_costs_one_call_and_no_practice_record() {
+    let (db, profile) = setup(&["park", "diligent"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 1).await;
+
+    let exercise = overdue_translation(
+        &db,
+        profile,
+        true,
+        &["我昨天去了公園", "他很勤奮", "天氣很好"],
+    )
+    .await;
+
+    // 複習批改：一次收三句
+    let llm = FakeLlm::new(&[r#"{"score":67,
+            "items":[{"index":1,"correct":true,"reference_formal":"I went to the park yesterday"},
+                     {"index":2,"correct":true,"reference_formal":"He is diligent",
+                      "reference":"He works hard"},
+                     {"index":3,"correct":false,"reference_formal":"The weather is nice"}],
+            "corrections":[{"index":3,"original":"Weather good","corrected":"The weather is nice",
+                            "grammar_point":"articles","severity":"major"}],
+            "unknown_words":[]}"#]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    // 隔天複習那三句
+    let day2 = t0() + Duration::days(1);
+    let results = engine
+        .grade_due_sentences(
+            profile,
+            &[
+                DueAnswer {
+                    exercise_id: exercise,
+                    item_index: 0,
+                    answer: "I went to the park yesterday".into(),
+                },
+                DueAnswer {
+                    exercise_id: exercise,
+                    item_index: 1,
+                    answer: "He is diligent".into(),
+                },
+                DueAnswer {
+                    exercise_id: exercise,
+                    item_index: 2,
+                    answer: "Weather good".into(),
+                },
+            ],
+            day2,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        llm.call_count(),
+        1,
+        "三句要擠在同一個 prompt 裡，不是一句一次"
+    );
+    assert!(
+        wordforge_db::exercises::attempts(&db, wordforge_db::exercises::ExerciseId(exercise))
+            .await
+            .unwrap()
+            .is_empty(),
+        "複習不該在練習紀錄裡多出任何一筆"
+    );
+
+    // 兩種語體都要留下來
+    assert_eq!(results.len(), 3);
+    assert!(results[0].correct);
+    assert_eq!(results[1].reference.as_deref(), Some("He works hard"));
+    assert_eq!(
+        results[1].reference_formal.as_deref(),
+        Some("He is diligent")
+    );
+    assert!(!results[2].correct);
+
+    // 寫對的兩句從排程消失，寫錯的那句排到後天
+    let still_due = wordforge_db::sentences::due(&db, ProfileId(profile), day2, 10)
+        .await
+        .unwrap();
+    assert!(still_due.is_empty(), "今天的都處理完了");
+    let day3 = wordforge_db::sentences::due(&db, ProfileId(profile), day2 + Duration::days(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(day3.len(), 1, "只有寫錯的那句回來");
+    assert_eq!(day3[0].item_index, 2);
+
+    // 複習紀錄自己一份，三句都在
+    let log = wordforge_db::sentences::attempts(&db, ProfileId(profile), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(log.len(), 3);
+    assert_eq!(
+        wordforge_db::sentences::attempt_count(&db, ProfileId(profile))
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+/// 兩個方向同時到期時，各自照自己的方向送——一份 prompt 只能講一個方向。
+#[tokio::test]
+async fn each_direction_gets_its_own_call() {
+    let (db, profile) = setup(&["park", "diligent"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 1).await;
+
+    let to_target = overdue_translation(&db, profile, true, &["我昨天去了公園"]).await;
+    let to_native = overdue_translation(&db, profile, false, &["The weather is nice"]).await;
+
+    // 複習：兩個方向各一次
+    let llm = FakeLlm::new(&[
+        r#"{"score":100,"items":[{"index":1,"correct":true,"reference_formal":"I went to the park yesterday"}]}"#,
+        r#"{"score":100,"items":[{"index":1,"correct":true,"reference_formal":"天氣很好"}]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let day2 = t0() + Duration::days(1);
+    let results = engine
+        .grade_due_sentences(
+            profile,
+            &[
+                DueAnswer {
+                    exercise_id: to_target,
+                    item_index: 0,
+                    answer: "I went to the park yesterday".into(),
+                },
+                DueAnswer {
+                    exercise_id: to_native,
+                    item_index: 0,
+                    answer: "天氣很好".into(),
+                },
+            ],
+            day2,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "兩個方向要分開送");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.correct));
+
+    // 每一份 prompt 只講自己的方向
+    assert!(
+        llm.seen_prompt(0).contains("繁體中文 → English"),
+        "第一次該是中翻英"
+    );
+    assert!(
+        llm.seen_prompt(1).contains("English → 繁體中文"),
+        "第二次該是英翻中"
+    );
+}
+
+/// 自己寫得出來的字不是「他不會的字」，模型說是也不算。
+///
+/// 這條測試存在的理由是它曾經是錯的。使用者做中翻英「為了不在期末考前
+/// 熬夜，我打算提前一週開始複習。」，答案裡寫了 `finals` 也寫了
+/// `reviewing`，模型仍然把 `final` 列進 `unknown_words`——於是兩個他
+/// 剛剛主動用對的字被排進複習。批改的 `unknown_words` 那時候完全沒有
+/// 本地驗收，模型說什麼就加什麼。
+///
+/// 比對必須認整個詞形家族：他寫的是 `finals` 與 `reviewing`，
+/// 字面比對兩個都對不上原形，那樣等於這層驗收沒有開。
+#[tokio::test]
+async fn a_word_the_learner_wrote_himself_is_not_an_unknown_word() {
+    let (db, profile) = setup(&["park", "final", "review", "diligent"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 1).await;
+
+    lemmas::add_surface_form(&db, "en", "finals", LemmaId(2), "plural")
+        .await
+        .unwrap();
+    lemmas::add_surface_form(&db, "en", "reviewing", LemmaId(3), "gerund")
+        .await
+        .unwrap();
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"我昨天去了公園","target_word":"park",
+                      "reference":"I went to the park yesterday"}]}"#,
+        // 模型把兩個他自己寫出來的字判成生詞，外加一個他真的沒寫的
+        r#"{"score":80,"items":[{"index":1,"correct":true}],
+            "unknown_words":["final","review","diligent"]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+        .await
+        .unwrap();
+
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![
+                    "I plan to start reviewing a week early so I don't stay up late before finals."
+                        .into(),
+                ],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        feedback.unknown_words,
+        vec!["diligent"],
+        "自己寫出來的字不該留在生詞清單裡，沒寫到的要留著"
+    );
+    assert_eq!(feedback.added_to_deck, vec!["diligent"]);
+
+    let cards_on_final: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM card WHERE profile_id = ? AND lemma_id = ?")
+            .bind(profile)
+            .bind(2_i64)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(cards_on_final, 0, "final 不該因為這次批改多一張卡");
+}
+
+/// 反過來說，濾掉的依據只有**他自己寫的那一句**。
+///
+/// 英翻中的作答是中文，裡面本來就不會出現英文單字，所以什麼都不濾。
+/// 這裡要擋的是一個很好想到但錯的做法：拿題目去比對。題目裡的字
+/// 正是他可能看不懂而漏譯的那些——那才是這個功能最該抓到的情況。
+#[tokio::test]
+async fn translating_into_the_native_language_still_trusts_the_model() {
+    let (db, profile) = setup(&["park", "diligent"]).await;
+    set_vocabulary(&db, profile, 300).await;
+    put_in_deck(&db, profile, 1).await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"The diligent student went to the park","target_word":"park",
+                      "reference":"用功的學生去了公園"}]}"#,
+        r#"{"score":60,"items":[{"index":1,"correct":false}],"unknown_words":["diligent"]}"#,
+    ]);
+
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToNative), t0())
+        .await
+        .unwrap();
+
+    let feedback = engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                // 漏譯了 diligent——而那個字就印在題目上
+                answers: vec!["學生去了公園".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        feedback.added_to_deck,
+        vec!["diligent"],
+        "題目裡出現過不代表他會，這個方向不該濾掉任何字"
+    );
+}
+
 /// 使用者自己點「這個字我不會」也要進牌組，而且不能跟模型的判斷重複。
 #[tokio::test]
 async fn words_marked_by_the_learner_are_merged_with_the_models() {
@@ -387,14 +702,19 @@ async fn words_marked_by_the_learner_are_merged_with_the_models() {
 }
 
 /// 模型偶爾會回傳片語、拼錯的字、或根本不是單字的東西，那些不該變成卡片。
+///
+/// 當作對照的那個有效字**不能挑答案裡出現過的**（這裡曾經用 `park`，
+/// 而答案就是 `I go to the park`）：學習者自己寫出來的字現在會被
+/// [`drop_words_the_learner_wrote`] 濾掉，於是這條測試會因為另一個
+/// 完全不同的原因通不過，而它想驗的是「垃圾字」那件事。
 #[tokio::test]
 async fn junk_words_are_not_turned_into_cards() {
-    let (db, profile) = setup(&["park"]).await;
+    let (db, profile) = setup(&["park", "diligent"]).await;
     set_vocabulary(&db, profile, 300).await;
 
     let llm = FakeLlm::new(&[
         r#"{"items":[{"source":"我去公園"}]}"#,
-        r#"{"score":90,"unknown_words":["park","zzzznotaword","take a walk",""]}"#,
+        r#"{"score":90,"unknown_words":["diligent","zzzznotaword","take a walk",""]}"#,
     ]);
     let engine = PracticeEngine::new(&db, &llm);
     let exercise = engine
@@ -418,7 +738,7 @@ async fn junk_words_are_not_turned_into_cards() {
 
     assert_eq!(
         feedback.added_to_deck,
-        vec!["park"],
+        vec!["diligent"],
         "字典裡查不到的不該建卡"
     );
 }

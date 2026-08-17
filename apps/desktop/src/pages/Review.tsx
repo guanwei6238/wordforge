@@ -61,7 +61,7 @@ export default function Review() {
       setQueue(cards);
       setStats(s);
       setStatus(q);
-      setSentenceCount(sentences.length);
+      setSentenceCount(sentences.total);
       setError(null);
     } catch (e) {
       setError(errorMessage(e));
@@ -136,6 +136,10 @@ export default function Review() {
   // 背單字時手不該離開鍵盤。
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      // 在句子那一半按鍵不該動到單字卡。輸入框有焦點時本來就擋掉了，
+      // 但送出之後焦點會落在「下一句」按鈕上——那時候按 B
+      // 會把一張看不見的卡片跳過，而使用者根本不知道發生了什麼。
+      if (mode === "sentences") return;
       if (!current || e.target instanceof HTMLInputElement) return;
       if (e.code === "Space") {
         e.preventDefault();
@@ -157,7 +161,7 @@ export default function Review() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [current, revealed, grade, skip]);
+  }, [current, revealed, grade, skip, mode]);
 
   async function onAddWord(e: FormEvent) {
     e.preventDefault();

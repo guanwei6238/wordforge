@@ -300,6 +300,17 @@ pub struct DueSentenceView {
     pub misses: i64,
 }
 
+/// 今天要練的句子，這一輪的份量加上總數。
+///
+/// 總數要跟著出來：畫面一次只出幾句，只回那幾句的話 UI 說不出
+/// 「還有幾句」，使用者不知道自己在半路還是最後一輪。
+#[derive(Debug, Serialize)]
+pub struct DueSentencePage {
+    pub items: Vec<DueSentenceView>,
+    /// 今天總共還有幾句要練，不是這一輪有幾句
+    pub total: i64,
+}
+
 /// 今天該重練的句子。
 ///
 /// 答錯的句子明天回來，答對的從此不再出現——「練到 100 分」就是
@@ -312,7 +323,7 @@ pub async fn due_sentences(
     state: tauri::State<'_, AppState>,
     profile_id: i64,
     limit: i64,
-) -> CmdResult<Vec<DueSentenceView>> {
+) -> CmdResult<DueSentencePage> {
     // 補寫不需要模型，但 engine 要一個 provider 才建得起來
     if let Ok(dummy) = wordforge_llm::CliLlm::new(wordforge_llm::CliConfig::claude_code()) {
         match PracticeEngine::for_profile(&state.db, &dummy, profile_id).await {
@@ -329,13 +340,18 @@ pub async fn due_sentences(
         }
     }
 
-    let due = wordforge_db::sentences::due(
-        &state.db,
-        ProfileId(profile_id),
-        OffsetDateTime::now_utc(),
-        limit.clamp(1, 100),
-    )
-    .await?;
+    let now = OffsetDateTime::now_utc();
+    let limit = limit.clamp(1, 100);
+    let total = wordforge_db::sentences::due_count(&state.db, ProfileId(profile_id), now).await?;
+
+    // 多撈幾句當緩衝。下面的迴圈會跳過兩種句子：練習內容讀不出來的，
+    // 以及**跟這一輪方向不同的**。剛好撈 `limit` 句的話，最前面那幾句
+    // 一被跳過就整頁空白，但總數還說有幾句要練，使用者看到的是一個
+    // 清不掉的數字。
+    const SKIPPABLE: i64 = 30;
+    let due =
+        wordforge_db::sentences::due(&state.db, ProfileId(profile_id), now, limit + SKIPPABLE)
+            .await?;
 
     // 同一份練習可能有好幾句到期，題目只讀一次
     let mut bodies: std::collections::HashMap<
@@ -343,8 +359,16 @@ pub async fn due_sentences(
         (String, wordforge_practice::payload::ExerciseBody),
     > = std::collections::HashMap::new();
     let mut out = Vec::new();
+    // 這一輪的翻譯方向。中翻英與英翻中同時到期是常態，但批改的 prompt
+    // 開頭就寫著這一份的方向，混在一起送等於告訴模型一件錯的事——
+    // 分開送就變成兩次模型呼叫，而一輪只想打一次。
+    // 另一個方向不會被漏掉：這一輪送完，下一輪自然輪到它。
+    let mut direction: Option<String> = None;
 
     for item in due {
+        if out.len() as i64 >= limit {
+            break;
+        }
         if let std::collections::hash_map::Entry::Vacant(slot) = bodies.entry(item.exercise_id) {
             let Some(record) = wordforge_db::exercises::get(
                 &state.db,
@@ -368,6 +392,11 @@ pub async fn due_sentences(
         let Some(sentence) = items.get(item.item_index as usize) else {
             continue;
         };
+        match &direction {
+            Some(chosen) if chosen != kind => continue,
+            Some(_) => {}
+            None => direction = Some(kind.clone()),
+        }
 
         out.push(DueSentenceView {
             exercise_id: item.exercise_id,
@@ -379,7 +408,186 @@ pub async fn due_sentences(
         });
     }
 
-    Ok(out)
+    Ok(DueSentencePage { items: out, total })
+}
+
+/// 今天不寫這一句，明天再出現。回傳有沒有真的推遲到。
+///
+/// **不打模型**：沒有作答就沒有東西可以批改。這也是它跟「送出」
+/// 最大的差別——跳過是即時的，不必等 CLI 冷啟動。
+#[tauri::command]
+pub async fn skip_sentence(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    exercise_id: i64,
+    item_index: i64,
+) -> CmdResult<bool> {
+    Ok(wordforge_db::sentences::skip(
+        &state.db,
+        ProfileId(profile_id),
+        exercise_id,
+        item_index,
+        OffsetDateTime::now_utc(),
+    )
+    .await?)
+}
+
+/// 送去批改的一句複習。
+#[derive(Debug, Deserialize)]
+pub struct DueAnswerInput {
+    pub exercise_id: i64,
+    pub item_index: usize,
+    pub answer: String,
+}
+
+/// 一句複習的批改結果。
+#[derive(Debug, Serialize)]
+pub struct DueSentenceResultView {
+    pub exercise_id: i64,
+    pub item_index: usize,
+    pub correct: bool,
+    /// 口語說法。只在它跟正式說法不一樣時才有值。
+    pub reference: Option<String>,
+    pub reference_formal: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// 批改這一輪的複習句子。**一次模型呼叫**，而且不寫進練習紀錄。
+///
+/// 跟 `regrade_items` 的分工：那個是「重寫某一份練習裡的某幾題」，
+/// 會合併回那份練習、重算分數、往 `attempt` 寫一筆；這個是複習，
+/// 紀錄寫進 `sentence_attempt`，練習紀錄完全不動。
+#[tauri::command]
+pub async fn grade_due_sentences(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    items: Vec<DueAnswerInput>,
+) -> CmdResult<Vec<DueSentenceResultView>> {
+    let settings = LlmSettings::load(&settings_dir(&app)?);
+    let llm = settings
+        .build()?
+        .ok_or_else(|| CommandError::new("還沒有設定 AI 後端"))?;
+
+    let answers: Vec<wordforge_practice::DueAnswer> = items
+        .into_iter()
+        .map(|i| wordforge_practice::DueAnswer {
+            exercise_id: i.exercise_id,
+            item_index: i.item_index,
+            answer: i.answer,
+        })
+        .collect();
+
+    let engine = PracticeEngine::for_profile(&state.db, llm.as_ref(), profile_id).await?;
+    Ok(engine
+        .grade_due_sentences(profile_id, &answers, OffsetDateTime::now_utc())
+        .await?
+        .into_iter()
+        .map(|r| DueSentenceResultView {
+            exercise_id: r.exercise_id,
+            item_index: r.item_index,
+            correct: r.correct,
+            reference: r.reference,
+            reference_formal: r.reference_formal,
+            comment: r.comment,
+        })
+        .collect())
+}
+
+/// 複習紀錄的一列：那句題目、你寫了什麼、對不對。
+#[derive(Debug, Serialize)]
+pub struct SentenceAttemptView {
+    pub id: i64,
+    pub exercise_id: i64,
+    pub item_index: usize,
+    /// 題目那一句。存在練習的 payload 裡，這裡讀出來給 UI 用。
+    pub source: String,
+    pub kind: String,
+    pub answer: String,
+    pub correct: bool,
+    pub reference: Option<String>,
+    pub reference_formal: Option<String>,
+    pub comment: Option<String>,
+    pub created_at: String,
+}
+
+/// 一頁複習紀錄。
+#[derive(Debug, Serialize)]
+pub struct SentenceAttemptPage {
+    pub items: Vec<SentenceAttemptView>,
+    pub total: i64,
+}
+
+/// 複習過的句子，新的在前。
+///
+/// 跟練習紀錄分開的兩張表、兩個查詢：一個是「這份題目做過幾次」，
+/// 另一個是「今天複習了哪幾句」。
+#[tauri::command]
+pub async fn list_sentence_attempts(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    limit: i64,
+    offset: i64,
+) -> CmdResult<SentenceAttemptPage> {
+    let pid = ProfileId(profile_id);
+    let rows =
+        wordforge_db::sentences::attempts(&state.db, pid, limit.clamp(1, 200), offset.max(0))
+            .await?;
+
+    // 題目本文在練習的 payload 裡。同一份練習只讀一次——一頁十筆
+    // 常常來自同一兩份練習。
+    let mut bodies: std::collections::HashMap<
+        i64,
+        Option<(String, wordforge_practice::payload::ExerciseBody)>,
+    > = std::collections::HashMap::new();
+    let mut items = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        if let std::collections::hash_map::Entry::Vacant(slot) = bodies.entry(row.exercise_id) {
+            let record = wordforge_db::exercises::get(
+                &state.db,
+                wordforge_db::exercises::ExerciseId(row.exercise_id),
+            )
+            .await?;
+            slot.insert(record.and_then(|r| {
+                serde_json::from_str(&r.payload_json)
+                    .ok()
+                    .map(|body| (r.kind, body))
+            }));
+        }
+
+        // 題目讀不出來時仍然要列出這一筆：使用者寫過的東西不該因為
+        // 那份練習壞掉就整列消失，只是題目那一欄說不出來。
+        let (kind, source) = match bodies.get(&row.exercise_id).and_then(|b| b.as_ref()) {
+            Some((kind, wordforge_practice::payload::ExerciseBody::Translation { items, .. })) => (
+                kind.clone(),
+                items
+                    .get(row.item_index as usize)
+                    .map(|i| i.source.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => (String::new(), String::new()),
+        };
+
+        items.push(SentenceAttemptView {
+            id: row.id,
+            exercise_id: row.exercise_id,
+            item_index: row.item_index as usize,
+            source,
+            kind,
+            answer: row.answer,
+            correct: row.correct,
+            reference: row.reference,
+            reference_formal: row.reference_formal,
+            comment: row.comment,
+            created_at: row.created_at,
+        });
+    }
+
+    Ok(SentenceAttemptPage {
+        items,
+        total: wordforge_db::sentences::attempt_count(&state.db, pid).await?,
+    })
 }
 
 /// 重寫一題：第幾題（從 0 起算）、新的作答。
