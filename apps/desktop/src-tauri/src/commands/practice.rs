@@ -517,17 +517,31 @@ pub struct SentenceAttemptView {
     pub created_at: String,
 }
 
-/// 一頁複習紀錄。
+/// 一次送出的複習，含那一輪的每一句。
 #[derive(Debug, Serialize)]
-pub struct SentenceAttemptPage {
+pub struct SentenceAttemptBatch {
+    /// 這一次送出的時間，同時是這一組的識別
+    pub created_at: String,
     pub items: Vec<SentenceAttemptView>,
-    pub total: i64,
 }
 
-/// 複習過的句子，新的在前。
+/// 一頁複習紀錄，一列是**一次送出**不是一句。
+#[derive(Debug, Serialize)]
+pub struct SentenceAttemptPage {
+    pub items: Vec<SentenceAttemptBatch>,
+    /// 複習過幾次（幾組）。分頁數的是這個。
+    pub total: i64,
+    /// 總共練過幾句。跟 `total` 問的是不同的事，兩個都要顯示。
+    pub sentences: i64,
+}
+
+/// 複習紀錄，**以每次送出為一組**，新的在前。
 ///
 /// 跟練習紀錄分開的兩張表、兩個查詢：一個是「這份題目做過幾次」，
-/// 另一個是「今天複習了哪幾句」。
+/// 另一個是「哪一次複習練了哪幾句」。
+///
+/// `limit` / `offset` 數的是組不是句：一輪三句攤成三列的話，一頁十列
+/// 只看得到三次多一點的複習，而使用者記得的是「剛剛那一次」。
 #[tauri::command]
 pub async fn list_sentence_attempts(
     state: tauri::State<'_, AppState>,
@@ -536,66 +550,96 @@ pub async fn list_sentence_attempts(
     offset: i64,
 ) -> CmdResult<SentenceAttemptPage> {
     let pid = ProfileId(profile_id);
-    let rows =
-        wordforge_db::sentences::attempts(&state.db, pid, limit.clamp(1, 200), offset.max(0))
-            .await?;
+    let batches = wordforge_db::sentences::attempt_batches(
+        &state.db,
+        pid,
+        limit.clamp(1, 200),
+        offset.max(0),
+    )
+    .await?;
 
-    // 題目本文在練習的 payload 裡。同一份練習只讀一次——一頁十筆
+    // 題目本文在練習的 payload 裡。同一份練習只讀一次——同一輪的三句
     // 常常來自同一兩份練習。
     let mut bodies: std::collections::HashMap<
         i64,
         Option<(String, wordforge_practice::payload::ExerciseBody)>,
     > = std::collections::HashMap::new();
-    let mut items = Vec::with_capacity(rows.len());
+    let mut items = Vec::with_capacity(batches.len());
 
-    for row in rows {
-        if let std::collections::hash_map::Entry::Vacant(slot) = bodies.entry(row.exercise_id) {
-            let record = wordforge_db::exercises::get(
-                &state.db,
-                wordforge_db::exercises::ExerciseId(row.exercise_id),
-            )
-            .await?;
-            slot.insert(record.and_then(|r| {
-                serde_json::from_str(&r.payload_json)
-                    .ok()
-                    .map(|body| (r.kind, body))
-            }));
+    for batch in batches {
+        let mut group = Vec::with_capacity(batch.items.len());
+        for row in batch.items {
+            if let std::collections::hash_map::Entry::Vacant(slot) = bodies.entry(row.exercise_id) {
+                let record = wordforge_db::exercises::get(
+                    &state.db,
+                    wordforge_db::exercises::ExerciseId(row.exercise_id),
+                )
+                .await?;
+                slot.insert(record.and_then(|r| {
+                    serde_json::from_str(&r.payload_json)
+                        .ok()
+                        .map(|body| (r.kind, body))
+                }));
+            }
+
+            // 題目讀不出來時仍然要列出這一筆：使用者寫過的東西不該因為
+            // 那份練習壞掉就整列消失，只是題目那一欄說不出來。
+            let (kind, source) = match bodies.get(&row.exercise_id).and_then(|b| b.as_ref()) {
+                Some((
+                    kind,
+                    wordforge_practice::payload::ExerciseBody::Translation { items, .. },
+                )) => (
+                    kind.clone(),
+                    items
+                        .get(row.item_index as usize)
+                        .map(|i| i.source.clone())
+                        .unwrap_or_default(),
+                ),
+                _ => (String::new(), String::new()),
+            };
+
+            group.push(SentenceAttemptView {
+                id: row.id,
+                exercise_id: row.exercise_id,
+                item_index: row.item_index as usize,
+                source,
+                kind,
+                answer: row.answer,
+                correct: row.correct,
+                reference: row.reference,
+                reference_formal: row.reference_formal,
+                comment: row.comment,
+                // 解析不出來就當作沒有修正：一筆壞掉的紀錄不該讓整頁看不了
+                corrections: serde_json::from_str(&row.corrections_json).unwrap_or_default(),
+                created_at: row.created_at,
+            });
         }
-
-        // 題目讀不出來時仍然要列出這一筆：使用者寫過的東西不該因為
-        // 那份練習壞掉就整列消失，只是題目那一欄說不出來。
-        let (kind, source) = match bodies.get(&row.exercise_id).and_then(|b| b.as_ref()) {
-            Some((kind, wordforge_practice::payload::ExerciseBody::Translation { items, .. })) => (
-                kind.clone(),
-                items
-                    .get(row.item_index as usize)
-                    .map(|i| i.source.clone())
-                    .unwrap_or_default(),
-            ),
-            _ => (String::new(), String::new()),
-        };
-
-        items.push(SentenceAttemptView {
-            id: row.id,
-            exercise_id: row.exercise_id,
-            item_index: row.item_index as usize,
-            source,
-            kind,
-            answer: row.answer,
-            correct: row.correct,
-            reference: row.reference,
-            reference_formal: row.reference_formal,
-            comment: row.comment,
-            // 解析不出來就當作沒有修正：一筆壞掉的紀錄不該讓整頁看不了
-            corrections: serde_json::from_str(&row.corrections_json).unwrap_or_default(),
-            created_at: row.created_at,
+        items.push(SentenceAttemptBatch {
+            created_at: batch.created_at,
+            items: group,
         });
     }
 
     Ok(SentenceAttemptPage {
         items,
-        total: wordforge_db::sentences::attempt_count(&state.db, pid).await?,
+        total: wordforge_db::sentences::batch_count(&state.db, pid).await?,
+        sentences: wordforge_db::sentences::attempt_count(&state.db, pid).await?,
     })
+}
+
+/// 刪掉複習紀錄。回傳真的刪掉幾筆。
+///
+/// 收 id 清單：同一個入口就能刪掉一整次送出（傳那一組的 id）或其中一句。
+///
+/// **只刪紀錄，不動排程**。那一句還沒練起來的話，明天照樣要練——
+/// 「我不想看到這筆紀錄」跟「這句我練起來了」是兩件事。
+#[tauri::command]
+pub async fn delete_sentence_attempts(
+    state: tauri::State<'_, AppState>,
+    profile_id: i64,
+    ids: Vec<i64>,
+) -> CmdResult<u64> {
+    Ok(wordforge_db::sentences::delete_attempts(&state.db, ProfileId(profile_id), &ids).await?)
 }
 
 /// 重寫一題：第幾題（從 0 起算）、新的作答。

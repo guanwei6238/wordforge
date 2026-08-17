@@ -156,6 +156,7 @@ pub fn run() {
             commands::practice::skip_sentence,
             commands::practice::grade_due_sentences,
             commands::practice::list_sentence_attempts,
+            commands::practice::delete_sentence_attempts,
             commands::practice::word_sentences,
             commands::practice::delete_attempt,
             commands::practice::delete_exercise,

@@ -14,6 +14,7 @@ import {
   type Material,
   type ProfileLanguages,
   currentLanguages,
+  deleteSentenceAttempts,
   listSentenceAttempts,
   REVIEW_LOG_PAGE,
   type SentenceAttemptPage,
@@ -205,6 +206,11 @@ function ReviewLog({ labels }: { labels: Record<ExerciseKind, string> }) {
   const [page, setPage] = useState(0);
   const [data, setData] = useState<SentenceAttemptPage | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 刪除要二次確認，但不用彈窗——按一下變成「確定刪除」，跟練習紀錄一致。
+  // 認的是那一組的時間戳，因為一列就是一次送出。
+  const [confirming, setConfirming] = useState<string | null>(null);
+  // 刪完要重讀這一頁。用計數器而不是直接改 data：總數與分頁都會變
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -218,7 +224,7 @@ function ReviewLog({ labels }: { labels: Record<ExerciseKind, string> }) {
     return () => {
       cancelled = true;
     };
-  }, [page]);
+  }, [page, reload]);
 
   if (error) return <p className="error">{error}</p>;
   if (!data) return <p className="muted">載入中…</p>;
@@ -232,31 +238,71 @@ function ReviewLog({ labels }: { labels: Record<ExerciseKind, string> }) {
 
   const pages = Math.max(1, Math.ceil(data.total / REVIEW_LOG_PAGE));
 
+  async function remove(ids: number[]) {
+    setConfirming(null);
+    try {
+      await deleteSentenceAttempts(ids);
+      // 刪到某一頁只剩空的時候要退回上一頁，不然畫面是一片空白
+      if (data && data.items.length === 1 && page > 0) setPage(page - 1);
+      else setReload((n) => n + 1);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+
   return (
     <>
       <ul className="review-log">
-        {data.items.map((a) => (
-          <li key={a.id}>
-            <div className="muted history-meta">
-              {formatWhen(a.created_at)}
-              {a.kind && `　·　${labels[a.kind] ?? a.kind}`}
-              {a.correct ? (
-                <span className="ok">　·　寫對了</span>
-              ) : (
-                <span className="error">　·　沒寫對</span>
-              )}
-            </div>
-            {/* 題目那份練習被刪掉時 source 是空的。那時候仍然要列出
-                這一筆——他寫過的東西不該因為題目沒了就整列消失 */}
-            <p className="prompt">{a.source || <span className="muted">（題目已刪除）</span>}</p>
-            <p className="attempt-mine">{a.answer}</p>
-            <p>
-              <Reference reference={a.reference} formal={a.reference_formal} />
-            </p>
-            {a.comment && <p className="muted">{a.comment}</p>}
-            <Corrections items={a.corrections} />
-          </li>
-        ))}
+        {data.items.map((batch) => {
+          const passed = batch.items.filter((a) => a.correct).length;
+          const kind = batch.items[0]?.kind;
+          return (
+            <li key={batch.created_at}>
+              {/* 一列是「一次送出」：那一輪練了幾句、對了幾句。
+                  攤成一句一列的話，使用者記得的「剛剛那一次」就被打散了 */}
+              <div className="row review-batch-head">
+                <span className="muted history-meta">
+                  {formatWhen(batch.created_at)}
+                  {kind && `　·　${labels[kind] ?? kind}`}
+                  　·　{batch.items.length} 句
+                  {passed > 0 && <span className="ok">　·　{passed} 句寫對</span>}
+                </span>
+                {confirming === batch.created_at ? (
+                  <span className="row">
+                    <button
+                      className="destructive"
+                      onClick={() => void remove(batch.items.map((a) => a.id))}
+                    >
+                      確定刪除
+                    </button>
+                    <button onClick={() => setConfirming(null)}>取消</button>
+                  </span>
+                ) : (
+                  <button onClick={() => setConfirming(batch.created_at)}>刪除</button>
+                )}
+              </div>
+
+              <ol className="review-batch">
+                {batch.items.map((a) => (
+                  <li key={a.id}>
+                    {/* 題目那份練習被刪掉時 source 是空的。那時候仍然要列出
+                        這一筆——他寫過的東西不該因為題目沒了就整列消失 */}
+                    <p className="prompt">
+                      {a.correct ? <span className="ok">✓ </span> : <span className="error">✗ </span>}
+                      {a.source || <span className="muted">（題目已刪除）</span>}
+                    </p>
+                    <p className="attempt-mine">{a.answer}</p>
+                    <p>
+                      <Reference reference={a.reference} formal={a.reference_formal} />
+                    </p>
+                    {a.comment && <p className="muted">{a.comment}</p>}
+                    <Corrections items={a.corrections} />
+                  </li>
+                ))}
+              </ol>
+            </li>
+          );
+        })}
       </ul>
 
       {pages > 1 && (
@@ -265,13 +311,17 @@ function ReviewLog({ labels }: { labels: Record<ExerciseKind, string> }) {
             上一頁
           </button>
           <span className="muted">
-            第 {page + 1} / {pages} 頁　·　共 {data.total} 句
+            第 {page + 1} / {pages} 頁　·　複習過 {data.total} 次、共 {data.sentences} 句
           </span>
           <button onClick={() => setPage(page + 1)} disabled={page + 1 >= pages}>
             下一頁
           </button>
         </div>
       )}
+
+      <p className="muted hint">
+        刪除只會拿掉這筆紀錄，不影響排程——那一句還沒寫對的話，明天照樣會回到複習頁。
+      </p>
     </>
   );
 }

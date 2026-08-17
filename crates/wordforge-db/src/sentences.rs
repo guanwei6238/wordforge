@@ -293,6 +293,104 @@ pub async fn attempts(
         .collect())
 }
 
+/// 一次送出的複習，含那一輪的每一句。
+///
+/// 分組的鍵是 `created_at`：同一輪的每一句是同一次批改寫進來的，
+/// 拿到的是同一個時間戳（到微秒），所以它天生就是「這一次送出」的識別，
+/// 不需要另外加一個批次欄位。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttemptBatch {
+    pub created_at: String,
+    pub items: Vec<SentenceAttempt>,
+}
+
+/// 複習紀錄，**以「每次送出」為一組**，新的在前。
+///
+/// `limit` / `offset` 數的是**組**不是句：一輪三句攤成三列的話，
+/// 一頁十列只看得到三次多一點的複習，而使用者記得的是「剛剛那一次」。
+pub async fn attempt_batches(
+    db: &Db,
+    profile_id: ProfileId,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AttemptBatch>> {
+    // 一次查完。先挑出這一頁的批次時間，再把屬於它們的句子全撈回來——
+    // 分兩段查會變成一組一次查詢，十組就是十一趟。
+    let rows = sqlx::query(
+        "SELECT id, exercise_id, item_index, answer, correct,
+                reference, reference_formal, comment, corrections_json, created_at
+         FROM sentence_attempt
+         WHERE profile_id = ?1 AND created_at IN (
+             SELECT DISTINCT created_at FROM sentence_attempt
+             WHERE profile_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3
+         )
+         ORDER BY created_at DESC, id",
+    )
+    .bind(profile_id.0)
+    .bind(limit.max(0))
+    .bind(offset.max(0))
+    .fetch_all(db.pool())
+    .await?;
+
+    let mut batches: Vec<AttemptBatch> = Vec::new();
+    for row in rows.iter() {
+        let attempt = SentenceAttempt {
+            id: row.get("id"),
+            exercise_id: row.get("exercise_id"),
+            item_index: row.get("item_index"),
+            answer: row.get("answer"),
+            correct: row.get::<i64, _>("correct") != 0,
+            reference: row.get("reference"),
+            reference_formal: row.get("reference_formal"),
+            comment: row.get("comment"),
+            corrections_json: row.get("corrections_json"),
+            created_at: row.get("created_at"),
+        };
+        match batches.last_mut() {
+            Some(last) if last.created_at == attempt.created_at => last.items.push(attempt),
+            _ => batches.push(AttemptBatch {
+                created_at: attempt.created_at.clone(),
+                items: vec![attempt],
+            }),
+        }
+    }
+    Ok(batches)
+}
+
+/// 複習過幾次（幾組），不是幾句。分頁的總數要用這個。
+pub async fn batch_count(db: &Db, profile_id: ProfileId) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT created_at) FROM sentence_attempt WHERE profile_id = ?",
+    )
+    .bind(profile_id.0)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(count)
+}
+
+/// 刪掉指定的複習紀錄。回傳真的刪掉幾筆。
+///
+/// 收 id 清單而不是「刪這一組」：同一個入口就能刪掉一整次送出（傳整組的
+/// id）或其中一句。而且 id 是主鍵，不會像時間戳那樣要靠字串比對。
+///
+/// **只刪紀錄**。排程（`sentence_review`）不動——那是「這句還沒練起來」，
+/// 跟「我不想看到這筆紀錄」是兩件事。刪了紀錄還是要練那一句。
+pub async fn delete_attempts(db: &Db, profile_id: ProfileId, ids: &[i64]) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql =
+        format!("DELETE FROM sentence_attempt WHERE profile_id = ? AND id IN ({placeholders})");
+    let mut q = sqlx::query(&sql).bind(profile_id.0);
+    for id in ids {
+        q = q.bind(id);
+    }
+    Ok(q.execute(db.pool()).await?.rows_affected())
+}
+
 /// 複習紀錄總共幾筆。
 pub async fn attempt_count(db: &Db, profile_id: ProfileId) -> Result<i64> {
     let count: i64 =
@@ -575,6 +673,105 @@ mod tests {
         // 刪練習時 CASCADE 會照 exercise_id 找子列，那條也不能是全表掃描
         let cascade = plan(&db, "SELECT 1 FROM sentence_attempt WHERE exercise_id = 1").await;
         assert!(!cascade.contains("SCAN"), "CASCADE 會掃全表：{cascade}");
+    }
+
+    /// 一次送出的三句是一組，分頁數的是組不是句。
+    ///
+    /// 攤成一句一列的話，一頁十列只看得到三次多一點的複習——而使用者
+    /// 記得的是「剛剛那一次」，不是「第 7 句」。
+    #[tokio::test]
+    async fn review_attempts_are_grouped_by_when_they_were_submitted() {
+        let (db, profile, exercise) = setup().await;
+        // 第一輪三句，第二輪兩句（其中一句沒作答就送出）
+        for (round, count) in [(0, 3), (1, 2)] {
+            for i in 0..count {
+                record_attempt(
+                    &db,
+                    profile,
+                    NewAttempt {
+                        exercise_id: exercise,
+                        item_index: i,
+                        answer: &format!("第 {round} 輪第 {i} 句"),
+                        correct: i == 0,
+                        reference: None,
+                        reference_formal: None,
+                        comment: None,
+                        corrections_json: "[]",
+                    },
+                    t0() + Duration::days(round),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        assert_eq!(batch_count(&db, profile).await.unwrap(), 2, "兩次送出");
+        assert_eq!(
+            attempt_count(&db, profile).await.unwrap(),
+            5,
+            "句數仍然是 5，兩個數字問的是不同的事"
+        );
+
+        let page = attempt_batches(&db, profile, 10, 0).await.unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].items.len(), 2, "新的那一輪在前，它有兩句");
+        assert_eq!(page[1].items.len(), 3);
+        assert!(
+            page[0]
+                .items
+                .iter()
+                .all(|a| a.created_at == page[0].created_at),
+            "一組裡的每一句都屬於同一次送出"
+        );
+
+        // 一頁一組：翻頁翻的是「第幾次複習」
+        let first = attempt_batches(&db, profile, 1, 0).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].items.len(), 2, "不能因為 LIMIT 1 就把那一組切半");
+        let second = attempt_batches(&db, profile, 1, 1).await.unwrap();
+        assert_eq!(second[0].items.len(), 3);
+    }
+
+    /// 刪紀錄只刪紀錄：那一句還沒練起來的話，明天照樣要練。
+    #[tokio::test]
+    async fn deleting_a_record_leaves_the_schedule_alone() {
+        let (db, profile, exercise) = setup().await;
+        miss(&db, profile, exercise, 0, t0()).await.unwrap();
+        let id = record_attempt(
+            &db,
+            profile,
+            NewAttempt {
+                exercise_id: exercise,
+                item_index: 0,
+                answer: "寫錯的答案",
+                correct: false,
+                reference: None,
+                reference_formal: None,
+                comment: None,
+                corrections_json: "[]",
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(delete_attempts(&db, profile, &[id]).await.unwrap(), 1);
+        assert_eq!(attempt_count(&db, profile).await.unwrap(), 0);
+        assert_eq!(
+            due(&db, profile, t0() + Duration::days(1), 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "排程不該被刪紀錄影響——那一句還是沒練起來"
+        );
+
+        // 別人的紀錄刪不到，空清單也不該把整張表清掉
+        assert_eq!(delete_attempts(&db, profile, &[]).await.unwrap(), 0);
+        assert_eq!(
+            delete_attempts(&db, ProfileId(999), &[id]).await.unwrap(),
+            0
+        );
     }
 
     /// 複習紀錄自己一張表，而且要分頁。

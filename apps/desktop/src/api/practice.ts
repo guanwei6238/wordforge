@@ -511,21 +511,48 @@ export interface SentenceAttempt {
   created_at: string;
 }
 
-export interface SentenceAttemptPage {
+/** 一次送出的複習，含那一輪的每一句。 */
+export interface SentenceAttemptBatch {
+  /** 這一次送出的時間，同時是這一組的識別 */
+  created_at: string;
   items: SentenceAttempt[];
-  total: number;
 }
 
-/** 複習紀錄一頁幾筆。 */
+export interface SentenceAttemptPage {
+  items: SentenceAttemptBatch[];
+  /** 複習過幾次（幾組）。分頁數的是這個。 */
+  total: number;
+  /** 總共練過幾句 */
+  sentences: number;
+}
+
+/** 複習紀錄一頁幾**次**（不是幾句）。 */
 export const REVIEW_LOG_PAGE = 10;
 
-/** 複習過的句子，新的在前。 */
+/**
+ * 複習紀錄，以每次送出為一組，新的在前。
+ *
+ * 一輪三句攤成三列的話，一頁十列只看得到三次多一點的複習——
+ * 而使用者記得的是「剛剛那一次」，不是「第 7 句」。
+ */
 export function listSentenceAttempts(
   limit = REVIEW_LOG_PAGE,
   offset = 0,
   profileId = DEFAULT_PROFILE_ID,
 ): Promise<SentenceAttemptPage> {
   return invoke("list_sentence_attempts", { profileId, limit, offset });
+}
+
+/**
+ * 刪掉複習紀錄。傳一整組的 id 就是刪掉那一次送出。
+ *
+ * **只刪紀錄，不動排程**：那一句還沒練起來的話，明天照樣要練。
+ */
+export function deleteSentenceAttempts(
+  ids: number[],
+  profileId = DEFAULT_PROFILE_ID,
+): Promise<number> {
+  return invoke("delete_sentence_attempts", { profileId, ids });
 }
 
 /**
