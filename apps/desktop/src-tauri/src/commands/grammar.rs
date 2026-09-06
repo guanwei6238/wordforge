@@ -12,6 +12,14 @@ use crate::commands::llm::settings_dir;
 use crate::llm_settings::LlmSettings;
 use crate::{AppState, CmdResult, CommandError};
 
+/// 給人看的種類名稱。
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        wordforge_db::grammar::KIND_PATTERN => "句型",
+        _ => "錯誤標籤",
+    }
+}
+
 /// 一個文法點：定義加上「你學到哪」。
 ///
 /// 定義來自 `grammar_def`（可匯入、可編輯），掌握狀態來自 `grammar_point`
@@ -290,6 +298,31 @@ pub async fn import_grammar(
         // 壞的那條丟掉、其餘照收：一份 80 條的檔案不該因為一條打錯字
         // 而整份失敗。但**一定要說出丟了哪些**，不然使用者會以為
         // 難度上限開著，而它對那幾個句型從來沒有作用過。
+        // **匯入不得把既有的定義改成另一種東西。**
+        //
+        // `(lang, point)` 是唯一鍵，而 `upsert_def` 照著給的值寫 kind——
+        // 於是一份句型清單只要用到內建錯誤標籤已經佔掉的識別碼
+        // （`there-be`、`passive-voice` 這些很自然會撞），就會把那個標籤
+        // 就地改成句型：它從批改的可選清單裡消失，累積的錯誤紀錄也被
+        // 重新解讀成句型的掌握度。畫面上完全看不出來。
+        //
+        // 這裡擋下來並回報。要改變一筆定義的種類是**單筆、刻意**的動作，
+        // 該走文法頁的編輯器——那裡使用者正看著那個下拉選單。
+        if let Some(existing) =
+            wordforge_db::grammar::get_def(&state.db, &target, &def.point).await?
+            && existing.kind != def.kind
+        {
+            report.rejected.push(format!(
+                "{}：這個識別碼已經是「{}」，檔案裡寫的是「{}」。\
+                 匯入不會改變既有定義的種類——那會讓它從原本的用途裡消失，\
+                 而畫面上看不出來。請換一個識別碼，或到文法頁單獨改它。",
+                def.point,
+                kind_label(&existing.kind),
+                kind_label(&def.kind),
+            ));
+            continue;
+        }
+
         let (kept, rejected) = wordforge_practice::vet_detectors(&def.point, &def.detectors);
         def.detectors = kept;
         report.rejected.extend(rejected);

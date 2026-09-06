@@ -110,10 +110,14 @@ pub const ENGLISH_POINTS: &[(&str, &str, &str)] = &[
 
 /// 種子清單的版本。**改動 [`ENGLISH_POINTS`] 就要加一。**
 ///
+/// 版本 3 沒有改清單內容，是為了跑一次修復：匯入一份句型清單時，
+/// 只要撞到這裡已經用掉的識別碼（`there-be`、`passive-voice` 這些很自然
+/// 會撞），那個錯誤標籤就會被就地改成句型。見 `grammar::seed_defs`。
+///
 /// `grammar_def` 只在第一次啟動時填，所以清單改了之後，早就用過的
 /// 資料庫永遠看不到新的點——這個版號讓補齊只跑一次。
 /// 只跑一次是重點：每次啟動都補的話，使用者刪掉的點會一直復活。
-pub const SEED_VERSION: i64 = 2;
+pub const SEED_VERSION: i64 = 3;
 
 /// 某個語言的種子清單，第一次啟動時用來填 `grammar_def`。
 ///

@@ -879,6 +879,39 @@ pub async fn seed_defs(db: &Db, lang: &str, now: OffsetDateTime) -> Result<usize
     let mut written = 0usize;
     for (i, (point, name, level)) in seed.iter().enumerate() {
         if existing.iter().any(|e| e == point) {
+            // **先修復被匯入改掉種類的那些列。**
+            //
+            // `(lang, point)` 是唯一鍵，所以一份句型清單只要用到這裡已經
+            // 佔掉的識別碼（`there-be`、`passive-voice` 這些很自然會撞），
+            // 那個錯誤標籤就會被就地改成句型：它從批改的可選清單裡消失，
+            // 累積的錯誤紀錄也被重新解讀成句型的掌握度，而畫面上完全
+            // 看不出來。實際發生過，40 條標籤被改掉 4 條。
+            //
+            // `origin = 'seed'` 而 `kind <> 'point'` 就是這個狀態的指紋——
+            // `upsert_def` 的 ON CONFLICT 不碰 `origin`，被改的那幾列仍然
+            // 標著 seed。所以不必列舉是哪幾個識別碼。
+            //
+            // 名稱與偵測規則一起還原：那幾列的名稱同樣是匯入蓋掉的，
+            // 不是使用者寫的。這段跟著版號只跑一次，所以刻意要把某個種子
+            // 改成句型的人不會每次開 App 都被扳回去。
+            let repaired = sqlx::query(
+                "UPDATE grammar_def
+                 SET kind = 'point', name = ?3, level = ?4,
+                     level_ordinal = NULL, detectors_json = '[]', updated_at = ?5
+                 WHERE lang = ?1 AND point = ?2 AND origin = 'seed' AND kind <> 'point'",
+            )
+            .bind(lang)
+            .bind(*point)
+            .bind(*name)
+            .bind(*level)
+            .bind(ts::to_sql(now))
+            .execute(db.pool())
+            .await?
+            .rows_affected();
+            if repaired > 0 {
+                tracing::warn!(point, "這個種子標籤被匯入改成了句型，已扳回");
+            }
+
             // 已經有了：只把等級與順序對齊，而且只碰我們自己種的那些列。
             // `name` 與講解不在 SET 裡——那是使用者的東西。
             sqlx::query(
@@ -1458,6 +1491,85 @@ mod def_tests {
                 .len(),
             1
         );
+    }
+
+    /// 這條測試存在的理由是它真的發生過：匯入一份句型清單，其中四個
+    /// 識別碼跟內建的錯誤標籤撞號（`there-be`、`passive-voice` 這些很自然
+    /// 會撞），於是那四個標籤被就地改成句型——批改的可選清單從 40 條
+    /// 掉到 36 條，累積七次的錯誤紀錄被重新解讀成句型的掌握度，
+    /// 而畫面上完全看不出來。
+    #[tokio::test]
+    async fn a_seed_label_turned_into_a_pattern_is_put_back() {
+        let db = setup().await;
+        // 先種一次，拿到 40 條錯誤標籤
+        seed_defs(&db, "en", t0()).await.unwrap();
+        assert!(
+            list_points(&db, "en")
+                .await
+                .unwrap()
+                .contains(&"passive-voice".to_string())
+        );
+
+        // 匯入撞號：同一個識別碼被寫成句型
+        let mut clash = pattern("passive-voice", 2, r"\bwas\s+[a-z]+ed\b", "It was opened.");
+        clash.name = "被動句".into();
+        upsert_def(&db, &clash, t0()).await.unwrap();
+
+        assert!(
+            !list_points(&db, "en")
+                .await
+                .unwrap()
+                .contains(&"passive-voice".to_string()),
+            "撞號之後它確實從批改的標籤清單裡消失了"
+        );
+
+        // 版號往前跑一次就該修好。這裡直接把記下的版號抹掉來模擬升級
+        crate::meta::set_i64(&db, "grammar_seed:en", 0)
+            .await
+            .unwrap();
+        seed_defs(&db, "en", t0()).await.unwrap();
+
+        let back = get_def(&db, "en", "passive-voice").await.unwrap().unwrap();
+        assert_eq!(back.kind, KIND_POINT, "種類沒扳回來");
+        assert_eq!(back.name, "被動語態", "名稱是匯入蓋掉的，要一起還原");
+        assert!(back.detectors.is_empty(), "錯誤標籤不該留著句型的偵測規則");
+        assert!(
+            list_points(&db, "en")
+                .await
+                .unwrap()
+                .contains(&"passive-voice".to_string())
+        );
+    }
+
+    /// 使用者自己加的句型不會被這個修復掃到——它的 origin 不是 seed。
+    #[tokio::test]
+    async fn a_hand_made_pattern_survives_the_repair() {
+        let db = setup().await;
+        seed_defs(&db, "en", t0()).await.unwrap();
+        upsert_def(
+            &db,
+            &pattern(
+                "there-be-sentence",
+                1,
+                r"\bthere\s+(is|are)\b",
+                "There is a cat.",
+            ),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        crate::meta::set_i64(&db, "grammar_seed:en", 0)
+            .await
+            .unwrap();
+        seed_defs(&db, "en", t0()).await.unwrap();
+
+        let mine = get_def(&db, "en", "there-be-sentence")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mine.kind, KIND_PATTERN);
+        assert_eq!(mine.detectors.len(), 1);
     }
 
     /// 分級選單來自資料，程式不預設任何分級體系——匯入台灣課綱就得到
