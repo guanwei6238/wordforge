@@ -30,8 +30,14 @@ pub struct GrammarPoint {
     pub error_count: i64,
     /// 累計對幾次
     pub correct_count: i64,
-    /// 記憶穩定度（天）。越大表示越熟。
+    /// 記憶穩定度（天）。越大表示越熟。這是**證據**：排程算出來的。
     pub stability: Option<f64>,
+    /// 使用者自己按「我會了」的時間。這是**主張**：他說的話。
+    ///
+    /// 跟 `stability` 分開存，理由見 0022 migration：按一次「我會了」
+    /// 只會把 stability 推到 3.17 天，離「已學會」的 21 天還很遠，
+    /// 混在一起的結果是那一下按了等於沒按。
+    pub known_at: Option<String>,
 }
 
 fn row_to_point(row: &sqlx::sqlite::SqliteRow) -> GrammarPoint {
@@ -42,11 +48,12 @@ fn row_to_point(row: &sqlx::sqlite::SqliteRow) -> GrammarPoint {
         error_count: row.get("error_count"),
         correct_count: row.get("correct_count"),
         stability: row.get("stability"),
+        known_at: row.get("known_at"),
     }
 }
 
 const SELECT_POINT: &str = "SELECT point, state, step, stability, difficulty, due,
-    last_review, scheduled_days, error_count, correct_count FROM grammar_point";
+    last_review, scheduled_days, error_count, correct_count, known_at FROM grammar_point";
 
 /// 記錄一次結果並重新排程。
 ///
@@ -137,27 +144,172 @@ pub async fn record(
     Ok(())
 }
 
+/// 使用者按下「我會了」／「還要練」。
+///
+/// 做兩件事，而且**必須是兩件**：
+///
+/// 1. 照樣送一次 FSRS 評分（會了＝答對、還要練＝答錯），排程才會跟著動
+/// 2. 記下（或清掉）`known_at`——那是使用者說的話，不是算出來的
+///
+/// 只做第一件的話，按一次「我會了」只會把 stability 推到 3.17 天，
+/// 而「已學會」的門檻是 21 天：按鈕看起來沒有反應，出題也不會知道
+/// 他會這個句型。那正是這個功能原本壞掉的樣子。
+pub async fn set_known(
+    db: &Db,
+    profile_id: ProfileId,
+    point: &str,
+    known: bool,
+    scheduler: &Scheduler,
+    now: OffsetDateTime,
+) -> Result<()> {
+    // 先跑排程：這一步會把列建出來，下面的 UPDATE 才找得到它
+    record(db, profile_id, point, known, scheduler, now).await?;
+
+    sqlx::query("UPDATE grammar_point SET known_at = ?3 WHERE profile_id = ?1 AND point = ?2")
+        .bind(profile_id.0)
+        .bind(point.trim())
+        // 「還要練」要真的清掉，否則收不回自己標錯的那一下
+        .bind(known.then(|| ts::to_sql(now)))
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 /// 現在該練的文法點，最久沒複習的排前面。
 ///
 /// 出題時只送這幾個給模型——prompt 大小固定，
 /// 練習做得再多也不會讓 token 膨脹。
+///
+/// **只回錯誤標籤（`kind='point'`），不回句型。** 句型走
+/// [`due_patterns`]：它要另外受難度上限約束，而且拿去指派給翻譯題，
+/// 跟「這幾個文法你最近常錯」是兩件事。
+///
+/// 定義已經被刪掉的識別碼仍然算標籤（`COALESCE(kind, 'point')`）——
+/// 刪掉一份教材不該讓累積的學習歷史從排程裡消失。
 pub async fn due_points(
     db: &Db,
     profile_id: ProfileId,
+    lang: &str,
     now: OffsetDateTime,
     limit: i64,
 ) -> Result<Vec<String>> {
     let points: Vec<String> = sqlx::query_scalar(
-        "SELECT point FROM grammar_point
-         WHERE profile_id = ? AND due <= ?
-         ORDER BY due ASC LIMIT ?",
+        "SELECT p.point FROM grammar_point p
+         LEFT JOIN grammar_def d ON d.lang = ?2 AND d.point = p.point
+         WHERE p.profile_id = ?1 AND p.due <= ?3 AND COALESCE(d.kind, ?4) = ?4
+         ORDER BY p.due ASC LIMIT ?5",
     )
     .bind(profile_id.0)
+    .bind(lang)
+    .bind(ts::to_sql(now))
+    .bind(KIND_POINT)
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(points)
+}
+
+/// 現在該練的句型：到期的排前面，接著是**還沒練過的**，由簡入難。
+///
+/// ## 為什麼沒練過的也要進來
+///
+/// 只挑「到期」的話，一個句型永遠不會被第一次指派——`grammar_point`
+/// 那一列要練過才會出現。整份課綱會靜靜躺在資料庫裡，一條都不會被教到。
+/// 這正是這個專案踩過的那個坑的形狀：文法選單只列 `state != null` 的點，
+/// 於是自己加的點練過才選得到，沒選過就永遠練不到。
+///
+/// ## 上限也在這裡生效
+///
+/// 超過 `ceiling` 的句型不會被指派——難度上限不只是「不要用」，
+/// 也包含「不要現在教」。沒有分級的句型（`level_ordinal IS NULL`）
+/// 一律通過：我們不知道它難不難，擋掉它等於憑空造出一條規則。
+///
+/// ## 這條查詢會排序，而且排得掉的只有一半
+///
+/// `EXPLAIN QUERY PLAN` 上有 `USE TEMP B-TREE FOR ORDER BY`：排序的第一個
+/// 鍵是 `p.due`，它來自 JOIN 進來的另一張表，索引接不上。**這裡接受它**，
+/// 理由是列數的上限不是由使用時間決定的——它是「這個語言有幾個句型」，
+/// 也就是一份課綱的長度（幾百條），而且整條查詢每出一題才跑一次，
+/// 旁邊就是一趟好幾秒的模型呼叫。
+///
+/// 會隨使用時間長大的是 `grammar_point`，而那一側走的是
+/// `sqlite_autoindex_grammar_point_1`。
+pub async fn due_patterns(
+    db: &Db,
+    profile_id: ProfileId,
+    lang: &str,
+    ceiling: Option<i64>,
+    now: OffsetDateTime,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let points: Vec<String> = sqlx::query_scalar(
+        "SELECT d.point FROM grammar_def d
+         LEFT JOIN grammar_point p ON p.point = d.point AND p.profile_id = ?1
+         WHERE d.lang = ?2 AND d.kind = ?3
+           AND (?4 IS NULL OR d.level_ordinal IS NULL OR d.level_ordinal <= ?4)
+           AND (p.due IS NULL OR p.due <= ?5)
+         ORDER BY (p.due IS NULL), p.due ASC, d.level_ordinal ASC, d.sort_order ASC
+         LIMIT ?6",
+    )
+    .bind(profile_id.0)
+    .bind(lang)
+    .bind(KIND_PATTERN)
+    .bind(ceiling)
     .bind(ts::to_sql(now))
     .bind(limit)
     .fetch_all(db.pool())
     .await?;
     Ok(points)
+}
+
+/// 使用者**已經會的句型**：標記過「我會了」，或練到撐得過門檻的。
+///
+/// 取兩者的**聯集**，因為它們是兩件不同的真話：`known_at` 是他說的，
+/// `stability` 是排程算的。缺任何一邊都會漏——只看 stability 的話，
+/// 剛按完「我會了」的句型撈不到（按一次只到 3.17 天）；只看 known_at
+/// 的話，練到滾瓜爛熟但從沒按過按鈕的句型撈不到。
+///
+/// ## 這份清單是做什麼用的
+///
+/// 兩件事，而且是這整套機制真正貼合使用者的地方：
+///
+/// 1. **出題時列給模型看**——「這些他讀得懂，放心用」。沒有這份清單的話，
+///    模型只知道什麼不能用，不知道什麼好用，於是句子會退化成一種形狀。
+/// 2. **從禁止清單裡扣掉**——他自己標記會了的句型，就算級數高過上限
+///    也不該被擋。上限是「還沒教到哪」的預設值，不是「他不會什麼」的事實；
+///    使用者親手標記的才是事實。
+///
+/// `stability_days` 要跟 UI 上「已學會」的定義**同一個數字**。兩邊各用
+/// 各的門檻，就會出現「畫面說學會了，出題還當他不會」——這個專案踩過
+/// 那個坑：prompt 說他掌握 5200 個字，驗收只認 stability ≥ 21 天的卡片，
+/// 結果覆蓋率永遠 0%。
+///
+/// 排序由難到易：模型最需要知道的是**他會的上緣在哪**。
+pub async fn known_patterns(
+    db: &Db,
+    profile_id: ProfileId,
+    lang: &str,
+    stability_days: f64,
+) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query(
+        "SELECT d.point AS point, d.name AS name
+         FROM grammar_def d
+         JOIN grammar_point p ON p.point = d.point AND p.profile_id = ?1
+         WHERE d.lang = ?2 AND d.kind = ?3
+           AND (p.known_at IS NOT NULL OR p.stability >= ?4)
+         ORDER BY d.level_ordinal DESC, d.sort_order, d.point",
+    )
+    .bind(profile_id.0)
+    .bind(lang)
+    .bind(KIND_PATTERN)
+    .bind(stability_days)
+    .fetch_all(db.pool())
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| (row.get("point"), row.get("name")))
+        .collect())
 }
 
 /// 全部文法點的狀況，還沒練熟的排前面。供 UI 顯示進度。
@@ -214,7 +366,7 @@ mod tests {
         assert_eq!(all[0].correct_count, 0);
 
         // 剛錯過的東西應該很快就要再遇到
-        let due = due_points(&db, profile, t0() + Duration::minutes(5), 10)
+        let due = due_points(&db, profile, "en", t0() + Duration::minutes(5), 10)
             .await
             .unwrap();
         assert_eq!(due, vec!["tense"]);
@@ -248,7 +400,7 @@ mod tests {
 
         // 隔天不該再被挑出來練
         assert!(
-            due_points(&db, profile, when + Duration::days(1), 10)
+            due_points(&db, profile, "en", when + Duration::days(1), 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -266,13 +418,18 @@ mod tests {
                 .unwrap();
             when += Duration::days(3);
         }
-        assert!(due_points(&db, profile, when, 10).await.unwrap().is_empty());
+        assert!(
+            due_points(&db, profile, "en", when, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         record(&db, profile, "tense", false, &sched, when)
             .await
             .unwrap();
         assert_eq!(
-            due_points(&db, profile, when + Duration::minutes(30), 10)
+            due_points(&db, profile, "en", when + Duration::minutes(30), 10)
                 .await
                 .unwrap(),
             vec!["tense"],
@@ -290,7 +447,7 @@ mod tests {
                 .unwrap();
         }
 
-        let due = due_points(&db, profile, t0() + Duration::hours(1), 3)
+        let due = due_points(&db, profile, "en", t0() + Duration::hours(1), 3)
             .await
             .unwrap();
         assert_eq!(due.len(), 3, "要能限制數量");
@@ -329,7 +486,12 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_profile_has_nothing_due() {
         let (db, profile, _) = setup().await;
-        assert!(due_points(&db, profile, t0(), 10).await.unwrap().is_empty());
+        assert!(
+            due_points(&db, profile, "en", t0(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(all_points(&db, profile).await.unwrap().is_empty());
     }
 }
@@ -339,10 +501,17 @@ mod tests {
 /// 一個文法點的定義：名稱、講解、例句。
 ///
 /// 跟 [`GrammarPoint`]（掌握狀態）分開：定義是教材，狀態是每個人自己的。
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct GrammarDef {
     #[serde(default)]
     pub id: i64,
+    /// 語言代碼。**匯入時不必寫**——`import_grammar` 一律用 profile 的
+    /// 目標語言覆寫它，讓檔案指定只會讓那份定義消失在另一個語言底下。
+    ///
+    /// 沒有這個 `default` 的話，文件寫的最小格式
+    /// `[{"point": …, "name": …}]` 會直接解析失敗（missing field `lang`），
+    /// 而錯誤訊息看起來像使用者的檔案寫錯了。
+    #[serde(default)]
     pub lang: String,
     /// 受控識別碼，與 `grammar_point.point` 對應
     pub point: String,
@@ -353,14 +522,40 @@ pub struct GrammarDef {
     pub explanation: Option<String>,
     #[serde(default)]
     pub examples: Vec<GrammarExample>,
-    /// 難度標示，由來源決定（CEFR 的 A2、JLPT 的 N4…）
+    /// 難度標示，由來源決定（CEFR 的 A2、JLPT 的 N4…）。
+    ///
+    /// **這是顯示用的名稱，程式不解讀它**——字串沒有順序，
+    /// 排得出先後的是 [`GrammarDef::level_ordinal`]。
     #[serde(default)]
     pub level: Option<String>,
+    /// 分級刻度上的位置。`None` 表示沒有分級，那時這一筆不參與難度上限
+    /// ——我們不知道它難不難，猜一個等於憑空造出一條規則。
+    #[serde(default)]
+    pub level_ordinal: Option<i64>,
+    /// `point`（批改用的錯誤標籤）或 `pattern`（教學用的句型）。
+    ///
+    /// 兩者要的粒度相反，見 0021 migration 的說明。預設是 `point`：
+    /// 既有的資料與舊格式的匯入檔案都是錯誤標籤。
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// 怎麼在句子裡認出這個句型。空的就是「偵測不到」——
+    /// 那時它只能靠模型自報，難度上限對它不生效。
+    #[serde(default)]
+    pub detectors: Vec<wordforge_core::patterns::Detector>,
     #[serde(default)]
     pub sort_order: i64,
     /// seed（程式碼種子）/ import（匯入）/ manual（自己加）
     #[serde(default)]
     pub origin: String,
+}
+
+/// 批改用的錯誤標籤。
+pub const KIND_POINT: &str = "point";
+/// 教學用的句型。
+pub const KIND_PATTERN: &str = "pattern";
+
+fn default_kind() -> String {
+    KIND_POINT.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
@@ -374,6 +569,7 @@ pub struct GrammarExample {
 
 fn row_to_def(row: &sqlx::sqlite::SqliteRow) -> GrammarDef {
     let examples: String = row.get("examples_json");
+    let detectors: String = row.get("detectors_json");
     GrammarDef {
         id: row.get("id"),
         lang: row.get("lang"),
@@ -383,13 +579,28 @@ fn row_to_def(row: &sqlx::sqlite::SqliteRow) -> GrammarDef {
         // 例句壞掉不該讓整頁打不開——那是附加內容，不是主線
         examples: serde_json::from_str(&examples).unwrap_or_default(),
         level: row.get("level"),
+        level_ordinal: row.get("level_ordinal"),
+        kind: row.get("kind"),
+        // 偵測器讀不出來時**要出聲**。它壞掉的症狀是「難度檢查安靜地
+        // 不生效」，跟例句壞掉（少看幾句）完全不是同一個等級的事。
+        detectors: match serde_json::from_str(&detectors) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    point = %row.get::<String, _>("point"),
+                    error = %e,
+                    "偵測器讀不出來，這個句型的難度檢查不會生效"
+                );
+                Vec::new()
+            }
+        },
         sort_order: row.get("sort_order"),
         origin: row.get("origin"),
     }
 }
 
 const SELECT_DEF: &str = "SELECT id, lang, point, name, explanation, examples_json,
-    level, sort_order, origin FROM grammar_def";
+    level, level_ordinal, kind, detectors_json, sort_order, origin FROM grammar_def";
 
 /// 某個語言的全部文法點定義，照 `sort_order` 排。
 pub async fn list_defs(db: &Db, lang: &str) -> Result<Vec<GrammarDef>> {
@@ -402,14 +613,122 @@ pub async fn list_defs(db: &Db, lang: &str) -> Result<Vec<GrammarDef>> {
     Ok(rows.iter().map(row_to_def).collect())
 }
 
-/// 只要識別碼。出題與正規化用得到，不必把講解一起撈出來。
+/// 批改用的錯誤標籤清單。
+///
+/// **只回 `kind='point'`**。句型不能混進來：那份清單會原樣列進批改
+/// prompt，上百條課綱句型會同時撐爆 prompt、並且把「最常錯的文法點」
+/// 稀釋成一堆各錯一次的標籤——0005 與 0011 的註解各講過一次這件事。
 pub async fn list_points(db: &Db, lang: &str) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT point FROM grammar_def WHERE lang = ? AND kind = ?
+         ORDER BY sort_order, point",
+    )
+    .bind(lang)
+    .bind(KIND_POINT)
+    .fetch_all(db.pool())
+    .await?)
+}
+
+/// 這個語言的**全部**識別碼，錯誤標籤與句型都算。
+///
+/// ## 跟 [`list_points`] 的分工
+///
+/// `list_points` 是**給模型挑的選單**（批改時「從這份清單挑一個標籤」），
+/// 所以要窄——句型混進去會撐爆 prompt 並稀釋排程。
+///
+/// 這一份是**認回來用的字典**：把模型回報的標籤收斂到某個真實存在的
+/// 識別碼。它必須寬，因為指定句型出的練習，題目標籤就是那個句型的
+/// 識別碼——拿窄的那份去比對會認不出來，然後**整份練習的對錯被無聲
+/// 丟掉**：使用者答完五題，畫面一切正常，什麼都沒記到。
+pub async fn list_all_points(db: &Db, lang: &str) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar(
         "SELECT point FROM grammar_def WHERE lang = ? ORDER BY sort_order, point",
     )
     .bind(lang)
     .fetch_all(db.pool())
     .await?)
+}
+
+/// 這個語言的句型，轉成偵測層看得懂的形狀。
+///
+/// 只撈 `kind='pattern'`：錯誤標籤沒有偵測器，也不參與難度上限。
+/// 回傳的是**定義**，還沒編譯——編譯（含控制組自我檢查）在
+/// [`wordforge_core::patterns::PatternSet::compile`]。
+pub async fn pattern_defs(
+    db: &Db,
+    lang: &str,
+) -> Result<Vec<wordforge_core::patterns::PatternDef>> {
+    let defs = list_defs_of_kind(db, lang, KIND_PATTERN).await?;
+    Ok(defs
+        .into_iter()
+        .map(|d| wordforge_core::patterns::PatternDef {
+            point: d.point,
+            name: d.name,
+            level_ordinal: d.level_ordinal,
+            level: d.level,
+            detectors: d.detectors,
+        })
+        .collect())
+}
+
+/// 某個語言、某一種 kind 的全部定義。
+pub async fn list_defs_of_kind(db: &Db, lang: &str, kind: &str) -> Result<Vec<GrammarDef>> {
+    let rows = sqlx::query(&format!(
+        "{SELECT_DEF} WHERE lang = ? AND kind = ? ORDER BY level_ordinal, sort_order, point"
+    ))
+    .bind(lang)
+    .bind(kind)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows.iter().map(row_to_def).collect())
+}
+
+/// 分級刻度上的一格。設定頁的「我現在的程度」選單就是這個。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LevelOption {
+    /// 顯示名稱（`"國中七年級"`）。可能是 NULL——那時只有序號。
+    pub level: Option<String>,
+    pub ordinal: i64,
+    /// 這一級有幾個句型。使用者要看得出「選這一級等於開放多少東西」。
+    pub patterns: i64,
+    /// 其中有幾個**偵測得到**。
+    ///
+    /// 這個數字一定要露出來：偵測不到的句型只能靠模型自報，
+    /// 難度上限對它不生效。兩個數字差很多的話，使用者該知道
+    /// 這一級的保護其實很薄，而不是以為系統擋得住。
+    pub detectable: i64,
+}
+
+/// 這個語言的句型分級有哪幾格。
+///
+/// **選項來自資料，程式不預設任何分級體系**——跟「設定頁的語言選單
+/// 來自字典裡有什麼」是同一件事。匯入台灣課綱就得到國小國中高中，
+/// 匯入 CEFR 就得到 A1..C2，程式兩種都不認識。
+pub async fn level_options(db: &Db, lang: &str) -> Result<Vec<LevelOption>> {
+    let rows = sqlx::query(
+        "SELECT level_ordinal AS ordinal,
+                MIN(level) AS level,
+                COUNT(*) AS patterns,
+                SUM(CASE WHEN detectors_json <> '[]' THEN 1 ELSE 0 END) AS detectable
+         FROM grammar_def
+         WHERE lang = ? AND kind = ? AND level_ordinal IS NOT NULL
+         GROUP BY level_ordinal
+         ORDER BY level_ordinal",
+    )
+    .bind(lang)
+    .bind(KIND_PATTERN)
+    .fetch_all(db.pool())
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| LevelOption {
+            level: row.get("level"),
+            ordinal: row.get("ordinal"),
+            patterns: row.get("patterns"),
+            detectable: row.get("detectable"),
+        })
+        .collect())
 }
 
 pub async fn get_def(db: &Db, lang: &str, point: &str) -> Result<Option<GrammarDef>> {
@@ -436,13 +755,19 @@ pub async fn upsert_def(db: &Db, def: &GrammarDef, now: OffsetDateTime) -> Resul
     }
 
     let examples = serde_json::to_string(&def.examples).unwrap_or_else(|_| "[]".into());
+    let detectors = serde_json::to_string(&def.detectors).unwrap_or_else(|_| "[]".into());
     let ts = ts::to_sql(now);
+    let kind = if def.kind.is_empty() {
+        KIND_POINT
+    } else {
+        def.kind.as_str()
+    };
 
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO grammar_def
              (lang, point, name, explanation, examples_json, level, sort_order, origin,
-              created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+              level_ordinal, kind, detectors_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10, ?11, ?12, ?9, ?9)
          ON CONFLICT (lang, point) DO UPDATE SET
              name          = excluded.name,
              -- 只在新的有內容時才覆蓋：匯入一份只有名稱的清單，
@@ -452,6 +777,13 @@ pub async fn upsert_def(db: &Db, def: &GrammarDef, now: OffsetDateTime) -> Resul
                                   THEN grammar_def.examples_json
                                   ELSE excluded.examples_json END,
              level         = COALESCE(excluded.level, grammar_def.level),
+             level_ordinal = COALESCE(excluded.level_ordinal, grammar_def.level_ordinal),
+             kind          = excluded.kind,
+             -- 跟例句同一個道理：匯入一份沒有偵測器的清單，不該把
+             -- 已經寫好、已經通過控制組的那些洗掉
+             detectors_json = CASE WHEN excluded.detectors_json = '[]'
+                                   THEN grammar_def.detectors_json
+                                   ELSE excluded.detectors_json END,
              sort_order    = excluded.sort_order,
              updated_at    = excluded.updated_at
          RETURNING id",
@@ -469,6 +801,9 @@ pub async fn upsert_def(db: &Db, def: &GrammarDef, now: OffsetDateTime) -> Resul
         &def.origin
     })
     .bind(&ts)
+    .bind(def.level_ordinal)
+    .bind(kind)
+    .bind(&detectors)
     .fetch_one(db.pool())
     .await?;
 
@@ -567,11 +902,13 @@ pub async fn seed_defs(db: &Db, lang: &str, now: OffsetDateTime) -> Result<usize
                 lang: lang.to_string(),
                 point: (*point).to_string(),
                 name: (*name).to_string(),
-                explanation: None,
-                examples: Vec::new(),
                 level: Some((*level).to_string()),
                 sort_order: i as i64,
                 origin: "seed".into(),
+                // 種子是錯誤標籤，不是句型：它們不參與難度上限，
+                // 也不該讓 CEFR 的刻度跟匯入的課綱刻度混在一起。
+                kind: KIND_POINT.into(),
+                ..GrammarDef::default()
             },
             now,
         )
@@ -587,6 +924,7 @@ pub async fn seed_defs(db: &Db, lang: &str, now: OffsetDateTime) -> Result<usize
 mod def_tests {
     use super::*;
     use crate::repo::profiles;
+    use time::Duration;
 
     fn t0() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
@@ -602,15 +940,33 @@ mod def_tests {
 
     fn def(point: &str, name: &str) -> GrammarDef {
         GrammarDef {
-            id: 0,
             lang: "en".into(),
             point: point.into(),
             name: name.into(),
-            explanation: None,
-            examples: Vec::new(),
-            level: None,
-            sort_order: 0,
             origin: "manual".into(),
+            kind: KIND_POINT.into(),
+            ..GrammarDef::default()
+        }
+    }
+
+    /// 一個看得到、驗得過的句型。`positive` 一定要真的命中——
+    /// 測試資料要像真實資料，而真實資料是會被 `compile_detector` 擋下來的。
+    fn pattern(point: &str, ordinal: i64, regex: &str, positive: &str) -> GrammarDef {
+        GrammarDef {
+            lang: "en".into(),
+            point: point.into(),
+            name: point.into(),
+            kind: KIND_PATTERN.into(),
+            level: Some(format!("第 {ordinal} 級")),
+            level_ordinal: Some(ordinal),
+            detectors: vec![wordforge_core::patterns::Detector {
+                kind: "regex".into(),
+                value: regex.into(),
+                positive: vec![positive.into()],
+                negative: Vec::new(),
+            }],
+            origin: "import".into(),
+            ..GrammarDef::default()
         }
     }
 
@@ -811,10 +1167,328 @@ mod def_tests {
         assert_eq!(points[0].error_count, 1);
     }
 
+    /// 這條測試存在的理由：`lang` 曾經沒有 `default`，於是文件與 UI 上
+    /// 寫的最小格式 `[{"point": …, "name": …}]` **解析不了**——
+    /// 匯入會回「missing field `lang`」，而那看起來像使用者的檔案寫錯了。
+    /// 語言本來就由 profile 決定，檔案裡不該有它。
+    #[test]
+    fn the_documented_minimal_import_format_parses() {
+        let json = r#"[{"point": "there-be", "name": "there is / there are"}]"#;
+        let defs: Vec<GrammarDef> = serde_json::from_str(json).expect("最小格式該解析得了");
+        assert_eq!(defs[0].point, "there-be");
+        assert_eq!(defs[0].kind, KIND_POINT, "沒寫 kind 就是錯誤標籤");
+        assert!(defs[0].lang.is_empty(), "語言由 profile 決定，檔案裡不該有");
+    }
+
     #[tokio::test]
     async fn a_definition_needs_an_identifier_and_a_name() {
         let db = setup().await;
         assert!(upsert_def(&db, &def("  ", "時態"), t0()).await.is_err());
         assert!(upsert_def(&db, &def("tense", " "), t0()).await.is_err());
+    }
+
+    /// 這條測試存在的理由：句型與錯誤標籤住在同一張表，而它們要的粒度
+    /// 相反。上百條課綱句型如果混進批改用的標籤清單，會同時撐爆 prompt
+    /// 並把「最常錯的文法點」稀釋成一堆各錯一次的東西——0005 的註解
+    /// 已經為了這件事把排程從「數次數」改成 FSRS 一次了。
+    #[tokio::test]
+    async fn a_sentence_pattern_is_not_offered_as_an_error_label() {
+        let db = setup().await;
+        upsert_def(&db, &def("tense", "時態"), t0()).await.unwrap();
+        upsert_def(
+            &db,
+            &pattern(
+                "conditional-2",
+                3,
+                r"\bif\b[^.?!]*\bwould\b",
+                "If I knew, I would say.",
+            ),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let labels = list_points(&db, "en").await.unwrap();
+        assert_eq!(labels, vec!["tense".to_string()]);
+
+        let patterns = pattern_defs(&db, "en").await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].point, "conditional-2");
+        assert_eq!(patterns[0].level_ordinal, Some(3));
+        assert_eq!(patterns[0].detectors.len(), 1);
+    }
+
+    /// 同一件事的排程那一側：句型練過之後會在 `grammar_point` 留下紀錄，
+    /// 而那張表沒有 kind 欄位。少了 JOIN 的話，句型會跑進
+    /// 「這幾個文法你最近常錯」餵給批改 prompt。
+    #[tokio::test]
+    async fn a_due_pattern_does_not_leak_into_the_weak_point_list() {
+        let db = setup().await;
+        let profile = ProfileId(1);
+        let scheduler = Scheduler::default();
+        upsert_def(&db, &def("tense", "時態"), t0()).await.unwrap();
+        upsert_def(
+            &db,
+            &pattern(
+                "conditional-2",
+                3,
+                r"\bif\b[^.?!]*\bwould\b",
+                "If I knew, I would say.",
+            ),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        record(&db, profile, "tense", false, &scheduler, t0())
+            .await
+            .unwrap();
+        record(&db, profile, "conditional-2", false, &scheduler, t0())
+            .await
+            .unwrap();
+
+        let later = t0() + Duration::days(1);
+        let weak = due_points(&db, profile, "en", later, 10).await.unwrap();
+        assert_eq!(weak, vec!["tense".to_string()], "句型混進錯誤標籤了");
+    }
+
+    /// 這條測試存在的理由是它曾經是同一個形狀的錯：文法選單只列
+    /// `state != null` 的點，於是自己加的點**練過才選得到**，
+    /// 而沒選過就永遠練不到。句型如果只從 `grammar_point` 撈到期的，
+    /// 整份匯入的課綱會靜靜躺著，一條都不會被第一次指派。
+    #[tokio::test]
+    async fn a_pattern_never_practised_is_still_offered() {
+        let db = setup().await;
+        upsert_def(
+            &db,
+            &pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat."),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let due = due_patterns(&db, ProfileId(1), "en", None, t0(), 5)
+            .await
+            .unwrap();
+        assert_eq!(due, vec!["there-be".to_string()]);
+    }
+
+    /// 難度上限不只是「不要用」，也包含「不要現在教」。
+    #[tokio::test]
+    async fn a_pattern_above_the_ceiling_is_not_assigned() {
+        let db = setup().await;
+        upsert_def(
+            &db,
+            &pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat."),
+            t0(),
+        )
+        .await
+        .unwrap();
+        upsert_def(
+            &db,
+            &pattern(
+                "inversion",
+                8,
+                r"^never\s+\w+\s+(i|he|she|we|they)\b",
+                "Never have I seen it.",
+            ),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let due = due_patterns(&db, ProfileId(1), "en", Some(3), t0(), 5)
+            .await
+            .unwrap();
+        assert_eq!(due, vec!["there-be".to_string()]);
+
+        // 上限拉高就教得到
+        let due = due_patterns(&db, ProfileId(1), "en", Some(8), t0(), 5)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 2);
+    }
+
+    /// 到期的排在還沒練過的前面：忘掉的東西比沒學過的東西急。
+    #[tokio::test]
+    async fn a_pattern_that_is_due_comes_before_one_never_seen() {
+        let db = setup().await;
+        let scheduler = Scheduler::default();
+        upsert_def(
+            &db,
+            &pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat."),
+            t0(),
+        )
+        .await
+        .unwrap();
+        upsert_def(
+            &db,
+            &pattern("past-simple", 2, r"\b\w+ed\b", "I walked home."),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        // 第 2 級的那個練過而且答錯了，所以很快就到期
+        record(&db, ProfileId(1), "past-simple", false, &scheduler, t0())
+            .await
+            .unwrap();
+
+        let later = t0() + Duration::days(1);
+        let due = due_patterns(&db, ProfileId(1), "en", None, later, 5)
+            .await
+            .unwrap();
+        assert_eq!(due[0], "past-simple", "到期的要排在沒學過的前面");
+    }
+
+    /// 跟講解、例句同一個道理：重匯一份沒有偵測器的清單，不該把已經
+    /// 寫好、已經通過控制組的 regex 洗掉。那些東西沒有備份。
+    #[tokio::test]
+    async fn a_bare_reimport_keeps_the_detectors() {
+        let db = setup().await;
+        let full = pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat.");
+        upsert_def(&db, &full, t0()).await.unwrap();
+
+        let mut bare = full.clone();
+        bare.detectors = Vec::new();
+        bare.name = "there is / there are".into();
+        upsert_def(&db, &bare, t0()).await.unwrap();
+
+        let got = get_def(&db, "en", "there-be").await.unwrap().unwrap();
+        assert_eq!(got.name, "there is / there are", "名稱該更新");
+        assert_eq!(got.detectors.len(), 1, "偵測器被洗掉了");
+    }
+
+    /// 這條測試存在的理由是它曾經是錯的：按「我會了」只送一次 FSRS 的
+    /// Good，而初始 stability 是 3.17 天、「已學會」的門檻是 21 天。
+    /// 於是**按一次等於沒按**——畫面仍然顯示「在學」，出題也不知道
+    /// 他會這個句型，而使用者不知道自己按的那一下去了哪裡。
+    #[tokio::test]
+    async fn one_click_on_i_know_this_is_enough_to_count() {
+        let db = setup().await;
+        let scheduler = Scheduler::default();
+        upsert_def(
+            &db,
+            &pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat."),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        set_known(&db, ProfileId(1), "there-be", true, &scheduler, t0())
+            .await
+            .unwrap();
+
+        let known = known_patterns(&db, ProfileId(1), "en", 21.0).await.unwrap();
+        assert_eq!(known.len(), 1, "按了一次「我會了」卻撈不到");
+        assert_eq!(known[0].0, "there-be");
+
+        // 排程照樣要動——自評與作答匯流到同一個進度，不是兩套
+        let state = all_points(&db, ProfileId(1)).await.unwrap();
+        assert_eq!(state[0].correct_count, 1);
+        assert!(
+            state[0].stability.is_some_and(|s| s < 21.0),
+            "證據還沒到門檻，但主張已經在了"
+        );
+    }
+
+    /// 收得回來：標錯的那一下要按得掉，否則自評變成單向閥門。
+    #[tokio::test]
+    async fn marking_it_for_practice_again_takes_the_claim_back() {
+        let db = setup().await;
+        let scheduler = Scheduler::default();
+        upsert_def(
+            &db,
+            &pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat."),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        set_known(&db, ProfileId(1), "there-be", true, &scheduler, t0())
+            .await
+            .unwrap();
+        set_known(&db, ProfileId(1), "there-be", false, &scheduler, t0())
+            .await
+            .unwrap();
+
+        assert!(
+            known_patterns(&db, ProfileId(1), "en", 21.0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "按了「還要練」卻收不回標記"
+        );
+    }
+
+    /// 練到撐得過門檻的也算——兩個來源取聯集。
+    /// 只認自評的話，練了半年卻從沒按過按鈕的句型會被當成他不會。
+    #[tokio::test]
+    async fn practising_it_until_it_sticks_also_counts_as_known() {
+        let db = setup().await;
+        let scheduler = Scheduler::default();
+        upsert_def(
+            &db,
+            &pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat."),
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        // 沒有按過任何按鈕，只是一直答對
+        let mut when = t0();
+        for _ in 0..6 {
+            record(&db, ProfileId(1), "there-be", true, &scheduler, when)
+                .await
+                .unwrap();
+            when += Duration::days(30);
+        }
+
+        let state = all_points(&db, ProfileId(1)).await.unwrap();
+        assert!(state[0].known_at.is_none(), "他從來沒按過按鈕");
+        assert!(
+            state[0].stability.is_some_and(|s| s >= 21.0),
+            "答對六次之後穩定度是 {:?}",
+            state[0].stability
+        );
+        assert_eq!(
+            known_patterns(&db, ProfileId(1), "en", 21.0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// 分級選單來自資料，程式不預設任何分級體系——匯入台灣課綱就得到
+    /// 國小國中高中，匯入 CEFR 就得到 A1..C2，程式兩種都不認識。
+    #[tokio::test]
+    async fn the_level_menu_comes_from_whatever_was_imported() {
+        let db = setup().await;
+        let mut p1 = pattern("there-be", 1, r"\bthere\s+(is|are)\b", "There is a cat.");
+        p1.level = Some("國小".into());
+        let mut p2 = pattern("past-simple", 1, r"\b\w+ed\b", "I walked home.");
+        p2.level = Some("國小".into());
+        let mut p3 = pattern("relative", 4, r"\b(who|which)\b", "The man who came.");
+        p3.level = Some("國中".into());
+        // 偵測不到的那一條也要算進總數，但不能算進 detectable
+        let mut p4 = pattern("subjunctive", 4, r"\bwish\b", "I wish I could.");
+        p4.level = Some("國中".into());
+        p4.detectors = Vec::new();
+        for d in [&p1, &p2, &p3, &p4] {
+            upsert_def(&db, d, t0()).await.unwrap();
+        }
+
+        let levels = level_options(&db, "en").await.unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].level.as_deref(), Some("國小"));
+        assert_eq!(levels[0].ordinal, 1);
+        assert_eq!(levels[0].patterns, 2);
+        assert_eq!(levels[1].level.as_deref(), Some("國中"));
+        assert_eq!(levels[1].patterns, 2);
+        assert_eq!(
+            levels[1].detectable, 1,
+            "偵測不到的句型要看得出來，否則使用者會以為系統擋得住"
+        );
     }
 }

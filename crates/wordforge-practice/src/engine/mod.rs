@@ -232,12 +232,15 @@ pub struct PracticeEngine<'a> {
 }
 
 mod choices;
+mod difficulty;
 mod generate;
 mod grade;
 
 pub use grade::{DueAnswer, DueSentenceResult};
+pub use patterns::{PatternReport, vet_detectors};
 
 mod links;
+mod patterns;
 mod points;
 mod words;
 
@@ -349,7 +352,8 @@ impl<'a> PracticeEngine<'a> {
 
         // 只拿「今天到期」的文法點：練熟的不必再出，
         // 而且送給模型的數量固定，token 不會隨練習次數增加
-        let weak_grammar = grammar::due_points(self.db, pid, now, GRAMMAR_BATCH).await?;
+        let weak_grammar =
+            grammar::due_points(self.db, pid, &self.target_lang, now, GRAMMAR_BATCH).await?;
         let recent_kinds = exercises::recent_kinds(self.db, pid, 6)
             .await?
             .iter()

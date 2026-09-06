@@ -3781,15 +3781,13 @@ async fn the_controlled_list_comes_from_the_database() {
     wordforge_db::grammar::upsert_def(
         &db,
         &wordforge_db::grammar::GrammarDef {
-            id: 0,
             lang: "en".into(),
             point: "tag-questions".into(),
             name: "附加問句".into(),
-            explanation: None,
-            examples: Vec::new(),
-            level: None,
             sort_order: 99,
             origin: "manual".into(),
+            kind: wordforge_db::grammar::KIND_POINT.into(),
+            ..Default::default()
         },
         t0(),
     )
@@ -3838,5 +3836,617 @@ async fn a_language_without_grammar_definitions_falls_back_gracefully() {
     assert!(
         !prompt.contains("gerund-infinitive"),
         "英文的分類外洩到日文了：{prompt}"
+    );
+}
+
+// ---------------------------------------------------------------- 句子難度
+
+/// 匯入一個句型，含**通過控制組**的偵測器。
+///
+/// `positive` 一定要真的命中：`upsert_def` 不會擋，但出題時
+/// `PatternSet::compile` 會把它丟掉，而症狀是「這個句型的檢查安靜地
+/// 不生效」——測試資料要像真實資料，而真實資料是匯入時驗過的。
+async fn add_pattern(db: &Db, point: &str, name: &str, ordinal: i64, regex: &str, positive: &str) {
+    wordforge_db::grammar::upsert_def(
+        db,
+        &wordforge_db::grammar::GrammarDef {
+            lang: "en".into(),
+            point: point.into(),
+            name: name.into(),
+            kind: wordforge_db::grammar::KIND_PATTERN.into(),
+            level: Some(format!("第 {ordinal} 級")),
+            level_ordinal: Some(ordinal),
+            detectors: vec![wordforge_core::patterns::Detector {
+                kind: "regex".into(),
+                value: regex.into(),
+                positive: vec![positive.into()],
+                negative: Vec::new(),
+            }],
+            origin: "import".into(),
+            ..Default::default()
+        },
+        t0(),
+    )
+    .await
+    .unwrap();
+}
+
+async fn set_limits(
+    db: &Db,
+    profile: i64,
+    ceiling: Option<i64>,
+    max_words: Option<i64>,
+    max_clauses: Option<i64>,
+) {
+    let mut settings = profiles::study_settings(db, ProfileId(profile))
+        .await
+        .unwrap();
+    settings.pattern_ceiling = ceiling;
+    settings.sentence_max_words = max_words;
+    settings.sentence_max_clauses = max_clauses;
+    profiles::update_study_settings(db, ProfileId(profile), settings)
+        .await
+        .unwrap();
+}
+
+/// 出一份翻譯練習的共同前置。回傳資料庫與 profile。
+async fn translation_setup() -> (Db, i64) {
+    let (db, profile) = setup(&["alpha", "never1"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    study(&db, profile, 1).await;
+    put_in_deck(&db, profile, 2).await;
+    (db, profile)
+}
+
+/// 這條測試存在的理由：出題的難度一直只有**詞彙**那一半有依據。
+/// 每個字都會的句子照樣可以是假設語氣，而系統原本對此一無所知——
+/// 使用者的症狀是「每一題都錯」，而畫面上每一題都是好題目。
+#[tokio::test]
+async fn a_sentence_using_a_pattern_he_has_not_learned_is_sent_back() {
+    let (db, profile) = translation_setup().await;
+    add_pattern(
+        &db,
+        "conditional-2",
+        "第二類條件句",
+        5,
+        r"\bif\b[^.?!]*\bwould\b",
+        "If I knew, I would say.",
+    )
+    .await;
+    set_limits(&db, profile, Some(2), None, None).await;
+
+    let hard = r#"{"items":[{"source":"如果我有錢我會買","target_word":"alpha",
+                             "reference":"If I had money, I would buy alpha."}]}"#;
+    let easy = r#"{"items":[{"source":"我買了","target_word":"alpha",
+                             "reference":"I buy alpha."}]}"#;
+    let llm = FakeLlm::new(&[hard, easy]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "超綱的句型沒有被退回去重寫");
+    let retry = llm.last_prompt();
+    assert!(
+        retry.contains("第二類條件句"),
+        "回問要說得出是哪個句型超綱：\n{retry}"
+    );
+
+    let wordforge_practice::payload::ExerciseBody::Translation { items, .. } = &exercise.body
+    else {
+        panic!("該是翻譯題");
+    };
+    assert_eq!(items[0].reference.as_deref(), Some("I buy alpha."));
+}
+
+/// 第二層的存在理由：句型偵測只抓得到**收錄過的**東西，而課綱沒收錄的
+/// 難句正是最需要被擋下來的。這一條連一個句型都沒匯入。
+#[tokio::test]
+async fn a_hard_sentence_nobody_catalogued_is_caught_by_the_length_limit() {
+    let (db, profile) = translation_setup().await;
+    set_limits(&db, profile, None, Some(6), None).await;
+
+    let long = r#"{"items":[{"source":"長句","target_word":"alpha",
+                             "reference":"Yesterday I went to the store and bought a very large alpha."}]}"#;
+    let short = r#"{"items":[{"source":"短句","target_word":"alpha",
+                              "reference":"I bought alpha."}]}"#;
+    let llm = FakeLlm::new(&[long, short]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "太長的句子沒有被退回去重寫");
+    let wordforge_practice::payload::ExerciseBody::Translation { items, .. } = &exercise.body
+    else {
+        panic!("該是翻譯題");
+    };
+    assert_eq!(items[0].reference.as_deref(), Some("I bought alpha."));
+}
+
+/// 「請練這個句型」跟「請用這些字」是同一種東西：**只是請求**。
+/// 模型很會寫出一句通順、自然、跟指定句型完全無關的話，而系統仍然
+/// 會把這次記成「練了它」。
+#[tokio::test]
+async fn an_assigned_pattern_must_actually_show_up_in_a_sentence() {
+    let (db, profile) = translation_setup().await;
+    add_pattern(
+        &db,
+        "there-be",
+        "there is / there are",
+        1,
+        r"\bthere\s+(is|are)\b",
+        "There is a cat.",
+    )
+    .await;
+    set_limits(&db, profile, Some(1), None, None).await;
+
+    let missed = r#"{"items":[{"source":"這裡有東西","target_word":"alpha",
+                               "reference":"I see alpha here."}]}"#;
+    let used = r#"{"items":[{"source":"這裡有東西","target_word":"alpha",
+                             "reference":"There is alpha here."}]}"#;
+    let llm = FakeLlm::new(&[missed, used]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let first = llm.seen_prompt(0);
+    assert!(
+        first.contains("there is / there are"),
+        "出題 prompt 要講明這次要練哪個句型：\n{first}"
+    );
+    assert_eq!(llm.call_count(), 2, "沒用到指定句型卻沒退回去重出");
+
+    let wordforge_practice::payload::ExerciseBody::Translation { items, .. } = &exercise.body
+    else {
+        panic!("該是翻譯題");
+    };
+    assert_eq!(items[0].reference.as_deref(), Some("There is alpha here."));
+}
+
+/// 這條測試存在的理由是它曾經是整個缺口：翻譯題只記 `false`。
+///
+/// 主要在做翻譯題的人，文法點的 stability 只會被拉低，沒有任何東西
+/// 拉高它——練越多看起來越不熟。缺的不是誠意，是**量得到的證據**，
+/// 而使用者自己寫的那一句配上偵測器就是證據。
+#[tokio::test]
+async fn using_the_pattern_correctly_counts_as_a_correct_answer() {
+    let (db, profile) = translation_setup().await;
+    add_pattern(
+        &db,
+        "there-be",
+        "there is / there are",
+        1,
+        r"\bthere\s+(is|are)\b",
+        "There is a cat.",
+    )
+    .await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"這裡有東西","target_word":"alpha",
+                      "reference":"There is alpha here."}]}"#,
+        r#"{"score":100,"items":[{"index":1,"correct":true}],"corrections":[]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["There is alpha here.".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let points = wordforge_db::grammar::all_points(&db, ProfileId(profile))
+        .await
+        .unwrap();
+    let there_be = points
+        .iter()
+        .find(|p| p.point == "there-be")
+        .expect("用對了句型卻一筆紀錄都沒有");
+    assert_eq!(there_be.correct_count, 1);
+    assert_eq!(there_be.error_count, 0);
+}
+
+/// 反過來：被指出來的錯誤**壓在那個句型上**時要記成答錯。
+#[tokio::test]
+async fn an_error_landing_on_the_pattern_counts_as_wrong() {
+    let (db, profile) = translation_setup().await;
+    add_pattern(
+        &db,
+        "there-be",
+        "there is / there are",
+        1,
+        r"\bthere\s+(is|are)\b",
+        "There is a cat.",
+    )
+    .await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"這裡有東西","target_word":"alpha",
+                      "reference":"There are alpha books here."}]}"#,
+        r#"{"score":50,"items":[{"index":1,"correct":false}],
+            "corrections":[{"index":1,"original":"There is alpha books",
+                            "corrected":"There are alpha books","severity":"major"}]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["There is alpha books here.".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let points = wordforge_db::grammar::all_points(&db, ProfileId(profile))
+        .await
+        .unwrap();
+    let there_be = points.iter().find(|p| p.point == "there-be").unwrap();
+    assert_eq!(there_be.error_count, 1, "錯誤就壓在這個句型上");
+    assert_eq!(there_be.correct_count, 0);
+}
+
+/// **量不到就什麼都不記。**
+///
+/// 修正的片段對不回作答的位置時，就不知道錯在哪：記「答對」會高估、
+/// 記「答錯」會冤枉。這跟 CLI 後端不回報 token 數時寧可留白、
+/// 不寫 0 是同一條原則。
+#[tokio::test]
+async fn an_unlocatable_correction_records_nothing_at_all() {
+    let (db, profile) = translation_setup().await;
+    add_pattern(
+        &db,
+        "there-be",
+        "there is / there are",
+        1,
+        r"\bthere\s+(is|are)\b",
+        "There is a cat.",
+    )
+    .await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"這裡有東西","target_word":"alpha",
+                      "reference":"There is alpha here."}]}"#,
+        // 模型指出的片段跟他實際寫的對不起來——實測會發生
+        r#"{"score":50,"items":[{"index":1,"correct":false}],
+            "corrections":[{"index":1,"original":"完全對不上的片段",
+                            "corrected":"別的東西","severity":"minor"}]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["There is alpha here.".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    let points = wordforge_db::grammar::all_points(&db, ProfileId(profile))
+        .await
+        .unwrap();
+    assert!(
+        points.iter().all(|p| p.point != "there-be"),
+        "對不回位置時猜了一個結果：{points:?}"
+    );
+}
+
+/// 沒有匯入任何句型、也沒有設上限時，這整套機制要**完全不作用**：
+/// prompt 裡不該多出一段空的「句型難度」，也不該有任何東西被退回。
+#[tokio::test]
+async fn nothing_changes_for_someone_who_never_imported_patterns() {
+    let (db, profile) = translation_setup().await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"如果我有錢我會買","target_word":"alpha",
+                                 "reference":"If I had money, I would buy a very large alpha today."}]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 1, "沒設上限卻退回去重寫了");
+    let prompt = llm.seen_prompt(0);
+    assert!(
+        !prompt.contains("# 句型難度"),
+        "沒設定就不該在 prompt 裡留一段空的難度要求：\n{prompt}"
+    );
+}
+
+/// 標記「我會了」之後，那個句型的級數再高也不算超綱。
+///
+/// 分級上限講的是「一般人學到哪」，是預設值；使用者親手標記的是事實。
+/// 沒有這一條的話，他標記完之後題目照樣被退回去重寫，而畫面上完全
+/// 看不出為什麼——他只會覺得那顆按鈕沒有用。
+#[tokio::test]
+async fn what_the_learner_says_he_knows_beats_the_level_ceiling() {
+    let (db, profile) = translation_setup().await;
+    add_pattern(
+        &db,
+        "conditional-2",
+        "第二類條件句",
+        5,
+        r"\bif\b[^.?!]*\bwould\b",
+        "If I knew, I would say.",
+    )
+    .await;
+    set_limits(&db, profile, Some(2), None, None).await;
+
+    // 他自己說他會這個——按一次就要算數
+    wordforge_db::grammar::set_known(
+        &db,
+        ProfileId(profile),
+        "conditional-2",
+        true,
+        &wordforge_core::srs::Scheduler::default(),
+        t0(),
+    )
+    .await
+    .unwrap();
+
+    let hard = r#"{"items":[{"source":"如果我有錢我會買","target_word":"alpha",
+                             "reference":"If I had money, I would buy alpha."}]}"#;
+    let llm = FakeLlm::new(&[hard]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    let exercise = engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 1, "他說他會的句型還是被退回去重寫了");
+
+    let prompt = llm.seen_prompt(0);
+    assert!(
+        prompt.contains("他已經會的句型") && prompt.contains("第二類條件句"),
+        "只講什麼不能用、不講他會什麼的話，句子會越寫越平：\n{prompt}"
+    );
+
+    let wordforge_practice::payload::ExerciseBody::Translation { items, .. } = &exercise.body
+    else {
+        panic!("該是翻譯題");
+    };
+    assert_eq!(
+        items[0].reference.as_deref(),
+        Some("If I had money, I would buy alpha.")
+    );
+}
+
+/// 沒標記的時候，同一個句型仍然會被擋下來。
+///
+/// 上面那條測試如果因為「上限根本沒生效」而通過，這裡會紅。
+#[tokio::test]
+async fn the_same_pattern_is_still_blocked_when_he_has_not_marked_it() {
+    let (db, profile) = translation_setup().await;
+    add_pattern(
+        &db,
+        "conditional-2",
+        "第二類條件句",
+        5,
+        r"\bif\b[^.?!]*\bwould\b",
+        "If I knew, I would say.",
+    )
+    .await;
+    set_limits(&db, profile, Some(2), None, None).await;
+
+    let hard = r#"{"items":[{"source":"如果我有錢我會買","target_word":"alpha",
+                             "reference":"If I had money, I would buy alpha."}]}"#;
+    let easy = r#"{"items":[{"source":"我買了","target_word":"alpha",
+                             "reference":"I buy alpha."}]}"#;
+    let llm = FakeLlm::new(&[hard, easy]);
+    let engine = PracticeEngine::new(&db, &llm);
+
+    engine
+        .generate(
+            profile,
+            Some(ExerciseKind::TranslationToTarget),
+            t0() + Duration::days(400),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm.call_count(), 2, "沒標記過的超綱句型應該被退回去重寫");
+}
+
+/// 這條測試存在的理由是它曾經是錯的，而且錯得完全看不出來。
+///
+/// 為了不讓上百條句型撐爆批改 prompt，「可用標籤」那份清單被過濾成
+/// 只有錯誤標籤。但**認回來**用的是同一份——於是指定句型出的選擇題，
+/// 題目標籤（`there-be`）認不出來，`normalize_point` 回 `None`，
+/// 整份練習的對錯被無聲丟掉：答完五題，畫面一切正常，什麼都沒記到。
+#[tokio::test]
+async fn drilling_a_sentence_pattern_actually_records_the_result() {
+    let (db, profile) = setup(&["go"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    add_pattern(
+        &db,
+        "there-be",
+        "there is / there are",
+        1,
+        r"\bthere\s+(is|are)\b",
+        "There is a cat.",
+    )
+    .await;
+
+    let llm = FakeLlm::new(&[r#"{"items":[
+        {"prompt":"___ a book on the desk.","options":["There is","There are"],
+         "option_notes":["單數","複數"],"answer_index":0,"grammar_point":"there-be"},
+        {"prompt":"___ two cats here.","options":["There is","There are"],
+         "option_notes":["單數","複數"],"answer_index":1,"grammar_point":"there-be"}
+    ]}"#]);
+    let engine = PracticeEngine::new(&db, &llm).with_grammar_focus(Some("there-be".to_string()));
+
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::Grammar), t0())
+        .await
+        .unwrap();
+
+    let prompt = llm.seen_prompt(0);
+    assert!(
+        prompt.contains("there is / there are"),
+        "指定的句型要連名稱一起帶給模型，只給識別碼它只能猜：\n{prompt}"
+    );
+
+    // 第一題對、第二題錯
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec![],
+                choices: answer(&exercise, &[Some(true), Some(false)]),
+                marked_unknown: vec![],
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+    let points = wordforge_db::grammar::all_points(&db, ProfileId(profile))
+        .await
+        .unwrap();
+    let there_be = points
+        .iter()
+        .find(|p| p.point == "there-be")
+        .expect("練了兩題句型卻一筆紀錄都沒有");
+    assert_eq!(there_be.correct_count, 1);
+    assert_eq!(there_be.error_count, 1);
+}
+
+/// 但批改那一側仍然要用**窄的**清單。
+///
+/// 批改 prompt 只列了錯誤標籤，模型只可能從那份挑。拿含句型的寬清單去
+/// 比對的話，`normalize_point` 會先命中字面更長的句型識別碼——於是
+/// 「時態錯了」這條修正會被掛到「過去簡單式」那個句型上，而錯誤標籤
+/// 那邊什麼都沒累積。畫面上完全看不出來。
+#[tokio::test]
+async fn a_correction_lands_on_the_error_label_not_a_lookalike_pattern() {
+    let (db, profile) = setup(&["park", "alpha"]).await;
+    set_vocabulary(&db, profile, 1_000).await;
+    put_in_deck(&db, profile, 1).await;
+
+    // 識別碼刻意寫得比錯誤標籤 `tense` 更長更具體：模型回 "past simple tense"
+    // 時，寬清單會完全命中這一條，窄清單只命中 `tense`
+    add_pattern(
+        &db,
+        "past-simple-tense",
+        "過去簡單式",
+        2,
+        r"\bwent\b",
+        "I went there.",
+    )
+    .await;
+
+    let llm = FakeLlm::new(&[
+        r#"{"items":[{"source":"我昨天去了公園","target_word":"park",
+                      "reference":"I went to the park yesterday"}]}"#,
+        r#"{"score":50,
+            "items":[{"index":1,"correct":false,"reference":"I went to the park yesterday"}],
+            "corrections":[{"original":"I go to park","corrected":"I went to the park",
+                            "grammar_point":"past simple tense","severity":"major"}]}"#,
+    ]);
+    let engine = PracticeEngine::new(&db, &llm);
+    let exercise = engine
+        .generate(profile, Some(ExerciseKind::TranslationToTarget), t0())
+        .await
+        .unwrap();
+
+    engine
+        .grade(
+            profile,
+            &GradeInput {
+                exercise_id: exercise.exercise_id,
+                answers: vec!["I go to park yesterday".into()],
+                choices: vec![],
+                marked_unknown: vec![],
+            },
+            t0(),
+        )
+        .await
+        .unwrap();
+
+    let points = wordforge_db::grammar::all_points(&db, ProfileId(profile))
+        .await
+        .unwrap();
+    let tense = points
+        .iter()
+        .find(|p| p.point == "tense")
+        .expect("這條修正該累積在錯誤標籤 tense 上");
+    assert_eq!(tense.error_count, 1);
+    assert!(
+        points.iter().all(|p| p.point != "past-simple-tense"),
+        "修正被掛到句型上了：{points:?}"
     );
 }

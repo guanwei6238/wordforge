@@ -58,6 +58,11 @@ impl PracticeEngine<'_> {
                 .await?
         };
 
+        // 難度上限與這次要練的句型。翻譯是唯一會**指派句型**的題型：
+        // 它本來就是「照這個要求寫一句」，而且使用者的作答是目標語言，
+        // 驗得動——閱讀那邊硬指派一個句型只會把文章綁死。
+        let difficulty = self.difficulty(profile_id, true, now).await?;
+
         let mut req = prompts::translation_task(&prompts::TranslationSpec {
             target_lang: self.target_name(),
             native_lang: self.native_name(),
@@ -67,6 +72,7 @@ impl PracticeEngine<'_> {
             words: &words,
             usable: &usable,
             count,
+            difficulty: difficulty.brief(),
         });
 
         // 每個字的家族詞形先查好，驗收才問得出「這句有沒有真的練到它」。
@@ -75,14 +81,24 @@ impl PracticeEngine<'_> {
         let assignments = self
             .word_assignments(&words[..words.len().min(count)])
             .await?;
+        let to_target = kind == ExerciseKind::TranslationToTarget;
         let spec = crate::validate::TranslationSpec {
             assignments: &assignments,
-            to_target: kind == ExerciseKind::TranslationToTarget,
+            to_target,
             target_lang: &self.target_lang,
         };
+        // 難度跟用字一起驗，同一趟重試裡一起講完：分兩次的話模型會
+        // 先修好句型、再被退回去修用字，每一輪都是一趟完整的呼叫。
+        let difficulty_spec = difficulty.spec(&self.target_lang);
         let value = self
             .ask_valid_json(profile_id, "generate", &mut req, |v| {
-                crate::validate::check_translation(&spec, v)
+                let mut problems = crate::validate::check_translation(&spec, v);
+                problems.extend(crate::validate::check_translation_difficulty(
+                    &difficulty_spec,
+                    to_target,
+                    v,
+                ));
+                problems
             })
             .await?;
 
@@ -252,6 +268,11 @@ impl PracticeEngine<'_> {
             .await?;
         let topic = if excerpt.is_some() { None } else { topic };
 
+        // 文章不指派句型（一篇 300 詞本來就會用上幾十種結構，硬指派
+        // 一個等於把文章綁死），但上限一樣要套。
+        let difficulty = self.difficulty(profile_id, false, now).await?;
+        let difficulty_spec = difficulty.spec(&self.target_lang);
+
         let spec = prompts::ReadingSpec {
             target_lang: self.target_name(),
             native_lang: self.native_name(),
@@ -265,6 +286,7 @@ impl PracticeEngine<'_> {
             topic: topic.as_deref(),
             material_excerpt: excerpt.as_deref(),
             question_count: 4,
+            difficulty: difficulty.brief(),
         };
 
         let mut req = prompts::reading_comprehension(&spec);
@@ -307,6 +329,19 @@ impl PracticeEngine<'_> {
                 tracing::warn!("沒有任何已知詞資料，跳過覆蓋率驗收（建議先做分級測驗）");
             }
 
+            // 句法那一半。覆蓋率算的是「這些字他認不認得」，完全看不到
+            // 「這個結構他學過沒有」——一篇每個字都會的文章，照樣可以
+            // 整篇都是分詞構句。
+            //
+            // **`no_baseline` 不能連這一層一起跳過**：那個旗標講的是
+            // 「沒有已知詞資料所以覆蓋率沒有意義」，而句型上限是使用者
+            // 自己設定的，跟他學過幾個字無關。
+            let hard_sentences: Vec<String> =
+                crate::validate::check_passage_difficulty(&difficulty_spec, "passage", &value)
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
+
             // 「太難」要跟著設定走。原本用寫死的難度帶（<90% 才算太難），
             // 使用者把目標設成 98% 的話那個判斷完全不會生效。
             let too_hard = coverage.ratio() < target_coverage - COVERAGE_TOLERANCE;
@@ -317,7 +352,8 @@ impl PracticeEngine<'_> {
             // 要求一件做不到的事（候選被牌組排光的新使用者就是這種狀態）。
             let too_easy = !target_words.is_empty()
                 && coverage.ratio() > target_coverage + (1.0 - target_coverage) / 2.0;
-            let acceptable = (!too_hard && !too_easy) || no_baseline || attempt == COVERAGE_RETRIES;
+            let acceptable = ((!too_hard && !too_easy) || no_baseline) && hard_sentences.is_empty()
+                || attempt == COVERAGE_RETRIES;
             if acceptable {
                 let mut questions: Vec<ChoiceItem> = parse_choice_items(&value, "questions");
 
@@ -380,6 +416,15 @@ impl PracticeEngine<'_> {
                         now,
                     )
                     .await;
+            }
+
+            // 句型超標優先處理：那是「他讀不懂」，比「生詞多了兩個」嚴重，
+            // 而且一輪只能給一則重問訊息（每一則都是一趟完整的呼叫）
+            if !hard_sentences.is_empty() {
+                tracing::info!(?hard_sentences, "句型超出程度，要求重寫");
+                req.messages
+                    .push(prompts::difficulty_retry(&hard_sentences, &passage));
+                continue;
             }
 
             // 太簡單是相反的問題：白名單裡的字沒用夠。要講出「哪幾個沒用到」，
@@ -495,6 +540,9 @@ impl PracticeEngine<'_> {
         // 這條的形狀是測試抓出來的。
         let min_blanks = CLOZE_MIN_BLANKS.min(blanks.len() / 2).max(1);
 
+        let difficulty = self.difficulty(profile_id, false, now).await?;
+        let difficulty_spec = difficulty.spec(&self.target_lang);
+
         let mut req = prompts::cloze_passage(&prompts::ClozeSpec {
             target_lang: self.target_name(),
             native_lang: self.native_name(),
@@ -506,6 +554,7 @@ impl PracticeEngine<'_> {
             blanks_min: min_blanks,
             topic: topic.as_deref(),
             material_excerpt: excerpt.as_deref(),
+            difficulty: difficulty.brief(),
         });
         // 挖的字必須來自候選：模型挖了別的字時畫面上完全正常，
         // 只是他複習到的不是他該複習的那些字
@@ -513,6 +562,11 @@ impl PracticeEngine<'_> {
             .ask_valid_json(profile_id, "generate", &mut req, |v| {
                 let mut problems = crate::validate::check_cloze(v);
                 problems.extend(crate::validate::check_blank_words(v, &blanks, min_blanks));
+                problems.extend(crate::validate::check_passage_difficulty(
+                    &difficulty_spec,
+                    "passage",
+                    v,
+                ));
                 problems
             })
             .await?;

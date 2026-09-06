@@ -6262,6 +6262,7 @@ dependencies = [
 name = "wordforge-core"
 version = "2.2.6"
 dependencies = [
+ "regex",
  "serde",
  "thiserror 2.0.20",
  "time",

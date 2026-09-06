@@ -9,6 +9,7 @@
 //! - [`coverage`]：可理解輸入（90% 法則）的覆蓋率計算與目標詞挑選
 //! - [`grammar_points`]：文法點的受控詞彙表，避免模型每次換一套說法
 //! - [`model`]：跨層共用的領域型別
+//! - [`patterns`]：句型的本地偵測，出題難度的另一半
 //! - [`placement`]：分級測驗，估計詞彙量決定從哪裡開始學
 //! - [`practice`]：決定現在該出什麼題
 //! - [`text`]：字串正規化與斷詞的共用工具
@@ -17,6 +18,7 @@
 pub mod coverage;
 pub mod grammar_points;
 pub mod model;
+pub mod patterns;
 pub mod placement;
 pub mod practice;
 pub mod srs;

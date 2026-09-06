@@ -405,6 +405,139 @@ pub fn check_translation(spec: &TranslationSpec, value: &Value) -> Vec<Problem> 
     problems
 }
 
+// ---------------------------------------------------------------- 句子難度
+
+/// 這次出題的難度上限，以及指派要練的句型。
+///
+/// ## 為什麼一定要在本地驗
+///
+/// prompt 裡那段「不要用超過這一級的句型」跟「請用這些字」是同一種東西：
+/// **只是請求**。模型會寫出一句通順、自然、完全符合它自己對「簡單」的
+/// 理解、但學習者根本讀不懂的句子——而畫面上看不出異狀，題目是好題目，
+/// 只是他每一題都錯。
+///
+/// 這裡驗得到的就在這裡驗。驗不到的（沒收錄的句型）誠實承認驗不到，
+/// 由 `DifficultyLimit::max_words` 那一層接住。
+pub struct DifficultySpec<'a> {
+    pub patterns: &'a wordforge_core::patterns::PatternSet,
+    pub limit: &'a wordforge_core::patterns::DifficultyLimit,
+    /// 目標語言代碼。子句標記的表跟語言有關。
+    pub lang: &'a str,
+    /// 這次指派要練的句型識別碼。`None` 就只檢查上限。
+    pub practise: Option<&'a str>,
+    /// 使用者**已經標記會了**的句型（識別碼）。
+    ///
+    /// 這些不算超綱，級數再高也一樣：分級上限是「一般人學到哪」的預設值，
+    /// 而使用者親手標記的是事實。事實贏過預設值——否則他標記完「我會了」
+    /// 之後，那個句型仍然會被退回去重寫，而畫面上看不出為什麼。
+    pub known: &'a [String],
+}
+
+impl DifficultySpec<'_> {
+    /// 什麼都沒設定就整個跳過——連字串都不要切。
+    fn is_off(&self) -> bool {
+        self.limit.is_off() && self.practise.is_none()
+    }
+}
+
+/// 一段文字裡每一句的超標情形。
+///
+/// **逐句檢查，不是整段一起量**：模型偶爾會把兩句話塞進同一個 `reference`，
+/// 整段一起算詞數的話那一題會被判成「太長」，而它其實是兩個短句。
+/// 誤判的代價是題目被退回去重寫，使用者只看到出題變慢、看不出原因。
+fn sentence_problems(spec: &DifficultySpec, at: &str, text: &str) -> Vec<Problem> {
+    let mut out = Vec::new();
+    for sentence in wordforge_core::text::split_sentences(text) {
+        for exceeded in
+            wordforge_core::patterns::exceeds(sentence, spec.lang, spec.patterns, spec.limit)
+        {
+            // 他自己標記會了的句型不算超綱，見 `DifficultySpec::known`
+            if let wordforge_core::patterns::Exceeds::Pattern { point, .. } = &exceeded
+                && spec.known.iter().any(|k| k == point)
+            {
+                continue;
+            }
+            out.push(Problem::new(
+                at.to_string(),
+                format!("「{sentence}」{exceeded}。請換一個他學得到的說法重寫這一句。"),
+            ));
+        }
+    }
+    out
+}
+
+/// 翻譯題的難度驗收。
+///
+/// `to_target` 決定去哪一句找目標語言：母語 → 目標語時目標語句子是
+/// `reference`，反過來是 `source`。**這件事很容易寫反，而寫反的樣子是
+/// 「檢查永遠通過」**——母語那一句不會命中任何目標語言的 regex。
+pub fn check_translation_difficulty(
+    spec: &DifficultySpec,
+    to_target: bool,
+    value: &Value,
+) -> Vec<Problem> {
+    if spec.is_off() {
+        return Vec::new();
+    }
+    let Some(items) = value.get("items").and_then(|v| v.as_array()) else {
+        return Vec::new(); // 缺 items 是格式問題，check_translation 已經會報
+    };
+
+    let field = if to_target { "reference" } else { "source" };
+    let mut problems = Vec::new();
+    let mut practised = false;
+
+    for (i, item) in items.iter().enumerate() {
+        let Some(sentence) = item.get(field).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let at = format!("/items/{i}/{field}");
+        problems.extend(sentence_problems(spec, &at, sentence));
+
+        if let Some(point) = spec.practise
+            && spec
+                .patterns
+                .get(point)
+                .is_some_and(|p| p.matches(sentence))
+        {
+            practised = true;
+        }
+    }
+
+    // 指派了句型卻一題都沒用到——這正是「列出來只是請求」的那個洞。
+    // 沒有這一條的話，系統會把這次記成「練了這個句型」，而它一次都沒出現。
+    if let Some(point) = spec.practise
+        && !practised
+        && let Some(pattern) = spec.patterns.get(point)
+    {
+        problems.push(Problem::new(
+            "/items",
+            format!(
+                "沒有任何一題用到「{}」。這次指派要練的就是這個句型，\
+                 至少要有一題的目標語言句子真的是這個結構——\
+                 通順但沒用到它的句子，等於這次沒練到。",
+                pattern.name
+            ),
+        ));
+    }
+
+    problems
+}
+
+/// 文章類（閱讀、克漏字）的難度驗收。
+///
+/// 只檢查上限，不檢查「有沒有練到指定句型」：一篇 300 詞的文章本來就會
+/// 用上幾十種結構，硬指派一個等於把文章綁死，而那不是閱讀要練的東西。
+pub fn check_passage_difficulty(spec: &DifficultySpec, field: &str, value: &Value) -> Vec<Problem> {
+    if spec.limit.is_off() {
+        return Vec::new();
+    }
+    let Some(text) = value.get(field).and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    sentence_problems(spec, &format!("/{field}"), text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

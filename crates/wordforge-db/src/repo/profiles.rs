@@ -56,6 +56,29 @@ pub struct StudySettings {
     /// 視力與語言（漢字要比拉丁字母大才看得清楚筆畫），
     /// 三段一定有人剛好卡在中間。存成數字，UI 給加減鈕。
     pub reading_font_size: i64,
+
+    // ---- 句子難度上限。三個都是 Option，`None` 表示這一項不限制。
+    //
+    // 為什麼預設全是 `None`：這整套機制在使用者匯入句型、自己設定之前
+    // 應該**完全不作用**。預設一個數字等於替所有人決定「什麼叫太難」，
+    // 而那件事因人而異——跟 `reading_coverage` 是同一個道理，
+    // 差別只在覆蓋率有一個被廣泛引用的起點（90% 法則），句型沒有。
+    /// 句型分級的上限（`grammar_def.level_ordinal`）。
+    ///
+    /// 超過這一級的句型：出題時列進「不要用」，產生之後本地實測，
+    /// 命中就退回重寫；也不會被指派為「這次要練的句型」。
+    pub pattern_ceiling: Option<i64>,
+    /// 一句話最多幾個詞。
+    ///
+    /// 這是**全覆蓋但粗**的那一層：句型偵測只抓得到收錄過的東西，
+    /// 而沒收錄的難句正是最需要被擋下來的。有空格的語言算詞，
+    /// 中日文算字——兩個刻度差很多，所以這個數字只能由使用者自己調。
+    pub sentence_max_words: Option<i64>,
+    /// 一句話最多幾個子句標記（從屬連接詞、關係詞、分號）。
+    ///
+    /// 0 就是「只給單句」。沒收錄子句標記的語言一律算 0 個，
+    /// 這一項對它們等於沒開——降級成少一層過濾，不是降級成誤判。
+    pub sentence_max_clauses: Option<i64>,
 }
 
 impl Default for StudySettings {
@@ -71,6 +94,11 @@ impl Default for StudySettings {
             // 跟介面其他文字一樣大。兩欄版面下再放大會讓一行放不了
             // 幾個字，要一直換行反而更累；想大想小都自己按 A± 調。
             reading_font_size: 16,
+            // 沒匯入句型之前這三項無事可做，開著只會讓題目莫名其妙
+            // 被退回去重寫，而使用者不知道是自己沒設定過的東西在擋
+            pattern_ceiling: None,
+            sentence_max_words: None,
+            sentence_max_clauses: None,
         }
     }
 }
@@ -91,6 +119,15 @@ impl StudySettings {
             // 小於 12px 標點看不清楚，大於 32px 一行放不了幾個字，
             // 眼睛要一直換行反而更累
             reading_font_size: self.reading_font_size.clamp(12, 32),
+            // 上限本身不夾：分級刻度由匯入的資料決定，程式不知道
+            // 這個語言有幾級。夾在 1..=6 的話，匯入八級的課綱就會
+            // 有兩級永遠選不到，而那個症狀看起來像選單壞了。
+            pattern_ceiling: self.pattern_ceiling,
+            // 少於 3 個詞不成句，超過 60 個詞的「一句」多半是模型
+            // 沒斷好——兩邊都夾住，免得手滑打錯一個數字之後
+            // 每一題都被退回去重寫
+            sentence_max_words: self.sentence_max_words.map(|n| n.clamp(3, 60)),
+            sentence_max_clauses: self.sentence_max_clauses.map(|n| n.clamp(0, 10)),
         }
     }
 }
@@ -103,6 +140,9 @@ type SettingsRow = (
     Option<f64>,
     Option<f64>,
     Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
 );
 
 pub async fn study_settings(db: &Db, profile_id: ProfileId) -> Result<StudySettings> {
@@ -111,13 +151,16 @@ pub async fn study_settings(db: &Db, profile_id: ProfileId) -> Result<StudySetti
                 CAST(json_extract(settings_json, '$.max_reviews_per_day') AS INTEGER),
                 CAST(json_extract(settings_json, '$.desired_retention') AS REAL),
                 CAST(json_extract(settings_json, '$.reading_coverage') AS REAL),
-                CAST(json_extract(settings_json, '$.reading_font_size') AS INTEGER)
+                CAST(json_extract(settings_json, '$.reading_font_size') AS INTEGER),
+                CAST(json_extract(settings_json, '$.pattern_ceiling') AS INTEGER),
+                CAST(json_extract(settings_json, '$.sentence_max_words') AS INTEGER),
+                CAST(json_extract(settings_json, '$.sentence_max_clauses') AS INTEGER)
          FROM profile WHERE id = ? AND json_valid(settings_json)",
     )
     .bind(profile_id.0)
     .fetch_optional(db.pool())
     .await?
-    .unwrap_or((None, None, None, None, None));
+    .unwrap_or((None, None, None, None, None, None, None, None));
 
     let d = StudySettings::default();
     Ok(StudySettings {
@@ -126,6 +169,12 @@ pub async fn study_settings(db: &Db, profile_id: ProfileId) -> Result<StudySetti
         desired_retention: row.2.unwrap_or(d.desired_retention),
         reading_coverage: row.3.unwrap_or(d.reading_coverage),
         reading_font_size: row.4.unwrap_or(d.reading_font_size),
+        // 這三個**不套預設值**：`None` 本身就是「不限制」的意思，
+        // 跟「還沒設定過」是同一件事。用 unwrap_or 補一個數字進去，
+        // 等於替使用者決定了他從來沒選過的難度上限。
+        pattern_ceiling: row.5,
+        sentence_max_words: row.6,
+        sentence_max_clauses: row.7,
     }
     .clamped())
 }
@@ -145,7 +194,10 @@ pub async fn update_study_settings(
                  '$.max_reviews_per_day', ?,
                  '$.desired_retention', ?,
                  '$.reading_coverage', ?,
-                 '$.reading_font_size', ?)
+                 '$.reading_font_size', ?,
+                 '$.pattern_ceiling', ?,
+                 '$.sentence_max_words', ?,
+                 '$.sentence_max_clauses', ?)
          WHERE id = ?",
     )
     .bind(s.new_per_day)
@@ -153,6 +205,11 @@ pub async fn update_study_settings(
     .bind(s.desired_retention)
     .bind(s.reading_coverage)
     .bind(s.reading_font_size)
+    // `None` 存成 JSON null，讀回來 json_extract 一樣是 NULL——
+    // 「不限制」要存得回去，不然關掉一個上限就關不掉了
+    .bind(s.pattern_ceiling)
+    .bind(s.sentence_max_words)
+    .bind(s.sentence_max_clauses)
     .bind(profile_id.0)
     .execute(db.pool())
     .await?;
@@ -498,11 +555,21 @@ mod tests {
                 desired_retention: 1.5,
                 reading_coverage: 2.0,
                 reading_font_size: 400,
+                pattern_ceiling: Some(3),
+                sentence_max_words: Some(999),
+                sentence_max_clauses: Some(-1),
             },
         )
         .await
         .unwrap();
 
+        assert_eq!(
+            s.pattern_ceiling,
+            Some(3),
+            "分級刻度由匯入的資料決定，程式不知道這個語言有幾級，不能夾"
+        );
+        assert_eq!(s.sentence_max_words, Some(60));
+        assert_eq!(s.sentence_max_clauses, Some(0));
         assert_eq!(s.new_per_day, 0, "0 是合法的（今天先不學新字）");
         assert_eq!(s.max_reviews_per_day, 10);
         assert!((s.desired_retention - 0.97).abs() < 1e-9);

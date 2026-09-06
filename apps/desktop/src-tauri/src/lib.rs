@@ -169,6 +169,8 @@ pub fn run() {
             commands::grammar::explain_grammar,
             commands::grammar::set_grammar_known,
             commands::grammar::import_grammar,
+            commands::grammar::grammar_levels,
+            commands::grammar::check_detector,
             commands::practice::load_exercise,
             commands::profile::reset_progress,
             commands::dict::search_words,

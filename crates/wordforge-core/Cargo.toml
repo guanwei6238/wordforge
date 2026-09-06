@@ -9,6 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 句型偵測。保證線性時間、不會災難性回溯——這一點對「regex 由
+# 匯入的檔案或模型草擬」的情境是硬性條件，不是偏好。
+regex = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

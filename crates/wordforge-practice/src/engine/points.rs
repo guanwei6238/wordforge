@@ -93,7 +93,12 @@ impl PracticeEngine<'_> {
         now: OffsetDateTime,
     ) -> Result<()> {
         let pid = ProfileId(profile_id);
-        let points = self.grammar_points(now).await?;
+        // 批改用的**標籤選單**（窄，只有錯誤標籤）
+        let labels = self.grammar_points(now).await?;
+        // 認回來用的**字典**（寬，含句型）。兩份不能共用：指定句型出的
+        // 練習，題目標籤就是那個句型的識別碼，拿窄的去比對會認不出來，
+        // 然後整份練習的對錯被無聲丟掉。
+        let all = grammar::list_all_points(self.db, &self.target_lang).await?;
 
         match body {
             // 選擇題知道每一題在考什麼，對錯都能記。
@@ -108,7 +113,10 @@ impl PracticeEngine<'_> {
                     let Some(point) = item
                         .grammar_point
                         .as_deref()
-                        .and_then(|p| self.normalize_point(&points, p))
+                        // 用**寬的**那份：這個標籤是我們自己指定的
+                        // （`grammar_drill` 要求每一題都填指定的識別碼），
+                        // 而使用者指定得到的包含句型
+                        .and_then(|p| self.normalize_point(&all, p))
                     else {
                         continue;
                     };
@@ -118,25 +126,160 @@ impl PracticeEngine<'_> {
                 }
             }
 
-            // 翻譯題沒有標準答案可以比對，只能採信批改指出來的錯誤。
-            // 這裡沒有「答對」的資訊——沒被指出來不代表用對了，
-            // 可能只是那句話根本沒用到這個文法。
-            ExerciseBody::Translation { .. } => {
+            // 翻譯題沒有標準答案可以比對，錯誤那一側只能採信批改指出來的。
+            //
+            // **答對那一側**曾經是整個缺口：這裡只記 `false`，於是主要在做
+            // 翻譯題的人，文法點的 stability 只會被拉低，沒有任何東西拉高它
+            // ——練越多看起來越不熟。缺的不是誠意，是**量得到的證據**：
+            // 沒被指出來不代表用對了，可能只是那句話根本沒用到這個文法。
+            //
+            // 有偵測器的句型就有那個證據，見 [`Self::record_pattern_use`]。
+            ExerciseBody::Translation { to_target, .. } => {
                 for correction in &feedback.corrections {
                     let Some(point) = correction
                         .grammar_point
                         .as_deref()
-                        .and_then(|p| self.normalize_point(&points, p))
+                        // 這裡用**窄的**那份：批改 prompt 只列了錯誤標籤，
+                        // 模型只可能從那份挑。拿寬的去比對，關鍵字匹配會
+                        // 把一條修正誤掛到某個句型上
+                        .and_then(|p| self.normalize_point(&labels, p))
                     else {
                         continue;
                     };
                     grammar::record(self.db, pid, &point, false, &self.scheduler, now).await?;
+                }
+
+                // 只有「母語 → 目標語」量得到：那個方向使用者寫的是目標語言，
+                // regex 跑得動。反方向他寫的是母語，偵測器對它沒有意義——
+                // 硬跑只會什麼都比對不到，然後把每個句型都記成沒練。
+                if *to_target {
+                    self.record_pattern_use(profile_id, input, feedback, now)
+                        .await?;
                 }
             }
         }
 
         Ok(())
     }
+
+    /// 從**使用者自己寫的那一句**量句型：他用了什麼、用對了沒有。
+    ///
+    /// ## 為什麼這件事量得到
+    ///
+    /// 「母語 → 目標語」的作答是目標語言，偵測器直接跑得動。
+    /// 這是翻譯題唯一一處拿得到「答對」證據的地方——其餘全是
+    /// 「批改沒提到」，而那不等於用對了。
+    ///
+    /// ## 三種情況，第三種刻意什麼都不記
+    ///
+    /// | 這一題的狀況 | 記什麼 |
+    /// | --- | --- |
+    /// | 命中句型，而且被指出來的錯誤**壓在這個句型上** | 答錯 |
+    /// | 命中句型，這一題的錯誤都在別的地方（或根本沒錯） | 答對 |
+    /// | 命中句型，但有錯誤片段**對不回這一句的位置** | 什麼都不記 |
+    ///
+    /// 第三種是重點：對不回位置就不知道錯在哪，那時記「答對」會高估、
+    /// 記「答錯」會冤枉。**量不到就回 `None`，不要回 0**——這跟 CLI
+    /// 後端不回報 token 數時寧可留白、不寫 0 是同一條原則。
+    async fn record_pattern_use(
+        &self,
+        profile_id: i64,
+        input: &GradeInput,
+        feedback: &Feedback,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let defs = grammar::pattern_defs(self.db, &self.target_lang).await?;
+        if defs.is_empty() {
+            return Ok(());
+        }
+        let (set, problems) = wordforge_core::patterns::PatternSet::compile(&defs);
+        if !problems.is_empty() {
+            let listed: Vec<String> = problems.iter().map(|p| p.to_string()).collect();
+            tracing::warn!(?listed, "有偵測器沒通過控制組，這些句型量不到");
+        }
+        if set.is_empty() {
+            return Ok(());
+        }
+
+        let attributed = attribute_all(&feedback.corrections, &input.answers);
+        let pid = ProfileId(profile_id);
+
+        for (i, answer) in input.answers.iter().enumerate() {
+            if answer.trim().is_empty() {
+                continue;
+            }
+
+            // 這一題被指出來的錯誤，各自落在作答的哪個位置
+            let mut flaws: Vec<std::ops::Range<usize>> = Vec::new();
+            let mut unlocated = 0usize;
+            for (item, correction) in &attributed {
+                if *item != Some(i) {
+                    continue;
+                }
+                let fragment = correction.original.trim();
+                match (!fragment.is_empty())
+                    .then(|| answer.find(fragment))
+                    .flatten()
+                {
+                    Some(start) => flaws.push(start..start + fragment.len()),
+                    None => unlocated += 1,
+                }
+            }
+
+            for (pattern, span) in set.detect(answer) {
+                let broken = flaws
+                    .iter()
+                    .any(|flaw| flaw.start < span.end && span.start < flaw.end);
+                if broken {
+                    grammar::record(self.db, pid, &pattern.point, false, &self.scheduler, now)
+                        .await?;
+                } else if unlocated == 0 {
+                    grammar::record(self.db, pid, &pattern.point, true, &self.scheduler, now)
+                        .await?;
+                } else {
+                    // 有錯誤片段對不回位置：這個句型是對是錯我們不知道。
+                    // 猜一個會讓掌握度變成一個沒有依據的數字。
+                    tracing::debug!(
+                        point = pattern.point,
+                        "有對不回位置的修正，這個句型這次不計入"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// 每一條修正屬於哪一題（對不回去的是 `None`）。
+///
+/// 拆出來是因為有兩個用途：[`attribute_corrections`] 只要帶文法標籤的，
+/// 而句型那條路要**全部**——「這一題有沒有被指出錯誤」跟那條修正有沒有
+/// 標籤無關。兩邊各寫一份歸屬邏輯的話，一定會漂移。
+fn attribute_all<'a>(
+    corrections: &'a [Correction],
+    answers: &[String],
+) -> Vec<(Option<usize>, &'a Correction)> {
+    corrections
+        .iter()
+        .map(|correction| {
+            // 模型給的題號優先，但要在範圍內——超出範圍的 index 比沒有更糟
+            let by_index = correction
+                .index
+                .and_then(|n| n.checked_sub(1))
+                .filter(|i| *i < answers.len());
+
+            let by_text = || {
+                let needle = correction.original.trim();
+                if needle.is_empty() {
+                    return None;
+                }
+                answers.iter().position(|a| a.contains(needle))
+            };
+
+            (by_index.or_else(by_text), correction)
+        })
+        .collect()
 }
 
 /// 把每一條修正歸到它屬於的那一題。
@@ -158,7 +301,7 @@ pub(super) fn attribute_corrections(
     answers: &[String],
 ) -> Vec<(usize, String)> {
     let mut out = Vec::new();
-    for correction in corrections {
+    for (item, correction) in attribute_all(corrections, answers) {
         let Some(point) = correction
             .grammar_point
             .as_deref()
@@ -167,22 +310,7 @@ pub(super) fn attribute_corrections(
         else {
             continue;
         };
-
-        // 模型給的題號優先，但要在範圍內——超出範圍的 index 比沒有更糟
-        let by_index = correction
-            .index
-            .and_then(|n| n.checked_sub(1))
-            .filter(|i| *i < answers.len());
-
-        let by_text = || {
-            let needle = correction.original.trim();
-            if needle.is_empty() {
-                return None;
-            }
-            answers.iter().position(|a| a.contains(needle))
-        };
-
-        if let Some(item) = by_index.or_else(by_text) {
+        if let Some(item) = item {
             out.push((item, point.to_string()));
         }
     }

@@ -71,8 +71,14 @@ impl PracticeEngine<'_> {
 
         // 批改時讓模型看到「這個人最近常犯什麼」，它才判斷得出
         // 這次是同一個老毛病還是新問題
-        let weak_points =
-            grammar::due_points(self.db, ProfileId(profile_id), now, GRAMMAR_BATCH).await?;
+        let weak_points = grammar::due_points(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            now,
+            GRAMMAR_BATCH,
+        )
+        .await?;
 
         let mut feedback = match &body {
             ExerciseBody::Translation { to_target, items } => {
@@ -276,8 +282,14 @@ impl PracticeEngine<'_> {
                 target_word: items[*i].target_word.clone(),
             })
             .collect();
-        let weak_points =
-            grammar::due_points(self.db, ProfileId(profile_id), now, GRAMMAR_BATCH).await?;
+        let weak_points = grammar::due_points(
+            self.db,
+            ProfileId(profile_id),
+            &self.target_lang,
+            now,
+            GRAMMAR_BATCH,
+        )
+        .await?;
         let points = self.grammar_points(now).await?;
         let req = prompts::translation_feedback(
             self.target_name(),
@@ -456,7 +468,8 @@ impl PracticeEngine<'_> {
             ));
         }
 
-        let weak_points = grammar::due_points(self.db, pid, now, GRAMMAR_BATCH).await?;
+        let weak_points =
+            grammar::due_points(self.db, pid, &self.target_lang, now, GRAMMAR_BATCH).await?;
         let points = self.grammar_points(now).await?;
 
         let mut results: Vec<Option<DueSentenceResult>> = vec![None; pending.len()];

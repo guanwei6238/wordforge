@@ -34,6 +34,159 @@ fn grammar_point_rule(points: &[String]) -> String {
     }
 }
 
+/// 一個句型的簡介，出題時附給模型看。
+///
+/// 只帶識別碼是不夠的：`grammar_def` 開放編輯與匯入，`te-form` 這種
+/// 只有作者看得懂的字串丟過去，模型只能猜它在考什麼。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PatternBrief<'a> {
+    pub point: &'a str,
+    pub name: &'a str,
+    pub explanation: Option<&'a str>,
+    /// 一兩句例句。比講解有效——模型照著例句的形狀寫就對了。
+    pub examples: &'a [String],
+}
+
+/// 這次出題的句子難度上限，以及這次要練的句型。
+///
+/// ## 為什麼列「不要用的」而不是「只能用的」
+///
+/// 允許的句型可能有上百條，列完就把 prompt 撐爆了，而且清單越長模型
+/// 的注意力越稀薄。**最可能不小心用到的永遠是剛好高一級的那幾個**，
+/// 所以只列那些。
+///
+/// ## 這段話只是請求
+///
+/// 跟「請用這些字」一樣：列出來不代表模型會照做。真正擋得住的是
+/// 產生之後在本地用 regex 實測一次（`validate::check_translation_difficulty`）。
+/// 這段文字的作用是**降低重試次數**，不是保證。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DifficultyBrief<'a> {
+    /// 上限那一級的顯示名稱（`"國中七年級"`）。`None` 表示沒有分級上限。
+    pub level_name: Option<&'a str>,
+    /// 不要用的句型：`(名稱, 等級名稱)`。
+    pub avoid: &'a [(String, String)],
+    /// **他已經會的句型**（名稱），使用者自己標記或練出來的。
+    ///
+    /// 這是「更貼合這個人」的那一半：只講什麼不能用，模型只會把句子
+    /// 越寫越平；講清楚他會什麼，它才寫得出剛好落在他能力範圍內、
+    /// 又不無聊的句子。
+    pub known: &'a [String],
+    /// 一句話最多幾個詞
+    pub max_words: Option<i64>,
+    /// 一句話最多幾個子句
+    pub max_clauses: Option<i64>,
+    /// 這次要練的句型。指派了就會在本地檢查它真的出現在句子裡。
+    pub practise: Option<PatternBrief<'a>>,
+}
+
+impl DifficultyBrief<'_> {
+    /// 什麼都沒設定就整段不要出現在 prompt 裡。
+    ///
+    /// 留一段「句子不要太難：（空）」只會讓模型困惑，而且白燒 token。
+    pub fn is_empty(&self) -> bool {
+        self.level_name.is_none()
+            && self.avoid.is_empty()
+            && self.known.is_empty()
+            && self.max_words.is_none()
+            && self.max_clauses.is_none()
+            && self.practise.is_none()
+    }
+}
+
+/// 難度上限那一段。四個題型共用，所以措辭不提「這一題」或「這篇文章」。
+///
+/// 沒有任何限制時回空字串——見 [`DifficultyBrief::is_empty`]。
+pub fn difficulty_rules(brief: &DifficultyBrief) -> String {
+    if brief.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("# 句型難度\n");
+
+    if let Some(level) = brief.level_name {
+        out.push_str(&format!(
+            "他的句型程度到「{level}」為止。超過這一級的句型他還沒學過——\n\
+             用了的話他讀不懂題目，錯的原因會是句型而不是這一題真正要考的東西。\n"
+        ));
+    }
+
+    if let Some(max) = brief.max_words {
+        out.push_str(&format!("每一句不要超過 {max} 個詞。\n"));
+    }
+    if let Some(max) = brief.max_clauses {
+        out.push_str(&match max {
+            0 => "每一句只寫一個子句，不要用從屬子句與關係子句。\n".to_string(),
+            n => format!("每一句最多 {n} 個子句。\n"),
+        });
+    }
+
+    if !brief.avoid.is_empty() {
+        let list: Vec<String> = brief
+            .avoid
+            .iter()
+            .map(|(name, level)| {
+                if level.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name}（{level}）")
+                }
+            })
+            .collect();
+        out.push_str(&format!(
+            "特別不要用這些（他還沒學到，而且系統會實際檢查）：{}。\n",
+            list.join("、")
+        ));
+    }
+
+    if !brief.avoid.is_empty() || brief.level_name.is_some() {
+        out.push_str("**出題之後系統會用比對規則實際檢查**這幾件事，超標的句子會被退回來重寫。\n");
+    }
+    out.push('\n');
+
+    if !brief.known.is_empty() {
+        out.push_str(&format!(
+            "# 他已經會的句型\n\
+             {list}\n\
+             這些**放心用**——他自己標記過會了，或者練習裡用對過。\n\
+             只避開不能用的、卻不知道他會什麼的話，句子會越寫越平；\n\
+             這份清單是讓你寫得出剛好落在他能力範圍內、又不無聊的句子。\n\n",
+            list = brief.known.join("、"),
+        ));
+    }
+
+    if let Some(p) = &brief.practise {
+        out.push_str(&format!("# 這次要練的句型\n{}", practise_rule(p)));
+    }
+
+    out
+}
+
+/// 「這次要練這個句型」那一段。
+///
+/// 跟「每一題各練一個字」是同一個設計：列出來只是請求，模型很會寫出
+/// 一句通順、自然、跟指定句型完全無關的話。所以要明講系統會檢查——
+/// 而且真的要檢查。
+fn practise_rule(p: &PatternBrief) -> String {
+    let mut out = format!("「{}」", p.name);
+    if let Some(explanation) = p.explanation.map(str::trim).filter(|e| !e.is_empty()) {
+        // 講解可能很長（那是給學習者讀的整篇說明），這裡只要前幾句：
+        // 模型需要的是「這個標籤指的是什麼」，不是一堂課
+        let brief: String = explanation.chars().take(200).collect();
+        out.push_str(&format!("：{brief}"));
+    }
+    out.push('\n');
+    if !p.examples.is_empty() {
+        out.push_str(&format!("例句：{}\n", p.examples.join("　/　")));
+    }
+    out.push_str(
+        "**至少要有一題**的目標語言句子真的用到這個句型。\n\
+         系統會用比對規則檢查，對不上會把題目退回來重寫——\n\
+         寫一句通順但沒用到這個句型的話，等於這次沒練到。\n\n",
+    );
+    out
+}
+
 /// 產生閱讀理解的規格。
 #[derive(Debug, Clone)]
 pub struct ReadingSpec<'a> {
@@ -63,6 +216,8 @@ pub struct ReadingSpec<'a> {
     /// 自訂教材摘錄。有值時模型只能用這份材料的內容與用字。
     pub material_excerpt: Option<&'a str>,
     pub question_count: usize,
+    /// 句子的難度上限。什麼都沒設定時整段不會出現在 prompt 裡。
+    pub difficulty: DifficultyBrief<'a>,
 }
 
 impl<'a> ReadingSpec<'a> {
@@ -192,6 +347,8 @@ pub fn reading_comprehension(spec: &ReadingSpec) -> ChatRequest {
         ));
     }
 
+    prompt.push_str(&difficulty_rules(&spec.difficulty));
+
     if let Some(topic) = spec.topic {
         prompt.push_str(&format!("# 主題\n{topic}\n\n"));
     }
@@ -274,6 +431,8 @@ pub struct ClozeSpec<'a> {
     pub topic: Option<&'a str>,
     /// 自訂教材摘錄。有值時模型只能用這份材料的內容與用字。
     pub material_excerpt: Option<&'a str>,
+    /// 句子的難度上限。什麼都沒設定時整段不會出現在 prompt 裡。
+    pub difficulty: DifficultyBrief<'a>,
 }
 
 /// 克漏字出題。
@@ -298,6 +457,7 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
         blanks_min,
         topic,
         material_excerpt,
+        difficulty,
     } = *spec;
 
     let system = format!(
@@ -338,6 +498,8 @@ pub fn cloze_passage(spec: &ClozeSpec) -> ChatRequest {
         min = blanks_min.min(n),
         words_list = blank_words.join("、"),
     );
+
+    prompt.push_str(&difficulty_rules(&difficulty));
 
     if let Some(topic) = topic {
         prompt.push_str(&format!("# 主題\n{topic}\n\n"));
@@ -838,6 +1000,8 @@ pub struct TranslationSpec<'a> {
     pub usable: &'a [String],
     /// 要出幾題
     pub count: usize,
+    /// 句子的難度上限與這次要練的句型。
+    pub difficulty: DifficultyBrief<'a>,
 }
 
 pub fn translation_task(spec: &TranslationSpec) -> ChatRequest {
@@ -850,6 +1014,7 @@ pub fn translation_task(spec: &TranslationSpec) -> ChatRequest {
         words,
         usable,
         count,
+        difficulty,
     } = *spec;
     let system = format!(
         "你是一位{target}翻譯練習出題老師。你只輸出 JSON。",
@@ -933,6 +1098,8 @@ pub fn translation_task(spec: &TranslationSpec) -> ChatRequest {
         answer = answer_lang,
     );
 
+    prompt.push_str(&difficulty_rules(&difficulty));
+
     // 主題只是起點，不是限制：真正要的是題目之間有差異。
     // 上面那段「情境要有變化」不管有沒有主題都要講——沒有主題時
     // 模型的預設場景收斂得更嚴重。
@@ -985,6 +1152,29 @@ pub fn translation_task(spec: &TranslationSpec) -> ChatRequest {
 ///
 /// `problems` 用 JSON Pointer 定位（`/questions/2/answer_index`），
 /// 因為那是模型指得回去的方式——說「第三題」它還要自己數。
+/// 句子太難時的重問。
+///
+/// 跟 [`format_retry`] 分開，因為說「沒有通過格式檢查」會讓模型去改
+/// JSON 的形狀，而形狀本來就是對的——要改的是句子本身。
+///
+/// 一樣要把上一次的輸出串回去：非交互式的後端不記得自己寫過什麼。
+pub fn difficulty_retry(problems: &[String], previous: &str) -> Message {
+    Message::user(format!(
+        "上一次的內容有幾句超出這位學習者的句型程度。\n\
+         JSON 的格式沒有問題，要改的是句子本身。\n\n\
+         你上一次輸出的是：\n---\n{previous}\n---\n\n\
+         這幾句要換一個他學得到的說法重寫：\n{list}\n\n\
+         改寫的原則：拆成短句、少用從屬子句、換成他這個程度會用的結構。\n\
+         **不要為了變簡單而換掉指定要練的字或句型**——那樣這一題就白練了。\n\
+         其餘沒有被指出來的地方照原樣保留。只輸出 JSON。",
+        list = problems
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
 pub fn format_retry(problems: &[String], previous: &str) -> Message {
     Message::user(format!(
         "上一次的輸出沒有通過格式檢查。\n\n\
@@ -1140,6 +1330,7 @@ mod tests {
             topic: Some("學校生活"),
             material_excerpt: excerpt,
             question_count: 4,
+            difficulty: DifficultyBrief::default(),
         }
     }
 
@@ -1160,6 +1351,7 @@ mod tests {
             blanks_min: blank_words.len().saturating_sub(2).max(1),
             topic,
             material_excerpt: excerpt,
+            difficulty: DifficultyBrief::default(),
         }
     }
 
@@ -1333,6 +1525,7 @@ mod tests {
             words: &due,
             usable: &[],
             count: 3,
+            difficulty: DifficultyBrief::default(),
         });
         let text = req.messages[0].content.clone();
         assert!(text.contains("At the market."));
@@ -1348,6 +1541,7 @@ mod tests {
             words: &due,
             usable: &[],
             count: 3,
+            difficulty: DifficultyBrief::default(),
         });
         assert!(!free.messages[0].content.contains("指定教材"));
     }
@@ -1369,6 +1563,7 @@ mod tests {
             words: &due,
             usable: &[],
             count: 3,
+            difficulty: DifficultyBrief::default(),
         });
         let text = with_topic.messages[0].content.clone();
         assert!(text.contains("旅行：訂房"), "主題沒進 prompt：{text}");
@@ -1387,6 +1582,7 @@ mod tests {
             words: &due,
             usable: &[],
             count: 3,
+            difficulty: DifficultyBrief::default(),
         });
         let text = no_topic.messages[0].content.clone();
         assert!(text.contains("場合"), "沒主題時更需要這段：{text}");
@@ -1476,6 +1672,7 @@ mod tests {
             words: &due,
             usable: &[],
             count: 3,
+            difficulty: DifficultyBrief::default(),
         });
         let text = &to_target.messages[0].content;
         assert!(
@@ -1496,6 +1693,7 @@ mod tests {
             words: &due,
             usable: &[],
             count: 3,
+            difficulty: DifficultyBrief::default(),
         });
         let text = &to_native.messages[0].content;
         assert!(text.contains("English → 繁體中文"), "{text}");
@@ -1739,6 +1937,7 @@ mod tests {
             words: &words,
             usable: &[],
             count: 5,
+            difficulty: DifficultyBrief::default(),
         });
         let text = &req.messages[0].content;
 
@@ -1791,6 +1990,7 @@ mod tests {
             words: &due,
             usable: &[],
             count: 3,
+            difficulty: DifficultyBrief::default(),
         });
         let text = &req.messages[0].content;
         assert!(text.contains("borrow"));
@@ -2027,6 +2227,149 @@ mod tests {
         assert!(
             m.content.contains("The ubiquitous paradigm shifted."),
             "沒有附上上一篇，模型無從「保留其餘內容」"
+        );
+    }
+}
+
+#[cfg(test)]
+mod difficulty_tests {
+    use super::*;
+
+    fn avoid() -> Vec<(String, String)> {
+        vec![
+            ("分詞構句".to_string(), "高中".to_string()),
+            ("倒裝".to_string(), "高中".to_string()),
+        ]
+    }
+
+    /// 什麼都沒設定時整段要消失。留一句「句子不要太難：（空）」
+    /// 只會讓模型困惑，而且每一題都白燒那些 token。
+    #[test]
+    fn no_limit_means_no_text_at_all() {
+        assert_eq!(difficulty_rules(&DifficultyBrief::default()), "");
+    }
+
+    #[test]
+    fn the_ceiling_and_the_forbidden_list_both_show_up() {
+        let avoid = avoid();
+        let text = difficulty_rules(&DifficultyBrief {
+            level_name: Some("國中七年級"),
+            avoid: &avoid,
+            max_words: Some(12),
+            max_clauses: Some(1),
+            practise: None,
+            known: &[],
+        });
+        assert!(text.contains("國中七年級"));
+        assert!(text.contains("12 個詞"));
+        assert!(text.contains("分詞構句（高中）"));
+        assert!(
+            text.contains("實際檢查"),
+            "沒講會被檢查的話，模型只會把它當成建議"
+        );
+    }
+
+    /// 這條測試存在的理由是使用者的原話：「唯一要的功能是能夠標記使用者
+    /// 會什麼，讓 AI 出更貼合使用者的題目。」只講什麼不能用的話，
+    /// 模型只會把句子越寫越平——它不知道手上還有什麼可以用。
+    #[test]
+    fn what_the_learner_already_knows_reaches_the_prompt() {
+        let known = vec!["there is / there are".to_string(), "現在進行式".to_string()];
+        let text = difficulty_rules(&DifficultyBrief {
+            level_name: Some("國中"),
+            known: &known,
+            ..Default::default()
+        });
+        assert!(text.contains("他已經會的句型"));
+        assert!(text.contains("there is / there are"));
+        assert!(text.contains("現在進行式"));
+        assert!(text.contains("放心用"));
+    }
+
+    /// 只有「已經會的」也要成立：使用者可能一個上限都沒設，
+    /// 只是一路標記「我會了」——那時這一段仍然要出現。
+    #[test]
+    fn knowing_something_is_enough_to_produce_a_section() {
+        let known = vec!["there is / there are".to_string()];
+        let text = difficulty_rules(&DifficultyBrief {
+            known: &known,
+            ..Default::default()
+        });
+        assert!(text.contains("他已經會的句型"));
+        assert!(
+            !text.contains("實際檢查"),
+            "沒有上限就沒有東西會被退回，不要嚇它"
+        );
+    }
+
+    /// 「只寫一個子句」比「最多 0 個子句」看得懂。
+    #[test]
+    fn zero_clauses_is_phrased_as_a_single_clause() {
+        let text = difficulty_rules(&DifficultyBrief {
+            max_clauses: Some(0),
+            ..Default::default()
+        });
+        assert!(text.contains("只寫一個子句"), "{text}");
+        assert!(!text.contains("0 個子句"));
+    }
+
+    /// 指派了句型就要講死「至少一題要用到」，而且要講會被檢查——
+    /// 這跟「每一題各練一個字」是同一件事：列出來只是請求，
+    /// 模型很會寫出一句通順、自然、跟那個句型完全無關的話。
+    #[test]
+    fn an_assigned_pattern_is_stated_as_a_requirement_that_gets_checked() {
+        let examples = vec!["There is a book on the desk.".to_string()];
+        let text = difficulty_rules(&DifficultyBrief {
+            level_name: Some("國小"),
+            practise: Some(PatternBrief {
+                point: "there-be",
+                name: "there is / there are",
+                explanation: Some("用來說「有某個東西」。"),
+                examples: &examples,
+            }),
+            ..Default::default()
+        });
+        assert!(text.contains("there is / there are"));
+        assert!(text.contains("There is a book on the desk."));
+        assert!(text.contains("至少要有一題"));
+        assert!(text.contains("退回來重寫"));
+    }
+
+    /// 講解可能是整篇給學習者讀的說明。整篇塞進出題 prompt 只是燒 token，
+    /// 模型需要的是「這個標籤指的是什麼」。
+    #[test]
+    fn a_long_explanation_is_trimmed() {
+        let long = "說".repeat(500);
+        let text = difficulty_rules(&DifficultyBrief {
+            practise: Some(PatternBrief {
+                point: "x",
+                name: "某句型",
+                explanation: Some(&long),
+                examples: &[],
+            }),
+            ..Default::default()
+        });
+        assert!(text.chars().filter(|c| *c == '說').count() <= 200);
+    }
+
+    /// 句子太難的重問要說「格式沒問題、要改的是句子」——用 format_retry
+    /// 那一則的話，模型會去改 JSON 的形狀，而形狀本來就是對的。
+    #[test]
+    fn the_difficulty_retry_asks_for_a_rewrite_not_a_reformat() {
+        let msg = difficulty_retry(
+            &["/items/0/reference：「If I had known, I would have told you.」用到了「第三類條件句」（高中）".to_string()],
+            "{\"items\":[]}",
+        );
+        assert!(msg.content.contains("格式沒有問題"));
+        assert!(msg.content.contains("第三類條件句"));
+        assert!(
+            msg.content.contains("{\"items\":[]}"),
+            "沒附上一次的輸出，非交互式的後端不記得自己寫過什麼"
+        );
+        assert!(
+            msg.content
+                .contains("不要為了變簡單而換掉指定要練的字或句型"),
+            "少了這句，模型會把該練的字一起簡化掉"
         );
     }
 }

@@ -1836,3 +1836,18 @@ button.link:hover {
   flex: 1;
   min-width: 8rem;
 }
+
+/* 面板裡的面板：一條偵測規則自成一塊。
+   縮排與淡背景是為了在一長串規則裡看得出邊界——手寫十幾條的時候，
+   分不清哪一句 positive 屬於哪一條規則是很實際的問題。 */
+.panel .panel.nested {
+  background: var(--bg);
+  padding: 0.9rem 1rem;
+  gap: 0.5rem;
+}
+
+/* 規則本身是等寬才讀得出來：\s 跟 \S、l 跟 1 在比例字體下太像，
+   而這裡打錯一個字的後果是「這個句型從此偵測不到」。 */
+.panel .panel.nested > label.stacked > input {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
